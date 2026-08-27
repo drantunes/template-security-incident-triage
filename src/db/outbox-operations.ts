@@ -67,7 +67,7 @@ export async function recordOutboxFailure(
     backoffBaseMs: number;
     backoffCapMs: number;
   }>,
-): Promise<"retry" | "dead_letter" | "fence_lost"> {
+): Promise<"retry" | "dead_letter" | "fence_lost" | "workflow_run_exists"> {
   return store.transaction(async (tx) => {
     const current = await tx.execute({
       sql: `SELECT * FROM outbox_events
@@ -76,6 +76,20 @@ export async function recordOutboxFailure(
     });
     const row = current.rows[0];
     if (!row) return "fence_lost";
+    const workflowRun = await tx.execute({
+      sql: "SELECT 1 FROM workflow_runs WHERE run_id = ?",
+      args: [input.id],
+    });
+    if (workflowRun.rows.length > 0) {
+      const completed = await tx.execute({
+        sql: `UPDATE outbox_events SET published_at = ?, error_code = NULL
+          WHERE id = ? AND published_at IS NULL AND available_at = ?`,
+        args: [input.now, input.id, input.leaseToken],
+      });
+      return completed.rowsAffected === 1
+        ? "workflow_run_exists"
+        : "fence_lost";
+    }
     const attempts = Number(row.attempt_count) + 1;
     if (attempts >= input.maxAttempts) {
       await tx.execute({

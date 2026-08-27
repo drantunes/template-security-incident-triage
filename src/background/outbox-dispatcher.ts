@@ -73,23 +73,15 @@ export class OutboxDispatcher {
         this.logger.write({
           event: `outbox.${outcome}`,
           errorCode: "EVENT_INVALID",
-          attempt: item.attemptCount + 1,
+          attempt:
+            outcome === "workflow_run_exists"
+              ? item.attemptCount
+              : item.attemptCount + 1,
         });
         continue;
       }
       try {
         await this.pubsub.publish(item.event.type, item.event);
-        const published = await markOutboxPublished(this.store, {
-          id: item.event.data.eventId,
-          leaseToken: item.leaseToken,
-          publishedAt: this.now().toISOString(),
-        });
-        this.logger.write({
-          event: published ? "outbox.published" : "outbox.fence_lost",
-          correlationId: item.event.data.correlationId,
-          incidentId: item.event.data.incidentId,
-          attempt: item.attemptCount + 1,
-        });
       } catch {
         const outcome = await recordOutboxFailure(this.store, {
           id: item.event.data.eventId,
@@ -105,6 +97,31 @@ export class OutboxDispatcher {
           correlationId: item.event.data.correlationId,
           incidentId: item.event.data.incidentId,
           errorCode: "PUBSUB_UNAVAILABLE",
+          attempt:
+            outcome === "workflow_run_exists"
+              ? item.attemptCount
+              : item.attemptCount + 1,
+        });
+        continue;
+      }
+      try {
+        const published = await markOutboxPublished(this.store, {
+          id: item.event.data.eventId,
+          leaseToken: item.leaseToken,
+          publishedAt: this.now().toISOString(),
+        });
+        this.logger.write({
+          event: published ? "outbox.published" : "outbox.fence_lost",
+          correlationId: item.event.data.correlationId,
+          incidentId: item.event.data.incidentId,
+          attempt: item.attemptCount + 1,
+        });
+      } catch {
+        this.logger.write({
+          event: "outbox.mark_failed",
+          correlationId: item.event.data.correlationId,
+          incidentId: item.event.data.incidentId,
+          errorCode: "STORAGE_UNAVAILABLE",
           attempt: item.attemptCount + 1,
         });
       }
