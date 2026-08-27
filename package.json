@@ -1,0 +1,46 @@
+{
+  "name": "mastra-security-incident",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Baseline for a security incident triage and response template built with Mastra.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "node --env-file-if-exists=.env --import tsx src/server.ts",
+    "dev:studio": "mastra dev",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node --env-file-if-exists=.env dist/server.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "audit": "npm audit --audit-level=high"
+  },
+  "dependencies": {
+    "@hono/node-server": "2.1.1",
+    "@libsql/client": "0.17.4",
+    "@mastra/auth-workos": "1.6.4",
+    "@mastra/core": "1.63.0",
+    "@mastra/hono": "1.7.3",
+    "@mastra/libsql": "1.22.0",
+    "@mastra/redis-streams": "0.4.0",
+    "hono": "4.13.5",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.1",
+    "eslint": "10.9.1",
+    "mastra": "1.27.0",
+    "prettier": "3.9.6",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.68.0",
+    "vitest": "4.1.11"
+  }
+}

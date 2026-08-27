@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.mastra/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+coverage/
+.DS_Store
