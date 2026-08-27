@@ -2,6 +2,7 @@ import type { z } from "zod";
 
 export type DomainErrorCode =
   | "CONFLICT"
+  | "EVENT_OUT_OF_ORDER"
   | "INVALID_TRANSITION"
   | "NOT_FOUND"
   | "STORAGE_UNAVAILABLE"
@@ -9,6 +10,7 @@ export type DomainErrorCode =
 
 const publicMessages: Record<DomainErrorCode, string> = {
   CONFLICT: "The operation conflicts with the current state.",
+  EVENT_OUT_OF_ORDER: "The event is older than the current event stream.",
   INVALID_TRANSITION: "The requested state transition is not allowed.",
   NOT_FOUND: "The requested resource was not found.",
   STORAGE_UNAVAILABLE: "Storage is temporarily unavailable.",

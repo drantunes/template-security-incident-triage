@@ -1,59 +1,103 @@
-import { serve, type ServerType } from "@hono/node-server";
 import { MastraServer } from "@mastra/hono";
+import type { Mastra } from "@mastra/core/mastra";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 
-import { mastra } from "./mastra/index.js";
+import type { OperationalStore } from "./db/operational-store.js";
+import type { Phase2Config } from "./env.js";
+import { errorResponse } from "./http-errors.js";
+import {
+  defensiveHeadersMiddleware,
+  requestContextMiddleware,
+  type AppEnv,
+} from "./http-context.js";
+import {
+  consoleLogger,
+  requestLoggingMiddleware,
+  type StructuredLogger,
+} from "./logging.js";
+import { registerWebhookRoutes } from "./webhooks/routes.js";
 
-const DEFAULT_PORT = 3000;
+export async function createApp(
+  input: Readonly<{
+    config: Phase2Config;
+    store: OperationalStore;
+    logger?: StructuredLogger;
+    createRequestId?: () => string;
+    nowMs?: () => number;
+    mastraInstance?: Mastra;
+  }>,
+): Promise<Hono<AppEnv>> {
+  const logger = input.logger ?? consoleLogger;
+  const app = new Hono<AppEnv>();
 
-export async function createApp(): Promise<Hono> {
-  const app = new Hono();
-
-  app.use("*", async (context, next) => {
-    await next();
-    context.header("Cache-Control", "no-store");
-    context.header("Content-Security-Policy", "default-src 'none'");
-    context.header("X-Content-Type-Options", "nosniff");
-    context.header("X-Frame-Options", "DENY");
-  });
+  app.use("*", requestContextMiddleware(input.createRequestId));
+  app.use("*", defensiveHeadersMiddleware);
+  app.use("*", requestLoggingMiddleware(logger));
 
   app.get("/health", (context) => context.json({ status: "ok" }));
-
-  const server = new MastraServer({ app, mastra });
-  await server.init();
-
-  return app;
-}
-
-export async function startServer(port = readPort()): Promise<ServerType> {
-  const app = await createApp();
-  const server = serve({ fetch: app.fetch, port });
-
-  await new Promise<void>((resolve, reject) => {
-    server.once("listening", resolve);
-    server.once("error", reject);
+  registerWebhookRoutes(app, {
+    config: input.config,
+    store: input.store,
+    logger,
+    ...(input.nowMs ? { nowMs: input.nowMs } : {}),
   });
 
-  return server;
-}
+  app.use(
+    "/api/*",
+    bodyLimit({
+      maxSize: input.config.mastraMaxBodyBytes,
+      onError: (context) =>
+        errorResponse(context, "PAYLOAD_TOO_LARGE", 413, false, logger),
+    }),
+  );
 
-function readPort(): number {
-  const value = process.env.PORT;
-  if (!value) return DEFAULT_PORT;
+  const appMastra =
+    input.mastraInstance ?? (await import("./mastra/index.js")).mastra;
 
-  const port = Number(value);
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new Error("PORT must be an integer between 1 and 65535.");
-  }
+  const server = new MastraServer({
+    app,
+    mastra: appMastra,
+    bodyLimitOptions: {
+      maxSize: input.config.mastraMaxBodyBytes,
+      onError: () => ({
+        code: "PAYLOAD_TOO_LARGE",
+        message: "The request body is too large.",
+        retryable: false,
+      }),
+    },
+  });
+  await server.init();
 
-  return port;
-}
+  app.notFound((context) =>
+    context.json(
+      {
+        code: "NOT_FOUND",
+        message: "The requested resource was not found.",
+        requestId: context.get("requestId"),
+        retryable: false,
+      },
+      404,
+    ),
+  );
+  app.onError((_, context) => {
+    logger.write({
+      event: "http.request.rejected",
+      requestId: context.get("requestId"),
+      correlationId: context.get("correlationId"),
+      errorCode: "INTERNAL_ERROR",
+      status: 500,
+    });
+    return context.json(
+      {
+        code: "INTERNAL_ERROR",
+        message: "An internal error occurred.",
+        requestId: context.get("requestId"),
+        retryable: false,
+      },
+      500,
+    );
+  });
 
-if (
-  process.argv[1] &&
-  import.meta.url === new URL(process.argv[1], "file:").href
-) {
-  const port = readPort();
-  await startServer(port);
-  console.log(`Hono server listening on http://localhost:${port}`);
+  return app;
 }

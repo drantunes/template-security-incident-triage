@@ -10,10 +10,11 @@
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "dev:server": "node --env-file-if-exists=.env --import tsx src/server.ts",
+    "dev:server": "node --env-file-if-exists=.env --import tsx src/start.ts",
     "dev:studio": "mastra dev",
+    "fixture:sign": "node --env-file-if-exists=.env scripts/sign-webhook.mjs scripts/fixtures/phase2-alert.json",
     "build": "tsc -p tsconfig.build.json",
-    "start": "node --env-file-if-exists=.env dist/server.js",
+    "start": "node --env-file-if-exists=.env dist/start.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",

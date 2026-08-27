@@ -20,6 +20,8 @@ import { TimelineWriteSchema } from "./timeline-schema.js";
 export type OperationDependencies = Readonly<{
   clock?: Clock;
   ids?: IdGenerator;
+  correlationId?: string;
+  enforceAlertOrdering?: boolean;
 }>;
 
 const reservedTransitionPayloadKeys = new Set([
@@ -47,7 +49,20 @@ export async function createIncidentFromAlert(
   untrustedAlert: Alert,
   dependencies: OperationDependencies = {},
 ): Promise<Incident> {
+  return (
+    await createIncidentFromAlertResult(store, untrustedAlert, dependencies)
+  ).incident;
+}
+
+export async function createIncidentFromAlertResult(
+  store: OperationalStore,
+  untrustedAlert: Alert,
+  dependencies: OperationDependencies = {},
+): Promise<Readonly<{ incident: Incident; duplicate: boolean }>> {
   const alert = parseDomainSchema(AlertSchema, untrustedAlert);
+  if (dependencies.enforceAlertOrdering) {
+    await store.execute({ sql: "SELECT 1" });
+  }
   const clock = dependencies.clock ?? systemClock;
   const ids = dependencies.ids ?? uuidGenerator;
   const incidentId = ids.next();
@@ -59,6 +74,45 @@ export async function createIncidentFromAlert(
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       return await store.transaction(async (tx) => {
+        if (dependencies.enforceAlertOrdering) {
+          const existingIdentity = await tx.execute({
+            sql: `SELECT a.canonical_json, i.* FROM alerts a
+              JOIN incidents i ON i.tenant_id = a.tenant_id AND i.id = a.incident_id
+              WHERE a.tenant_id = ? AND a.source = ? AND a.source_event_id = ?`,
+            args: [alert.tenantId, alert.source, alert.sourceEventId],
+          });
+          const existingRow = existingIdentity.rows[0];
+          if (existingRow) {
+            if (
+              typeof existingRow.canonical_json !== "string" ||
+              !alertsAreEquivalent(existingRow.canonical_json, alert)
+            ) {
+              throw new DomainError("CONFLICT");
+            }
+            return {
+              duplicate: true,
+              incident: incidentFromRow(existingRow),
+            };
+          }
+
+          const newerInStream = await tx.execute({
+            sql: `SELECT 1 FROM alerts
+              WHERE source = ? AND tenant_id = ? AND subject_id = ? AND kind = ?
+                AND occurred_at > ?
+              LIMIT 1`,
+            args: [
+              alert.source,
+              alert.tenantId,
+              alert.subjectId,
+              alert.kind,
+              alert.occurredAt,
+            ],
+          });
+          if (newerInStream.rows.length > 0) {
+            throw new DomainError("EVENT_OUT_OF_ORDER");
+          }
+        }
+
         await tx.execute({
           sql: `INSERT INTO incidents(
           id, tenant_id, kind, subject_id, status, version, timeline_sequence, created_at, updated_at
@@ -101,23 +155,26 @@ export async function createIncidentFromAlert(
           type: "incident.received",
           eventType: "security.alert.received",
           runId: incidentId,
-          correlationId: alert.idempotencyKey,
+          correlationId: dependencies.correlationId ?? alert.idempotencyKey,
           causationId: alert.sourceEventId,
           occurredAt: now,
           payload: { alertId: alert.alertId, status: "received" },
         });
-        return parseDomainSchema(IncidentSchema, {
-          schemaVersion: 1,
-          incidentId,
-          tenantId: alert.tenantId,
-          subjectId: alert.subjectId,
-          kind: alert.kind,
-          status: "received",
-          version: 0,
-          timelineSequence: 1,
-          createdAt: now,
-          updatedAt: now,
-        });
+        return {
+          duplicate: false,
+          incident: parseDomainSchema(IncidentSchema, {
+            schemaVersion: 1,
+            incidentId,
+            tenantId: alert.tenantId,
+            subjectId: alert.subjectId,
+            kind: alert.kind,
+            status: "received",
+            version: 0,
+            timelineSequence: 1,
+            createdAt: now,
+            updatedAt: now,
+          }),
+        };
       });
     } catch (error) {
       lastError = error;
@@ -135,7 +192,10 @@ export async function createIncidentFromAlert(
           alertsAreEquivalent(row.canonical_json, alert) &&
           typeof row.incident_id === "string"
         ) {
-          return getIncident(store, alert.tenantId, row.incident_id);
+          return {
+            duplicate: true,
+            incident: await getIncident(store, alert.tenantId, row.incident_id),
+          };
         }
       } catch (readError) {
         lastError = readError;
@@ -268,6 +328,8 @@ function alertsAreEquivalent(canonicalJson: string, alert: Alert): boolean {
   const retriedCommand: Partial<Alert> = { ...alert };
   delete persistedCommand.alertId;
   delete retriedCommand.alertId;
+  delete persistedCommand.rawPayloadRef;
+  delete retriedCommand.rawPayloadRef;
   return (
     JSON.stringify(canonicalizeJson(persistedCommand)) ===
     JSON.stringify(canonicalizeJson(retriedCommand))

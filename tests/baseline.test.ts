@@ -6,8 +6,12 @@ import type { Mastra } from "@mastra/core/mastra";
 import type { LibSQLStore } from "@mastra/libsql";
 import type { Hono } from "hono";
 
+import { migrateOperationalStore } from "../src/db/migrate.js";
+import type { OperationalStore } from "../src/db/operational-store.js";
+import type { AppEnv } from "../src/http-context.js";
 import { smokeAgent } from "../src/mastra/agents/smoke-agent.js";
 import { baselineWorkflow } from "../src/mastra/workflows/baseline-workflow.js";
+import { makePhase2Config } from "./fixtures/phase2.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -15,7 +19,8 @@ import {
 
 let mastra: Mastra;
 let storage: LibSQLStore;
-let createApp: () => Promise<Hono>;
+let createApp: () => Promise<Hono<AppEnv>>;
+let operationalStore: OperationalStore;
 let database: TempDatabase | undefined;
 let previousStorageUrl: string | undefined;
 let initialWorkspaceDatabases: string[] = [];
@@ -27,11 +32,20 @@ beforeAll(async () => {
   process.env.MASTRA_STORAGE_URL = database.url;
 
   ({ mastra, storage } = await import("../src/mastra/index.js"));
-  ({ createApp } = await import("../src/server.js"));
+  const server = await import("../src/server.js");
+  operationalStore = database.createStore();
+  await migrateOperationalStore(operationalStore);
+  createApp = () =>
+    server.createApp({
+      config: makePhase2Config(),
+      store: operationalStore,
+      logger: { write: () => {} },
+    });
 });
 
 afterAll(async () => {
   try {
+    operationalStore?.close();
     await storage?.close();
   } finally {
     try {

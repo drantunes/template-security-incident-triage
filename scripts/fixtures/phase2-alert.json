@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "source": "demo",
+  "sourceEventId": "synthetic-event-1",
+  "kind": "unauthorized_privilege_change",
+  "occurredAt": "2026-08-27T12:00:00.000Z",
+  "tenantId": "synthetic-tenant",
+  "subjectId": "synthetic-user",
+  "actor": { "id": "synthetic-admin", "type": "user" },
+  "target": { "id": "synthetic-user", "type": "user" },
+  "changes": { "previousRole": "member", "nextRole": "admin" }
+}
