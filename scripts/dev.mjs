@@ -13,7 +13,7 @@ const children = [
   spawn(mastraExecutable, ["dev"], { cwd: root, stdio: "inherit" }),
   spawn(
     process.execPath,
-    ["--env-file-if-exists=.env", "--import", "tsx", "src/server.ts"],
+    ["--env-file-if-exists=.env", "--import", "tsx", "src/start.ts"],
     { cwd: root, stdio: "inherit" },
   ),
 ];
