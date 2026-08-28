@@ -166,3 +166,76 @@ export function readPhase6Config(
     rateLimit: value.CONTAINMENT_RATE_LIMIT,
   });
 }
+
+const phase7EnvironmentSchema = z.object({
+  DASHBOARD_AUTH_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  WORKOS_API_KEY: z.string().min(16).optional(),
+  WORKOS_CLIENT_ID: z.string().min(8).optional(),
+  WORKOS_REDIRECT_URI: z.url().optional(),
+  WORKOS_COOKIE_PASSWORD: z.string().min(32).optional(),
+  DASHBOARD_ORIGIN: z.url().default("http://localhost:3000"),
+  DASHBOARD_CSRF_SECRET: z.string().min(32).optional(),
+  DASHBOARD_SESSION_MAX_AGE_SECONDS: integer(28_800, 60, 28_800),
+  DASHBOARD_SSE_MAX_CONNECTIONS: integer(4, 1, 16),
+  DASHBOARD_TRUSTED_PROXY: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+});
+
+export type Phase7Config = Readonly<{
+  enabled: boolean;
+  workosApiKey?: string;
+  workosClientId?: string;
+  workosRedirectUri?: string;
+  workosCookiePassword?: string;
+  dashboardOrigin: string;
+  csrfSecret?: string;
+  sessionMaxAgeSeconds: number;
+  sseMaxConnections: number;
+  trustedProxy?: boolean;
+}>;
+
+/** Dashboard auth is disabled by default so mocks and CI never contact WorkOS. */
+export function readPhase7Config(
+  environment: NodeJS.ProcessEnv = process.env,
+): Phase7Config {
+  const parsed = phase7EnvironmentSchema.safeParse(environment);
+  if (!parsed.success) throw new Error("Invalid Phase 7 configuration.");
+  const value = parsed.data;
+  if (
+    value.DASHBOARD_AUTH_ENABLED &&
+    (!value.WORKOS_API_KEY ||
+      !value.WORKOS_CLIENT_ID ||
+      !value.WORKOS_REDIRECT_URI ||
+      !value.WORKOS_COOKIE_PASSWORD ||
+      !value.DASHBOARD_CSRF_SECRET)
+  ) {
+    throw new Error(
+      "WorkOS dashboard auth requires API key, client ID, redirect URI, cookie password, and CSRF secret.",
+    );
+  }
+  return Object.freeze({
+    enabled: value.DASHBOARD_AUTH_ENABLED,
+    ...(value.WORKOS_API_KEY ? { workosApiKey: value.WORKOS_API_KEY } : {}),
+    ...(value.WORKOS_CLIENT_ID
+      ? { workosClientId: value.WORKOS_CLIENT_ID }
+      : {}),
+    ...(value.WORKOS_REDIRECT_URI
+      ? { workosRedirectUri: value.WORKOS_REDIRECT_URI }
+      : {}),
+    ...(value.WORKOS_COOKIE_PASSWORD
+      ? { workosCookiePassword: value.WORKOS_COOKIE_PASSWORD }
+      : {}),
+    dashboardOrigin: new URL(value.DASHBOARD_ORIGIN).origin,
+    ...(value.DASHBOARD_CSRF_SECRET
+      ? { csrfSecret: value.DASHBOARD_CSRF_SECRET }
+      : {}),
+    sessionMaxAgeSeconds: value.DASHBOARD_SESSION_MAX_AGE_SECONDS,
+    sseMaxConnections: value.DASHBOARD_SSE_MAX_CONNECTIONS,
+    trustedProxy: value.DASHBOARD_TRUSTED_PROXY,
+  });
+}

@@ -8,6 +8,7 @@ export type AppEnv = {
     correlationId: string;
     incidentId?: string;
     workflowRunId?: string;
+    dashboardAuthTransient?: boolean;
   };
 };
 
@@ -35,8 +36,18 @@ export const defensiveHeadersMiddleware: MiddlewareHandler<AppEnv> = async (
   next,
 ) => {
   await next();
-  context.header("Cache-Control", "no-store");
-  context.header("Content-Security-Policy", "default-src 'none'");
+  const path = new URL(context.req.url).pathname;
+  // All dashboard HTML, including an incident detail, needs the same strictly
+  // self-hosted asset policy.  APIs/SSE deliberately keep the deny-all policy.
+  const dashboardDocument =
+    path === "/" || path.startsWith("/dashboard") || path.startsWith("/auth/");
+  if (!path.startsWith("/assets/")) context.header("Cache-Control", "no-store");
+  context.header(
+    "Content-Security-Policy",
+    dashboardDocument
+      ? "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'"
+      : "default-src 'none'",
+  );
   context.header("Referrer-Policy", "no-referrer");
   context.header("X-Content-Type-Options", "nosniff");
   context.header("X-Frame-Options", "DENY");
