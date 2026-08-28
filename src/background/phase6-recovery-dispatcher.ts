@@ -91,36 +91,56 @@ export class Phase6RecoveryDispatcher {
     const now = (this.dependencies.clock ?? systemClock).now();
     const due = await this.dependencies.store.execute({
       sql: `SELECT i.tenant_id, i.id AS incident_id, i.current_run_id,
-        a.id AS approval_id
+        a.id AS approval_id,
+        (SELECT completed.correlation_id FROM timeline_events completed
+          WHERE completed.tenant_id = i.tenant_id
+            AND completed.incident_id = i.id
+            AND completed.type = 'containment.completed'
+            AND completed.causation_id = a.id
+            AND json_extract(completed.payload_json, '$.status') = 'contained'
+          ORDER BY completed.sequence DESC LIMIT 1
+        ) AS containment_correlation_id
         FROM incidents i JOIN approvals a
           ON a.tenant_id = i.tenant_id AND a.incident_id = i.id
           AND a.plan_id = i.current_plan_id
-        WHERE i.status IN ('failed','containing') AND a.decision = 'approved'
-          AND a.expires_at > ?
-          AND NOT EXISTS (
-            SELECT 1 FROM containment_action_attempts active
-            WHERE active.tenant_id = i.tenant_id
-              AND active.incident_id = i.id
-              AND active.plan_id = i.current_plan_id
-              AND active.status = 'executing' AND active.lease_expires_at > ?
-          )
-          AND EXISTS (
-            SELECT 1 FROM containment_actions action
-            WHERE action.tenant_id = i.tenant_id AND action.incident_id = i.id
-              AND action.plan_id = i.current_plan_id
-              AND action.status IN ('pending','failed','blocked','timed_out')
-              AND (
-                SELECT count(*) FROM containment_action_attempts attempt
-                WHERE attempt.tenant_id = action.tenant_id
-                  AND attempt.plan_id = action.plan_id
-                  AND attempt.action_id = action.action_id
-              ) < 3
-          )
+        WHERE a.decision = 'approved' AND (
+          (i.status IN ('failed','containing') AND a.expires_at > ?
+            AND NOT EXISTS (
+              SELECT 1 FROM containment_action_attempts active
+              WHERE active.tenant_id = i.tenant_id
+                AND active.incident_id = i.id
+                AND active.plan_id = i.current_plan_id
+                AND active.status = 'executing' AND active.lease_expires_at > ?
+            )
+            AND EXISTS (
+              SELECT 1 FROM containment_actions action
+              WHERE action.tenant_id = i.tenant_id AND action.incident_id = i.id
+                AND action.plan_id = i.current_plan_id
+                AND action.status IN ('pending','failed','blocked','timed_out')
+                AND (
+                  SELECT count(*) FROM containment_action_attempts attempt
+                  WHERE attempt.tenant_id = action.tenant_id
+                    AND attempt.plan_id = action.plan_id
+                    AND attempt.action_id = action.action_id
+                ) < 3
+            ))
+          OR (i.status = 'contained' AND NOT EXISTS (
+            SELECT 1 FROM timeline_events terminal
+            WHERE terminal.tenant_id = i.tenant_id
+              AND terminal.incident_id = i.id
+              AND terminal.type = 'incident.status_changed'
+              AND json_extract(terminal.payload_json, '$.to') = 'closed'
+          ))
+        )
         ORDER BY i.updated_at, i.id LIMIT 1`,
       args: [now, now],
     });
     const row = due.rows[0];
     if (!row) return false;
+    const correlationId =
+      typeof row.containment_correlation_id === "string"
+        ? row.containment_correlation_id
+        : `partial_retry_${String(row.approval_id)}`;
     const retried = await retryPartialContainment(
       this.dependencies.store,
       {
@@ -128,7 +148,7 @@ export class Phase6RecoveryDispatcher {
         incidentId: String(row.incident_id),
         workflowRunId: String(row.current_run_id),
         approvalId: String(row.approval_id),
-        correlationId: `partial_retry_${String(row.approval_id)}`,
+        correlationId,
         state: this.dependencies.containmentState,
         mode: this.dependencies.mode ?? "mock",
         timeoutMs: this.dependencies.actionTimeoutMs ?? 1_000,
@@ -151,7 +171,7 @@ export class Phase6RecoveryDispatcher {
           operation: "final-contained",
           projection,
           workflowRunId: String(row.current_run_id),
-          correlationId: `partial_retry_${String(row.approval_id)}`,
+          correlationId,
         },
         {
           clock: this.dependencies.clock,
@@ -169,10 +189,14 @@ export class Phase6RecoveryDispatcher {
     incidentId: string,
   ) {
     const result = await this.dependencies.store.execute({
-      sql: `SELECT i.kind, i.severity, i.status, i.created_at, p.plan_json
+      sql: `SELECT i.kind, i.status, i.created_at, p.plan_json,
+          json_extract(run.phase5_result_json, '$.decision.severity') AS severity
         FROM incidents i JOIN containment_plans p
           ON p.tenant_id = i.tenant_id AND p.incident_id = i.id
           AND p.id = i.current_plan_id
+        JOIN workflow_runs run
+          ON run.tenant_id = i.tenant_id AND run.incident_id = i.id
+          AND run.run_id = i.current_run_id
         WHERE i.tenant_id = ? AND i.id = ?`,
       args: [tenantId, incidentId],
     });

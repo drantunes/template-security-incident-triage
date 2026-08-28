@@ -232,7 +232,7 @@ export async function claimContainmentAction(
       if (actionFenced.rowsAffected !== 1) throw new DomainError("CONFLICT");
     }
     const order = await tx.execute({
-      sql: `SELECT current.ordinal,
+      sql: `SELECT current.ordinal, current.action_type,
         (SELECT count(*) FROM containment_actions predecessor
           WHERE predecessor.tenant_id = current.tenant_id
             AND predecessor.incident_id = current.incident_id
@@ -244,7 +244,8 @@ export async function claimContainmentAction(
           AND current.plan_id = ? AND current.action_id = ?`,
       args: [input.tenantId, input.incidentId, input.planId, input.actionId],
     });
-    if (!order.rows[0] || Number(order.rows[0].incomplete) > 0) {
+    const authorizedAction = order.rows[0];
+    if (!authorizedAction || Number(authorizedAction.incomplete) > 0) {
       await tx.execute({
         sql: `INSERT INTO containment_gateway_audit(
           id, claimed_tenant_id, claimed_incident_id, claimed_plan_id,
@@ -266,11 +267,17 @@ export async function claimContainmentAction(
       };
     }
     const recent = await tx.execute({
-      sql: `SELECT count(*) AS count FROM containment_action_attempts
-        WHERE tenant_id = ? AND action_id = ? AND started_at >= ?`,
+      sql: `SELECT count(*) AS count FROM containment_action_attempts attempt
+        JOIN containment_actions action
+          ON action.tenant_id = attempt.tenant_id
+          AND action.incident_id = attempt.incident_id
+          AND action.plan_id = attempt.plan_id
+          AND action.action_id = attempt.action_id
+        WHERE attempt.tenant_id = ? AND action.action_type = ?
+          AND attempt.started_at >= ?`,
       args: [
         input.tenantId,
-        input.actionId,
+        String(authorizedAction.action_type),
         new Date(Date.parse(now) - 60_000).toISOString(),
       ],
     });

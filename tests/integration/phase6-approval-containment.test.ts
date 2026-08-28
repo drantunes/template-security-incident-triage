@@ -111,6 +111,126 @@ async function setup(plan = makePlan()) {
   return { database, store, plan, approval };
 }
 
+async function setupAdditionalApprovedIncident(
+  store: Awaited<ReturnType<typeof setup>>["store"],
+  actionType: "restore_previous_role" | "revoke_session",
+) {
+  const baseAction = makePlan().actions[0]!;
+  const actionInput: Record<string, string | number | boolean | null> =
+    actionType === "revoke_session" ? {} : { role: "member" };
+  const action = {
+    ...baseAction,
+    actionId: "action-2",
+    type: actionType,
+    targetId: actionType === "revoke_session" ? "session-2" : "subject-2",
+    input: actionInput,
+  };
+  const plan = makePlan({
+    planId: "plan-2",
+    incidentId: "incident-2",
+    actions: [action],
+  });
+  await createIncidentFromAlert(
+    store,
+    makeAlert({
+      alertId: "alert-2",
+      sourceEventId: "source-event-2",
+      subjectId: "subject-2",
+      target: { id: "subject-2", type: "user" },
+      rawPayloadRef: "protected://alerts/2",
+      idempotencyKey: "alert-idempotency-2",
+    }),
+    {
+      clock: fixedClock("2026-08-27T12:00:00.000Z"),
+      ids: sequenceIdGenerator([
+        "incident-2",
+        "timeline-incident-2",
+        "outbox-incident-2",
+      ]),
+    },
+  );
+  await transitionIncident(
+    store,
+    {
+      tenantId: "tenant-1",
+      incidentId: "incident-2",
+      expectedVersion: 0,
+      to: "investigating",
+      runId: "run-2",
+      correlationId: "correlation-2",
+    },
+    {
+      clock: fixedClock("2026-08-27T12:00:30.000Z"),
+      ids: sequenceIdGenerator([
+        "timeline-investigating-2",
+        "outbox-investigating-2",
+      ]),
+    },
+  );
+  await store.execute({
+    sql: `INSERT INTO workflow_runs(
+      id, incident_id, tenant_id, run_id, workflow_id, status, started_at
+    ) VALUES ('workflow-row-2', 'incident-2', 'tenant-1', 'run-2',
+      'incident-ingestion-workflow', 'running', '2026-08-27T12:00:30.000Z')`,
+  });
+  await store.execute({
+    sql: `UPDATE incidents SET current_run_id = 'run-2'
+      WHERE tenant_id = 'tenant-1' AND id = 'incident-2'`,
+  });
+  await seedAuthoritativePhase5Result(store, plan, "run-2");
+  await requestApproval(
+    store,
+    {
+      plan,
+      approval: makeApprovalRequest({
+        approvalId: "approval-2",
+        planId: plan.planId,
+        incidentId: plan.incidentId,
+        planHash: plan.planHash,
+        expiresAt: plan.expiresAt,
+      }),
+      expectedIncidentVersion: 1,
+      runId: "run-2",
+      correlationId: "correlation-2",
+    },
+    {
+      clock: fixedClock("2026-08-27T12:01:00.000Z"),
+      ids: sequenceIdGenerator([
+        "action-row-2",
+        "timeline-approval-2",
+        "outbox-approval-2",
+      ]),
+    },
+  );
+  await decideApprovalAndIssueResumeToken(
+    store,
+    {
+      decision: {
+        schemaVersion: 1,
+        approvalId: "approval-2",
+        planId: plan.planId,
+        incidentId: plan.incidentId,
+        tenantId: plan.tenantId,
+        planHashVersion: 1,
+        planHash: plan.planHash,
+        decision: "approved",
+        decidedBy: "studio-soc-manager",
+        decidedByRole: "soc_manager",
+        decidedAt: "2026-08-27T12:02:00.000Z",
+      },
+      expectedIncidentVersion: 2,
+      runId: "run-2",
+      correlationId: "correlation-2",
+      resumeSecret: "resume-secret-".padEnd(40, "x"),
+    },
+    {
+      clock: fixedClock("2026-08-27T12:02:00.000Z"),
+      ids: sequenceIdGenerator(["timeline-decision-2", "outbox-decision-2"]),
+    },
+  );
+  return { plan, action };
+}
+
 function schemaValidPlanTamperings(plan: ReturnType<typeof makePlan>) {
   const [action, ...remainingActions] = plan.actions;
   if (!action) throw new Error("fixture plan must contain an action");
@@ -169,6 +289,73 @@ async function approve(
       ids: sequenceIdGenerator(["timeline-4", "outbox-4"]),
     },
   );
+}
+
+async function preparePartialContainmentFailure(
+  store: Awaited<ReturnType<typeof setup>>["store"],
+  plan: ReturnType<typeof makePlan>,
+) {
+  const [first, second] = plan.actions;
+  if (!first || !second) throw new Error("fixture plan must have two actions");
+  await approve(store, plan);
+  await transitionIncident(
+    store,
+    {
+      tenantId: "tenant-1",
+      incidentId: "incident-1",
+      expectedVersion: 3,
+      to: "containing",
+      runId: "run-1",
+      correlationId: "correlation-1",
+      causationId: "approval-1",
+    },
+    {
+      clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      ids: sequenceIdGenerator(["containing-timeline", "containing-outbox"]),
+    },
+  );
+  const state = mockState();
+  state.roles.set("subject-1", "admin");
+  state.sessions.set("session-1", "active");
+  state.failActions = new Set([second.actionId]);
+  const gateway = gatewayFor(store, state);
+  await gateway.executeApprovedAction({
+    tenantId: "tenant-1",
+    incidentId: "incident-1",
+    workflowRunId: "run-1",
+    approvalId: "approval-1",
+    plan,
+    action: first,
+  });
+  await gateway.executeApprovedAction({
+    tenantId: "tenant-1",
+    incidentId: "incident-1",
+    workflowRunId: "run-1",
+    approvalId: "approval-1",
+    plan,
+    action: second,
+  });
+  await recordContainmentOutcome(
+    store,
+    {
+      tenantId: "tenant-1",
+      incidentId: "incident-1",
+      workflowRunId: "run-1",
+      correlationId: "correlation-1",
+      approvalId: "approval-1",
+      expectedVersion: 4,
+      status: "failed",
+      partial: true,
+      completedCount: 1,
+      failedCount: 1,
+    },
+    {
+      clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      ids: sequenceIdGenerator(["failed-timeline", "failed-outbox"]),
+    },
+  );
+  state.failActions.clear();
+  return { first, second, state };
 }
 
 async function reject(
@@ -1596,6 +1783,111 @@ describe("Phase 6 durable approval and containment", () => {
     }
   });
 
+  it("shares the tenant rate-limit budget across incidents for the same action type", async () => {
+    const { store, plan } = await setup();
+    try {
+      await approve(store, plan);
+      const second = await setupAdditionalApprovedIncident(
+        store,
+        "restore_previous_role",
+      );
+      const state = mockState();
+      state.roles.set("subject-1", "admin");
+      state.roles.set("subject-2", "admin");
+      const gateway = new ContainmentGateway({
+        store,
+        state,
+        mode: "mock",
+        timeoutMs: 1_000,
+        rateLimit: 1,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+
+      await expect(
+        gateway.executeApprovedAction({
+          tenantId: "tenant-1",
+          incidentId: "incident-1",
+          workflowRunId: "run-1",
+          approvalId: "approval-1",
+          plan,
+          action: plan.actions[0]!,
+        }),
+      ).resolves.toMatchObject({ status: "completed" });
+      await expect(
+        gateway.executeApprovedAction({
+          tenantId: "tenant-1",
+          incidentId: "incident-2",
+          workflowRunId: "run-2",
+          approvalId: "approval-2",
+          plan: second.plan,
+          action: second.action,
+        }),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+
+      expect(state.calls.get(plan.actions[0]!.actionId)).toBe(1);
+      expect(state.calls.get(second.action.actionId)).toBeUndefined();
+      const audit = await store.execute({
+        sql: `SELECT claimed_action_id, outcome, reason_code
+          FROM containment_gateway_audit ORDER BY rowid DESC LIMIT 1`,
+      });
+      expect(audit.rows[0]).toEqual({
+        claimed_action_id: second.action.actionId,
+        outcome: "rate_limited",
+        reason_code: "RATE_LIMITED",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps independent tenant rate-limit budgets for distinct action types", async () => {
+    const { store, plan } = await setup();
+    try {
+      await approve(store, plan);
+      const second = await setupAdditionalApprovedIncident(
+        store,
+        "revoke_session",
+      );
+      const state = mockState();
+      state.roles.set("subject-1", "admin");
+      state.sessions.set("session-2", "active");
+      const gateway = new ContainmentGateway({
+        store,
+        state,
+        mode: "mock",
+        timeoutMs: 1_000,
+        rateLimit: 1,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+
+      await expect(
+        gateway.executeApprovedAction({
+          tenantId: "tenant-1",
+          incidentId: "incident-1",
+          workflowRunId: "run-1",
+          approvalId: "approval-1",
+          plan,
+          action: plan.actions[0]!,
+        }),
+      ).resolves.toMatchObject({ status: "completed" });
+      await expect(
+        gateway.executeApprovedAction({
+          tenantId: "tenant-1",
+          incidentId: "incident-2",
+          workflowRunId: "run-2",
+          approvalId: "approval-2",
+          plan: second.plan,
+          action: second.action,
+        }),
+      ).resolves.toMatchObject({ status: "completed" });
+
+      expect(state.calls.get(plan.actions[0]!.actionId)).toBe(1);
+      expect(state.calls.get(second.action.actionId)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it("recovers an aggregate failed incident without repeating verified actions", async () => {
     const first = makePlan().actions[0]!;
     const second = {
@@ -1692,6 +1984,175 @@ describe("Phase 6 durable approval and containment", () => {
         sql: "SELECT status FROM incidents WHERE id = 'incident-1'",
       });
       expect(final.rows[0]?.status).toBe("closed");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rechecks partial-recovery terminal readiness inside the close transaction", async () => {
+    const first = makePlan().actions[0]!;
+    const second = {
+      ...first,
+      actionId: "action-2",
+      type: "revoke_session" as const,
+      targetId: "session-1",
+      input: {},
+    };
+    const plan = makePlan({ actions: [first, second] });
+    const { store } = await setup(plan);
+    try {
+      const prepared = await preparePartialContainmentFailure(store, plan);
+      let terminalReadbackSeen = false;
+      let raceInjected = false;
+      const tamperedPlan = {
+        ...plan,
+        actions: [{ ...first, targetId: "tampered-subject" }, second],
+      };
+      const racingStore: OperationalStore = {
+        execute: async (statement) => {
+          const result = await store.execute(statement);
+          if (statement.sql.includes("incident.status AS incident_status")) {
+            terminalReadbackSeen = true;
+          }
+          return result;
+        },
+        transaction: async (operation) => {
+          if (terminalReadbackSeen && !raceInjected) {
+            raceInjected = true;
+            await store.execute({
+              sql: `UPDATE containment_plans SET plan_json = ?
+                WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+                  AND id = ?`,
+              args: [JSON.stringify(tamperedPlan), plan.planId],
+            });
+          }
+          return store.transaction(operation);
+        },
+        close: () => undefined,
+      };
+
+      await expect(
+        retryPartialContainment(
+          racingStore,
+          {
+            tenantId: "tenant-1",
+            incidentId: "incident-1",
+            workflowRunId: "run-1",
+            approvalId: "approval-1",
+            correlationId: "retry-correlation-1",
+            state: prepared.state,
+            mode: "mock",
+            timeoutMs: 1_000,
+            rateLimit: 8,
+          },
+          { clock: fixedClock("2026-08-27T12:04:00.000Z") },
+        ),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+
+      expect(raceInjected).toBe(true);
+      const interrupted = await store.execute({
+        sql: `SELECT status, closed_at FROM incidents
+          WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
+      });
+      expect(interrupted.rows[0]).toEqual({
+        status: "contained",
+        closed_at: null,
+      });
+      const terminalEvents = await store.execute({
+        sql: `SELECT count(*) AS count FROM timeline_events
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND type = 'incident.status_changed'
+            AND json_extract(payload_json, '$.to') = 'closed'`,
+      });
+      expect(Number(terminalEvents.rows[0]?.count)).toBe(0);
+      expect(prepared.state.calls.get(first.actionId)).toBe(1);
+      expect(prepared.state.calls.get(second.actionId)).toBe(2);
+
+      await store.execute({
+        sql: `UPDATE containment_plans SET plan_json = ?
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND id = ?`,
+        args: [JSON.stringify(plan), plan.planId],
+      });
+      const retryContained = (correlationId = "retry-correlation-1") =>
+        retryPartialContainment(
+          store,
+          {
+            tenantId: "tenant-1",
+            incidentId: "incident-1",
+            workflowRunId: "run-1",
+            approvalId: "approval-1",
+            correlationId,
+            state: prepared.state,
+            mode: "mock",
+            timeoutMs: 1_000,
+            rateLimit: 8,
+          },
+          { clock: fixedClock("2026-08-27T12:04:01.000Z") },
+        );
+      await store.execute({
+        sql: `UPDATE approvals SET decided_by = 'tampered-manager'
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND id = 'approval-1'`,
+      });
+      await expect(retryContained()).rejects.toMatchObject({
+        code: "CONFLICT",
+      });
+      await store.execute({
+        sql: `UPDATE approvals SET decided_by = 'studio-soc-manager'
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND id = 'approval-1'`,
+      });
+      await store.execute({
+        sql: `UPDATE containment_actions SET ordinal = 1 - ordinal
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND plan_id = ?`,
+        args: [plan.planId],
+      });
+      await expect(retryContained()).rejects.toMatchObject({
+        code: "CONFLICT",
+      });
+      await store.execute({
+        sql: `UPDATE containment_actions
+          SET ordinal = CASE action_id WHEN ? THEN 0 ELSE 1 END
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND plan_id = ?`,
+        args: [first.actionId, plan.planId],
+      });
+      await expect(
+        retryContained("different-correlation"),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      const stillInterrupted = await store.execute({
+        sql: `SELECT status, closed_at FROM incidents
+          WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
+      });
+      expect(stillInterrupted.rows[0]).toEqual({
+        status: "contained",
+        closed_at: null,
+      });
+      const dispatcher = new Phase6RecoveryDispatcher({
+        store,
+        provider: new MockIncidentProvider(),
+        reconcileApprovalRun: async () => "completed",
+        containmentState: prepared.state,
+        mode: "mock",
+        actionTimeoutMs: 1_000,
+        rateLimit: 8,
+        clock: fixedClock("2026-08-27T12:04:01.000Z"),
+      });
+      await expect(dispatcher.runOnce()).resolves.toMatchObject({
+        containmentRetried: 1,
+      });
+      const recovered = await store.execute({
+        sql: `SELECT status, closed_at FROM incidents
+          WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
+      });
+      expect(recovered.rows[0]).toEqual({
+        status: "closed",
+        closed_at: "2026-08-27T12:04:01.000Z",
+      });
+      expect(prepared.state.calls.get(first.actionId)).toBe(1);
+      expect(prepared.state.calls.get(second.actionId)).toBe(2);
     } finally {
       store.close();
     }
