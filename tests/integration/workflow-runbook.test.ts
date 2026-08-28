@@ -47,6 +47,16 @@ describe("Phase 3 workflow integration", () => {
         embedder: new DeterministicRunbookEmbedder(),
         retrieve,
       },
+      {
+        supervisor: async () => ({
+          scopeValidated: true,
+          specialists: ["identity", "endpoint", "cloud"],
+        }),
+        identityInvestigator: deterministicInvestigator,
+        endpointInvestigator: deterministicInvestigator,
+        cloudInvestigator: deterministicInvestigator,
+        correlationAnalyst: async ({ candidate }) => candidate,
+      },
     );
     const run = await workflow.createRun({ runId: "outbox-1" });
     const result = await run.start({
@@ -82,6 +92,14 @@ describe("Phase 3 workflow integration", () => {
       verification.close();
     }
   });
+});
+
+const deterministicInvestigator = async (input: {
+  facts: readonly { factToken: string }[];
+}) => ({
+  citedFactTokens: input.facts.map((fact) => fact.factToken),
+  gaps: [],
+  contradictionFlags: [],
 });
 
 class NoopVectorStore implements RunbookVectorStore {

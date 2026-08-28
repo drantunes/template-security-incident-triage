@@ -1,6 +1,6 @@
 # Security Incident Triage and Response
 
-Phase 3 adds three versioned identity-incident runbooks and a fail-closed, auditable RAG step to the signed Hono ingestion and asynchronous workflow foundation. It remains mock-only: it does not connect to WorkOS or Upstash, run investigation agents, classify severity, propose containment, or execute actions.
+Phase 4 adds deterministic identity, endpoint, and cloud evidence collection, bounded supervisor agents, integrity-checked persistence, and correlation before the existing fail-closed RAG step. It remains mock-only: it does not connect to WorkOS, IPinfo, an EDR, or Upstash, classify severity, propose containment, or execute actions.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ cp .env.example .env
 openssl rand -hex 32
 ```
 
-Put separately generated values in `ALERT_WEBHOOK_SECRET` and `WORKOS_WEBHOOK_SECRET`. The local LibSQL database needs no token. An OpenAI API key is needed only when invoking the smoke agent. Runbook retrieval uses local BGE Small EN v1.5 embeddings with 384 dimensions and does not require an API key.
+Put separately generated values in `ALERT_WEBHOOK_SECRET` and `WORKOS_WEBHOOK_SECRET`. The local LibSQL database needs no token. An OpenAI API key is needed when the Phase 4 workflow invokes its registered agents; automated tests inject deterministic model doubles and make no model or network calls. Runbook retrieval uses local BGE Small EN v1.5 embeddings with 384 dimensions and does not require an API key.
 
 ## Runbook validation and indexing
 
@@ -87,7 +87,7 @@ curl --fail-with-body \
   http://localhost:3000/webhooks/alerts
 ```
 
-A new or equivalent retry returns `202` only after incident, alert, initial timeline and outbox commit. The dispatcher then publishes `security.alert.received` through Mastra's configured PubSub, and the worker uses a deterministic run ID with `startAsync`. The workflow transitions `received` to `investigating`, resolves the unique active runbook generation by incident kind before similarity, queries only that physical index, validates vector metadata against authoritative chunks, and persists the exact citation, ranks, scores and hashes. Missing, inactive, ambiguous, corrupted, low-score or unavailable runbooks fail closed without a global fallback. Investigation agents and providers belong to later phases.
+A new or equivalent retry returns `202` only after incident, alert, initial timeline and outbox commit. The dispatcher then publishes `security.alert.received` through Mastra's configured PubSub, and the worker uses a deterministic run ID with `startAsync`. The workflow transitions `received` to `investigating`, validates one trusted tenant/incident/subject/run context, starts identity, endpoint and cloud gather steps with Mastra `.parallel()`, and persists every valid mock fact before correlation. Source failures remain explicit gaps; integrity or storage failures fail closed. Correlation uses only verified evidence IDs and records ordering, relations, contradictions and missing sources without severity or actions. The unchanged RAG step then resolves the unique active runbook generation and persists its exact citations. Missing, inactive, ambiguous, corrupted, low-score or unavailable runbooks still fail closed without a global fallback.
 
 `/webhooks/workos` is a synthetic adapter using `WorkOS-Signature` with the same cryptographic semantics. It supports only `mock.user.role_changed`, `mock.session.country_login` and `mock.session.unknown_device`. Unknown/incompatible authenticated mock events are acknowledged only after a redacted dead-letter record; this is not complete WorkOS event support.
 

@@ -88,3 +88,30 @@ export function readPhase2Config(
     port: value.PORT,
   });
 }
+
+const phase4EnvironmentSchema = z.object({
+  MASTRA_MODEL: z.string().trim().min(1).default("openai/gpt-4o-mini"),
+  EVIDENCE_IDENTITY_TIMEOUT_MS: integer(1_500, 100, 30_000),
+  EVIDENCE_ENDPOINT_TIMEOUT_MS: integer(1_500, 100, 30_000),
+  EVIDENCE_CLOUD_TIMEOUT_MS: integer(1_500, 100, 30_000),
+});
+
+export type Phase4Config = Readonly<{
+  model: string;
+  timeouts: Readonly<Record<"identity" | "endpoint" | "cloud", number>>;
+}>;
+
+export function readPhase4Config(
+  environment: NodeJS.ProcessEnv = process.env,
+): Phase4Config {
+  const parsed = phase4EnvironmentSchema.safeParse(environment);
+  if (!parsed.success) throw new Error("Invalid Phase 4 configuration.");
+  return Object.freeze({
+    model: parsed.data.MASTRA_MODEL,
+    timeouts: Object.freeze({
+      identity: parsed.data.EVIDENCE_IDENTITY_TIMEOUT_MS,
+      endpoint: parsed.data.EVIDENCE_ENDPOINT_TIMEOUT_MS,
+      cloud: parsed.data.EVIDENCE_CLOUD_TIMEOUT_MS,
+    }),
+  });
+}

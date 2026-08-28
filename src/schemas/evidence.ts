@@ -20,6 +20,7 @@ export const EvidenceSourceSchema = z.enum([
 export const EvidenceSchema = z
   .object({
     schemaVersion,
+    hashVersion: z.literal(1),
     evidenceId: opaqueId,
     incidentId: opaqueId,
     tenantId: opaqueId,
