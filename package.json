@@ -13,13 +13,18 @@
     "dev:server": "node --env-file-if-exists=.env --import tsx src/start.ts",
     "dev:studio": "mastra dev",
     "fixture:sign": "node --env-file-if-exists=.env scripts/sign-webhook.mjs scripts/fixtures/phase2-alert.json",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "npm run runbooks:validate && tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=.env dist/start.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "runbooks:validate": "node --import tsx scripts/runbooks.mts validate",
+    "runbooks:index": "node --import tsx scripts/runbooks.mts index",
+    "runbooks:inspect": "node --import tsx scripts/runbooks.mts inspect",
+    "runbooks:rollback": "node --import tsx scripts/runbooks.mts rollback",
+    "runbooks:cleanup": "node --import tsx scripts/runbooks.mts cleanup",
     "audit": "npm audit --audit-level=high"
   },
   "dependencies": {
@@ -27,8 +32,10 @@
     "@libsql/client": "0.17.4",
     "@mastra/auth-workos": "1.6.4",
     "@mastra/core": "1.63.0",
+    "@mastra/fastembed": "1.2.0",
     "@mastra/hono": "1.7.3",
     "@mastra/libsql": "1.22.0",
+    "@mastra/rag": "2.6.0",
     "@mastra/redis-streams": "0.4.0",
     "hono": "4.13.5",
     "zod": "4.4.3"
@@ -43,5 +50,8 @@
     "typescript": "5.9.3",
     "typescript-eslint": "8.68.0",
     "vitest": "4.1.11"
+  },
+  "overrides": {
+    "adm-zip": "0.6.0"
   }
 }

@@ -13,7 +13,7 @@ afterEach(async () => {
 });
 
 describe("SOC migrations", () => {
-  it("creates all 13 tables, constraints and indexes from an empty database", async () => {
+  it("creates the operational and runbook tables, constraints and indexes from an empty database", async () => {
     const database = await createTempDatabase();
     databases.push(database);
     const store = database.createStore();
@@ -26,10 +26,13 @@ describe("SOC migrations", () => {
           WHERE type = 'table' AND (name LIKE 'soc_%' OR name IN (
             'incidents','alerts','evidence_items','workflow_runs','containment_plans',
             'containment_actions','approvals','timeline_events','authorized_devices',
-            'identity_snapshots','provider_deliveries','outbox_events','dead_letter_events'
+            'identity_snapshots','provider_deliveries','outbox_events','dead_letter_events',
+            'runbook_versions','runbook_generations','runbook_chunks','runbook_activations',
+            'runbook_activation_events','runbook_generation_cleanup_claims',
+            'runbook_retrievals','runbook_retrieval_chunks'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(14);
+      expect(tables.rows).toHaveLength(22);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
       );
@@ -37,7 +40,7 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(17);
+      expect(Number(indexes.rows[0]?.count)).toBe(27);
 
       await expect(
         store.execute({
@@ -52,11 +55,12 @@ describe("SOC migrations", () => {
     }
   });
 
-  it("supports 0001 to 0002 upgrade, no-op reapplication and reopening", async () => {
+  it("supports 0001 to 0002 to 0004 upgrade, no-op reapplication and reopening", async () => {
     const database = await createTempDatabase();
     databases.push(database);
     let store = database.createStore();
     await migrateOperationalStore(store, { targetVersion: 1 });
+    await migrateOperationalStore(store, { targetVersion: 2 });
     await store.execute({
       sql: `INSERT INTO incidents(
         id, tenant_id, kind, subject_id, status, created_at, updated_at
@@ -78,7 +82,12 @@ describe("SOC migrations", () => {
       const ledger = await store.execute({
         sql: "SELECT version FROM soc_schema_migrations ORDER BY version",
       });
-      expect(ledger.rows).toEqual([{ version: 1 }, { version: 2 }]);
+      expect(ledger.rows).toEqual([
+        { version: 1 },
+        { version: 2 },
+        { version: 3 },
+        { version: 4 },
+      ]);
     } finally {
       store.close();
     }
