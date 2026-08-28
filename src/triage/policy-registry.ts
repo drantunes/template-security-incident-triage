@@ -122,7 +122,7 @@ export const evidenceRequirements = {
     endpoint,
     endpointProviders,
     rule,
-    (value, context) => context.deviceId !== undefined && booleanValue(value),
+    (value, context) => context.deviceId !== undefined && value === true,
   ),
   deviceAuthorized: requirement(
     "device.authorized",
@@ -195,7 +195,9 @@ export const severityRules: Readonly<Record<IncidentKind, SeverityRule>> = {
     centralEvent: (facts) =>
       value(facts, "device.signatureValid") === true &&
       value(facts, "device.authorized") === false,
-    benignExplanation: (facts) => value(facts, "device.authorized") === true,
+    benignExplanation: (facts) =>
+      value(facts, "device.signatureValid") === true &&
+      value(facts, "device.authorized") === true,
     aggravatingEvidence: evidenceRequirements.abnormalHistory,
   },
 };

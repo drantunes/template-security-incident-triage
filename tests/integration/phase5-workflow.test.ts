@@ -224,6 +224,46 @@ describe("Phase 5 workflow", () => {
     },
   );
 
+  it("stops an invalid device signature before planning or persistence", async () => {
+    const database = await setupDatabase("unknown_device_login");
+    const planner = vi.fn(deterministicResponsePlanner);
+    const endpointProvider = overrideFact(
+      overrideFact(
+        new MockEndpointEvidenceProvider(),
+        "device.authorized",
+        true,
+      ),
+      "device.signatureValid",
+      false,
+    );
+    const workflow = createPhase5Workflow(database, planner, {
+      endpointProvider,
+    });
+    const run = await workflow.createRun({ runId: "workflow-run-1" });
+    const result = await run.start({ inputData: workflowInput });
+    expect(result.status).toBe("success");
+    if (result.status !== "success") return;
+    expect(result.result).toEqual({
+      status: "manual-review",
+      incidentId: "incident-1",
+      reasonCodes: ["REQUIRED_EVIDENCE_INCOMPLETE"],
+    });
+    expect(planner).not.toHaveBeenCalled();
+
+    const store = database.createStore();
+    try {
+      const rows = await store.execute({
+        sql: `SELECT
+          (SELECT count(*) FROM containment_plans) AS plans,
+          (SELECT count(*) FROM containment_actions) AS actions,
+          (SELECT count(*) FROM approvals) AS approvals`,
+      });
+      expect(rows.rows).toEqual([{ plans: 0, actions: 0, approvals: 0 }]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("produces identical plan bytes and hash when the planner reverses equivalent actions", async () => {
     const baselineDatabase = await setupDatabase("disallowed_country_login");
     const reorderedDatabase = await setupDatabase("disallowed_country_login");

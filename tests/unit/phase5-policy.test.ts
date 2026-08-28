@@ -41,6 +41,22 @@ describe("Phase 5 deterministic severity policy", () => {
     },
   );
 
+  it("routes an invalid device signature to manual review", () => {
+    const context = phase5Context("unknown_device_login", { benign: true });
+    const evidence = context.evidence.map((item) =>
+      item.fact.factType === "device.signatureValid"
+        ? { ...item, fact: { ...item.fact, value: false } }
+        : item,
+    );
+    expect(
+      evaluateSeverityPolicy(context.correlation.context, evidence, 0),
+    ).toMatchObject({
+      outcome: "manual-review",
+      effectiveConfidence: 0,
+      reasonCodes: expect.arrayContaining(["REQUIRED_EVIDENCE_INCOMPLETE"]),
+    });
+  });
+
   it("rejects required evidence with the wrong source, provider, provenance, domain, or context binding", () => {
     const context = phase5Context("disallowed_country_login");
     const country = context.evidence.find(
