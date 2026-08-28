@@ -6,6 +6,7 @@ import { endpointInvestigator } from "./agents/endpoint-investigator.js";
 import { cloudInvestigator } from "./agents/cloud-investigator.js";
 import { correlationAnalyst } from "./agents/correlation-analyst.js";
 import { socSupervisor } from "./agents/soc-supervisor.js";
+import { responsePlanner } from "./agents/response-planner.js";
 import { storage } from "./storage.js";
 import { baselineWorkflow } from "./workflows/baseline-workflow.js";
 import { incidentIngestionWorkflow } from "./workflows/incident-ingestion-workflow.js";
@@ -21,6 +22,7 @@ export const mastra = new Mastra({
     cloudInvestigator,
     correlationAnalyst,
     socSupervisor,
+    responsePlanner,
   },
   workflows: { baselineWorkflow, incidentIngestionWorkflow },
   storage,

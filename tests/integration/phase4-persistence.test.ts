@@ -100,6 +100,8 @@ describe("Phase 4 evidence persistence", () => {
         "evidence-outbox-2",
         "evidence-timeline-3",
         "evidence-outbox-3",
+        "evidence-timeline-4",
+        "evidence-outbox-4",
       ]),
     });
     const retry = await persistEvidenceItems(store, input, {
@@ -109,7 +111,7 @@ describe("Phase 4 evidence persistence", () => {
     const counts = await store.execute({
       sql: "SELECT count(*) AS count FROM evidence_items",
     });
-    expect(Number(counts.rows[0]?.count)).toBe(3);
+    expect(Number(counts.rows[0]?.count)).toBe(4);
     await expect(
       persistEvidenceItems(
         store,

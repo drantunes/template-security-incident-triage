@@ -41,6 +41,28 @@ function identityFacts(
       fact(input.occurredAt, "previous-role", "role.previous", "member"),
       fact(input.occurredAt, "current-role", "role.current", "admin"),
       fact(input.occurredAt, "actor", "actor.id", "synthetic-admin-1"),
+      booleanFact(
+        input.occurredAt,
+        "approved-change",
+        "change.approved",
+        false,
+      ),
+      ...(input.sessionId
+        ? [
+            fact(
+              input.occurredAt,
+              "session-subject",
+              "session.subject",
+              input.subjectId,
+            ),
+            booleanFact(
+              input.occurredAt,
+              "session-active",
+              "session.active",
+              true,
+            ),
+          ]
+        : []),
     ];
   }
   return [
@@ -51,6 +73,25 @@ function identityFacts(
       input.subjectId,
     ),
   ];
+}
+
+function booleanFact(
+  observedAt: string,
+  semanticKey: string,
+  factType: string,
+  value: boolean,
+): EvidenceFact {
+  return {
+    semanticKey,
+    observedAt,
+    factType,
+    value,
+    confidence: 1,
+    confidenceProvenance: "rule-v1",
+    rawPayloadRef: `protected:identity:${semanticKey}`,
+    sensitivity: "confidential",
+    incomplete: false,
+  };
 }
 
 function fact(

@@ -13,7 +13,6 @@ import { CorrelationSchema } from "../../evidence/contracts.js";
 import {
   createRetrieveRunbookStep,
   InvestigationStartedSchema,
-  RunbookRetrievedSchema,
   type RetrieveStepDependencies,
 } from "../steps/retrieve-runbook.js";
 import { createLoadInvestigationContextStep } from "../steps/load-investigation-context.js";
@@ -34,6 +33,14 @@ import type { InvestigatorInvoker } from "../agents/investigator-output.js";
 import type { SupervisorInvoker } from "../agents/soc-supervisor.js";
 import type { CorrelationAnalystInvoker } from "../agents/correlation-analyst.js";
 import type { EvidenceReadTool } from "../tools/evidence-read-tool.js";
+import {
+  createClassifySeverityStep,
+  type Phase5StepDependencies,
+} from "../steps/classify-severity.js";
+import { createGenerateSummaryStep } from "../steps/generate-summary.js";
+import { createProposeContainmentStep } from "../steps/propose-containment.js";
+import { createValidateContainmentStep } from "../steps/validate-containment.js";
+import { Phase5ResultSchema } from "../../triage/decision-contracts.js";
 
 export const IncidentIngestionInputSchema = z
   .object({
@@ -66,6 +73,7 @@ export function createIncidentIngestionWorkflow(
     clock?: Clock;
     ids?: IdGenerator;
   }> = {},
+  phase5Dependencies: Phase5StepDependencies = {},
 ) {
   const startInvestigation = createStep({
     id: "start-investigation",
@@ -76,7 +84,14 @@ export function createIncidentIngestionWorkflow(
     execute: async ({ inputData }) => {
       const store = openStore();
       try {
-        const result = await materializeInvestigationStart(store, inputData);
+        const result = await materializeInvestigationStart(store, inputData, {
+          ...(evidenceDependencies.clock
+            ? { clock: evidenceDependencies.clock }
+            : {}),
+          ...(evidenceDependencies.ids
+            ? { ids: evidenceDependencies.ids }
+            : {}),
+        });
         return { ...inputData, ...result };
       } finally {
         store.close();
@@ -168,12 +183,16 @@ export function createIncidentIngestionWorkflow(
       duplicate: getStepResult(startInvestigation).duplicate,
     }),
   });
+  const phase5 = {
+    ...phase5Dependencies,
+    openStore: phase5Dependencies.openStore ?? openStore,
+  };
   return createWorkflow({
     id: INCIDENT_INGESTION_WORKFLOW_ID,
     description:
-      "Starts investigation, gathers and correlates evidence in parallel, then retrieves the runbook.",
+      "Gathers evidence, retrieves policy, classifies, summarizes, proposes, and validates a non-executable plan.",
     inputSchema: IncidentIngestionInputSchema,
-    outputSchema: RunbookRetrievedSchema,
+    outputSchema: Phase5ResultSchema,
   })
     .then(startInvestigation)
     .then(loadContext)
@@ -182,6 +201,10 @@ export function createIncidentIngestionWorkflow(
     .then(correlate)
     .then(prepareRunbookRetrieval)
     .then(createRetrieveRunbookStep({ openStore, ...retrieveDependencies }))
+    .then(createClassifySeverityStep(phase5))
+    .then(createGenerateSummaryStep(phase5))
+    .then(createProposeContainmentStep(phase5))
+    .then(createValidateContainmentStep(phase5))
     .commit();
 }
 
