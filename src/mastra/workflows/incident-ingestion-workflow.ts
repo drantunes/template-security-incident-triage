@@ -8,6 +8,12 @@ import {
   materializeInvestigationStart,
 } from "../../db/workflow-run-operations.js";
 import { opaqueId } from "../../schemas/common.js";
+import {
+  createRetrieveRunbookStep,
+  InvestigationStartedSchema,
+  RunbookRetrievedSchema,
+  type RetrieveStepDependencies,
+} from "../steps/retrieve-runbook.js";
 
 export const IncidentIngestionInputSchema = z
   .object({
@@ -19,26 +25,21 @@ export const IncidentIngestionInputSchema = z
   })
   .strict();
 
-const outputSchema = z
-  .object({
-    runId: opaqueId,
-    duplicate: z.boolean(),
-  })
-  .strict();
-
 export function createIncidentIngestionWorkflow(
   openStore: () => OperationalStore = createLibSqlOperationalStore,
+  retrieveDependencies: RetrieveStepDependencies = {},
 ) {
   const startInvestigation = createStep({
     id: "start-investigation",
     description:
       "Materializes the idempotent received-to-investigating marker.",
     inputSchema: IncidentIngestionInputSchema,
-    outputSchema,
+    outputSchema: InvestigationStartedSchema,
     execute: async ({ inputData }) => {
       const store = openStore();
       try {
-        return await materializeInvestigationStart(store, inputData);
+        const result = await materializeInvestigationStart(store, inputData);
+        return { ...inputData, ...result };
       } finally {
         store.close();
       }
@@ -46,11 +47,13 @@ export function createIncidentIngestionWorkflow(
   });
   return createWorkflow({
     id: INCIDENT_INGESTION_WORKFLOW_ID,
-    description: "Starts only the Phase 2 investigation state transition.",
+    description:
+      "Starts investigation and retrieves the eligible Phase 3 runbook.",
     inputSchema: IncidentIngestionInputSchema,
-    outputSchema,
+    outputSchema: RunbookRetrievedSchema,
   })
     .then(startInvestigation)
+    .then(createRetrieveRunbookStep({ openStore, ...retrieveDependencies }))
     .commit();
 }
 

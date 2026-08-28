@@ -1,0 +1,55 @@
+import { z } from "zod";
+
+import type { ContainmentActionType } from "../schemas/containment.js";
+import { IncidentKindSchema } from "../schemas/incident.js";
+
+export const RUNBOOK_SCHEMA_VERSION = 1;
+export const CHUNKING_ALGORITHM_VERSION = 1;
+export const EMBEDDING_PROVIDER = "fastembed";
+export const EMBEDDING_MODEL = "bge-small-en-v1.5";
+export const EMBEDDING_DIMENSION = 384;
+
+export const RunbookFrontmatterSchema = z
+  .object({
+    id: z.string().regex(/^RB-IDENTITY-00[1-3]$/u),
+    version: z.string().regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u),
+    incidentKinds: z.array(IncidentKindSchema).min(1).max(3),
+    owner: z.literal("security"),
+    status: z.enum(["active", "inactive"]),
+  })
+  .strict()
+  .refine(
+    (value) => new Set(value.incidentKinds).size === value.incidentKinds.length,
+  );
+
+export const RunbookChunkMetadataSchema = z
+  .object({
+    schemaVersion: z.literal(RUNBOOK_SCHEMA_VERSION),
+    chunkingAlgorithmVersion: z.literal(CHUNKING_ALGORITHM_VERSION),
+    chunkId: z.string().regex(/^rch_[0-9a-f]{64}$/u),
+    vectorId: z.string().regex(/^rch_[0-9a-f]{64}$/u),
+    runbookId: RunbookFrontmatterSchema.shape.id,
+    runbookVersion: RunbookFrontmatterSchema.shape.version,
+    incidentKind: IncidentKindSchema,
+    status: z.enum(["active", "inactive"]),
+    owner: z.literal("security"),
+    sourcePath: z.string().regex(/^src\/mastra\/runbooks\/[a-z0-9-]+\.md$/u),
+    sectionKey: z.string().regex(/^[a-z0-9-]+$/u),
+    sectionOrdinal: z.number().int().min(1).max(9),
+    chunkOrdinal: z.number().int().nonnegative(),
+    sourceHash: z.string().regex(/^[0-9a-f]{64}$/u),
+    contentHash: z.string().regex(/^[0-9a-f]{64}$/u),
+    metadataHash: z.string().regex(/^[0-9a-f]{64}$/u),
+    generationId: z.string().min(1).max(128),
+    indexName: z.string().regex(/^rb_[a-z0-9_]+$/u),
+    embeddingProvider: z.literal(EMBEDDING_PROVIDER),
+    embeddingModel: z.literal(EMBEDDING_MODEL),
+    embeddingDimension: z.literal(EMBEDDING_DIMENSION),
+    text: z.string().min(1).max(1_200),
+  })
+  .strict()
+  .refine((value) => value.chunkId === value.vectorId);
+
+export type RunbookFrontmatter = z.infer<typeof RunbookFrontmatterSchema>;
+export type RunbookChunkMetadata = z.infer<typeof RunbookChunkMetadataSchema>;
+export type AllowedAction = ContainmentActionType;

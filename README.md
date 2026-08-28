@@ -1,6 +1,6 @@
 # Security Incident Triage and Response
 
-Phase 2 provides signed Hono ingestion and an outbox-backed, asynchronous Mastra workflow start. It is intentionally mock-only: it does not install WorkOS AuthKit, connect to WorkOS or Upstash, or process real identities.
+Phase 3 adds three versioned identity-incident runbooks and a fail-closed, auditable RAG step to the signed Hono ingestion and asynchronous workflow foundation. It remains mock-only: it does not connect to WorkOS or Upstash, run investigation agents, classify severity, propose containment, or execute actions.
 
 ## Requirements
 
@@ -15,7 +15,44 @@ cp .env.example .env
 openssl rand -hex 32
 ```
 
-Put separately generated values in `ALERT_WEBHOOK_SECRET` and `WORKOS_WEBHOOK_SECRET`. The local LibSQL database needs no token. An OpenAI API key is needed only when invoking the smoke agent; ingestion and the Phase 2 workflow do not call a model.
+Put separately generated values in `ALERT_WEBHOOK_SECRET` and `WORKOS_WEBHOOK_SECRET`. The local LibSQL database needs no token. An OpenAI API key is needed only when invoking the smoke agent. Runbook retrieval uses local BGE Small EN v1.5 embeddings with 384 dimensions and does not require an API key.
+
+## Runbook validation and indexing
+
+Validate the strict frontmatter, canonical sections, action allowlist, links, deterministic chunk IDs and hashes without network access:
+
+```sh
+npm run runbooks:validate
+```
+
+Index all three validated runbooks into immutable physical LibSQL vector indexes and atomically activate one generation per incident kind:
+
+```sh
+npm run runbooks:index
+```
+
+The first explicit indexing run may download BGE Small EN v1.5 into `RUNBOOK_FASTEMBED_CACHE_DIR`; default tests and CI use deterministic test embeddings and never download a model. Repeating the command is idempotent for unchanged bytes. A changed published SemVer is rejected and must be introduced as a new version.
+
+Inspect the active pointers, CAS revisions and append-only activation ledger before maintenance:
+
+```sh
+npm run runbooks:inspect
+```
+
+Rollback accepts only a previously activated, retired and intact generation. It reads back the exact physical vector index, then atomically switches the pointer with the inspected revision and records a `rollback` event:
+
+```sh
+npm run runbooks:rollback -- <generation-id> <expected-revision>
+```
+
+Cleanup requires the exact retired/failed generation, index and chunk count. It defaults to dry-run, refuses active or in-flight retrievals, establishes a durable cleanup claim, revalidates immediately before deletion and never uses a wildcard:
+
+```sh
+npm run runbooks:cleanup -- <generation-id> <index-name> <chunk-count> --dry-run
+npm run runbooks:cleanup -- <generation-id> <index-name> <chunk-count> --execute
+```
+
+Retrieval ownership uses a 60-second fenced lease. A retry during a live lease is refused; after expiry, one CAS winner renews the lease while preserving the exact generation and policy selection. An expired owner cannot persist success or failure, and cleanup blocks valid leases while safely claiming a generation whose retrieval lease is stale.
 
 ## Running
 
@@ -50,7 +87,7 @@ curl --fail-with-body \
   http://localhost:3000/webhooks/alerts
 ```
 
-A new or equivalent retry returns `202` only after incident, alert, initial timeline and outbox commit. The dispatcher then publishes `security.alert.received` through Mastra's configured PubSub, and the worker uses a deterministic run ID with `startAsync`. The Phase 2 workflow only transitions `received` to `investigating`; investigation, agents and providers belong to later phases.
+A new or equivalent retry returns `202` only after incident, alert, initial timeline and outbox commit. The dispatcher then publishes `security.alert.received` through Mastra's configured PubSub, and the worker uses a deterministic run ID with `startAsync`. The workflow transitions `received` to `investigating`, resolves the unique active runbook generation by incident kind before similarity, queries only that physical index, validates vector metadata against authoritative chunks, and persists the exact citation, ranks, scores and hashes. Missing, inactive, ambiguous, corrupted, low-score or unavailable runbooks fail closed without a global fallback. Investigation agents and providers belong to later phases.
 
 `/webhooks/workos` is a synthetic adapter using `WorkOS-Signature` with the same cryptographic semantics. It supports only `mock.user.role_changed`, `mock.session.country_login` and `mock.session.unknown_device`. Unknown/incompatible authenticated mock events are acknowledged only after a redacted dead-letter record; this is not complete WorkOS event support.
 
@@ -68,6 +105,7 @@ A new or equivalent retry returns `202` only after incident, alert, initial time
 npm run format:check
 npm run lint
 npm run typecheck
+npm run runbooks:validate
 npm test
 npm run build
 npm run audit

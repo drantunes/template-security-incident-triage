@@ -8,4 +8,5 @@ dist/
 *.db-shm
 *.db-wal
 coverage/
+.cache/
 .DS_Store
