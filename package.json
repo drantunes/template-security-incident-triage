@@ -35,6 +35,7 @@
     "@mastra/fastembed": "1.2.0",
     "@mastra/hono": "1.7.3",
     "@mastra/libsql": "1.22.0",
+    "@mastra/observability": "1.17.3",
     "@mastra/rag": "2.6.0",
     "@mastra/redis-streams": "0.4.0",
     "hono": "4.13.5",

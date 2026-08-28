@@ -22,6 +22,7 @@ describe("strict versioned schemas", () => {
     expect(
       EvidenceSchema.parse({
         schemaVersion: 1,
+        hashVersion: 1,
         evidenceId: "evidence-1",
         incidentId: "incident-1",
         tenantId: "tenant-1",
@@ -180,6 +181,7 @@ describe("strict versioned schemas", () => {
   it("enforces version and strictness on every top-level boundary schema", () => {
     const evidence = {
       schemaVersion: 1,
+      hashVersion: 1,
       evidenceId: "evidence-1",
       incidentId: "incident-1",
       tenantId: "tenant-1",

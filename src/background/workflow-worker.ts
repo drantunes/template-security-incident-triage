@@ -15,6 +15,7 @@ import { persistStandaloneDeadLetter } from "../db/webhook-operations.js";
 import type { StructuredLogger } from "../logging.js";
 import { DomainEventSchema } from "../schemas/domain-event.js";
 import { opaqueId } from "../schemas/common.js";
+import { createPhase4TraceCarrier } from "../mastra/observability.js";
 
 const workerEventSchema = DomainEventSchema.extend({
   type: z.literal("security.alert.received"),
@@ -26,6 +27,12 @@ const workerEventSchema = DomainEventSchema.extend({
 type WorkflowRun = Readonly<{
   startAsync(input: {
     inputData: StartInvestigationInput;
+    requestContext?: ReturnType<
+      typeof createPhase4TraceCarrier
+    >["requestContext"];
+    tracingOptions?: ReturnType<
+      typeof createPhase4TraceCarrier
+    >["tracingOptions"];
   }): Promise<{ runId: string }>;
 }>;
 
@@ -95,6 +102,12 @@ export async function startWorkflowWorker(
         runId: event.data.eventId,
         resourceId: event.data.incidentId,
       });
+      const traceCarrier = createPhase4TraceCarrier({
+        tenantId: event.data.tenantId,
+        incidentId: event.data.incidentId,
+        runId: event.data.eventId,
+        correlationId: event.data.correlationId,
+      });
       const started = await run.startAsync({
         inputData: {
           eventId: event.data.eventId,
@@ -103,6 +116,7 @@ export async function startWorkflowWorker(
           alertId: event.data.payload.alertId,
           correlationId: event.data.correlationId,
         },
+        ...traceCarrier,
       });
       input.logger.write({
         event: "worker.started",
