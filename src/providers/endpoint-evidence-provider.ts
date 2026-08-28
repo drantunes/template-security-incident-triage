@@ -27,37 +27,71 @@ export class MockEndpointEvidenceProvider implements EndpointEvidenceProvider {
       ...(this.options.release ? { release: this.options.release } : {}),
       ...(this.options.onStart ? { onStart: this.options.onStart } : {}),
       callLog: this.calls,
-      facts: (request) => endpointFacts(request.occurredAt, request.deviceId),
+      facts: (request) =>
+        endpointFacts(
+          request.occurredAt,
+          request.incidentKind,
+          request.deviceId,
+        ),
     });
   }
 }
 
 function endpointFacts(
   observedAt: string,
+  incidentKind: string,
   deviceId?: string,
 ): readonly EvidenceFact[] {
+  if (incidentKind !== "unknown_device_login")
+    return [
+      booleanFact(
+        observedAt,
+        "inspection-applicable",
+        "endpoint.inspectionApplicable",
+        false,
+      ),
+    ];
+  const identifier = booleanFact(
+    observedAt,
+    "device-identifier-present",
+    "device.identifierPresent",
+    deviceId !== undefined,
+    deviceId === undefined,
+  );
+  if (!deviceId) return [identifier];
   return [
-    {
-      semanticKey: "device-signature-valid",
+    identifier,
+    booleanFact(
       observedAt,
-      factType: "device.signatureValid",
-      value: true,
-      confidence: 1,
-      confidenceProvenance: "rule-v1",
-      rawPayloadRef: "protected:endpoint:signature",
-      sensitivity: "confidential",
-      incomplete: false,
-    },
-    {
-      semanticKey: "device-authorized",
+      "device-signature-valid",
+      "device.signatureValid",
+      true,
+    ),
+    booleanFact(
       observedAt,
-      factType: "device.authorized",
-      value: deviceId === undefined ? false : deviceId === "device-known-1",
-      confidence: 1,
-      confidenceProvenance: "rule-v1",
-      rawPayloadRef: "protected:endpoint:allowlist",
-      sensitivity: "confidential",
-      incomplete: deviceId === undefined,
-    },
+      "device-authorized",
+      "device.authorized",
+      deviceId === "device-known-1",
+    ),
   ];
+}
+
+function booleanFact(
+  observedAt: string,
+  semanticKey: string,
+  factType: string,
+  value: boolean,
+  incomplete = false,
+): EvidenceFact {
+  return {
+    semanticKey,
+    observedAt,
+    factType,
+    value,
+    confidence: 1,
+    confidenceProvenance: "rule-v1",
+    rawPayloadRef: `protected:endpoint:${semanticKey}`,
+    sensitivity: "confidential",
+    incomplete,
+  };
 }

@@ -129,7 +129,7 @@ describe("Phase 4 workflow", () => {
     const evidence = await verification.execute({
       sql: "SELECT count(*) AS count FROM evidence_items",
     });
-    expect(Number(evidence.rows[0]?.count)).toBe(7);
+    expect(Number(evidence.rows[0]?.count)).toBe(6);
     const eventTypes = await verification.execute({
       sql: "SELECT type FROM timeline_events ORDER BY sequence",
     });
@@ -142,13 +142,7 @@ describe("Phase 4 workflow", () => {
     });
     expect(JSON.parse(String(correlation.rows[0]?.payload_json))).toMatchObject(
       {
-        missingData: [
-          {
-            source: "endpoint",
-            evidenceId: expect.stringMatching(/^ev_[a-f0-9]{64}$/u),
-            reason: "INCOMPLETE_EVIDENCE",
-          },
-        ],
+        missingData: [],
       },
     );
     verification.close();
@@ -1748,14 +1742,14 @@ describe("Phase 4 workflow", () => {
           })
         ).rows[0]?.count,
       ),
-    ).toBe(3);
+    ).toBe(4);
     const correlation = await store.execute({
       sql: `SELECT payload_json FROM timeline_events
         WHERE type = 'evidence.correlated'`,
     });
     expect(JSON.parse(String(correlation.rows[0]?.payload_json))).toMatchObject(
       {
-        evidenceCount: 3,
+        evidenceCount: 4,
         missingSourceCount: 2,
       },
     );

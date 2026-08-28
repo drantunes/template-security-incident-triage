@@ -20,7 +20,7 @@ afterEach(async () => {
 });
 
 describe("Phase 3 workflow integration", () => {
-  it("runs retrieve-runbook after materializing investigation without adding later-phase behavior", async () => {
+  it("runs retrieve-runbook before Phase 5 and blocks a non-persisted retrieval double", async () => {
     const database = await createTempDatabase();
     databases.push(database);
     const setupStore = database.createStore();
@@ -71,9 +71,9 @@ describe("Phase 3 workflow integration", () => {
     expect(result.status).toBe("success");
     if (result.status === "success") {
       expect(result.result).toMatchObject({
-        retrievalId: "retrieval-1",
-        runbookId: "RB-IDENTITY-001",
-        citation: "[runbook:RB-IDENTITY-001@1.0.0]",
+        status: "blocked",
+        incidentId: "incident-1",
+        reasonCodes: ["INTEGRITY_CHECK_FAILED"],
       });
     }
     expect(retrieve).toHaveBeenCalledOnce();

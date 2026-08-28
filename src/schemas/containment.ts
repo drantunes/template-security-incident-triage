@@ -40,7 +40,7 @@ export const ContainmentPlanSchema = z
     planHash: sha256,
     createdAt: utcTimestamp,
     expiresAt: utcTimestamp,
-    actions: z.array(ContainmentActionSchema).min(1).max(16),
+    actions: z.array(ContainmentActionSchema).min(1).max(2),
   })
   .strict()
   .refine((plan) => plan.expiresAt > plan.createdAt, {

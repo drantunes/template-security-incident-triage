@@ -27,17 +27,67 @@ export class MockCloudEvidenceProvider implements CloudEvidenceProvider {
       ...(this.options.release ? { release: this.options.release } : {}),
       ...(this.options.onStart ? { onStart: this.options.onStart } : {}),
       callLog: this.calls,
-      facts: (request) => cloudFacts(request.occurredAt, request.incidentKind),
+      facts: (request) =>
+        cloudFacts(
+          request.occurredAt,
+          request.incidentKind,
+          request.ip !== undefined,
+        ),
     });
   }
 }
 
-function cloudFacts(observedAt: string, kind: string): readonly EvidenceFact[] {
+function cloudFacts(
+  observedAt: string,
+  kind: string,
+  ipPresent: boolean,
+): readonly EvidenceFact[] {
   const country = kind === "disallowed_country_login" ? "CA" : "US";
   return [
-    fact(observedAt, "observed-country", "login.country", country),
+    ...(ipPresent
+      ? [fact(observedAt, "observed-country", "login.country", country)]
+      : []),
     fact(observedAt, "allowed-country", "policy.allowedCountry", "US"),
+    ...(kind === "disallowed_country_login"
+      ? [
+          booleanFact(
+            observedAt,
+            "source-ip-present",
+            "login.ipPresent",
+            ipPresent,
+          ),
+        ]
+      : []),
+    ...(kind === "disallowed_country_login" || kind === "unknown_device_login"
+      ? [
+          booleanFact(
+            observedAt,
+            "abnormal-session-history",
+            "session.abnormalHistory",
+            false,
+          ),
+        ]
+      : []),
   ];
+}
+
+function booleanFact(
+  observedAt: string,
+  semanticKey: string,
+  factType: string,
+  value: boolean,
+): EvidenceFact {
+  return {
+    semanticKey,
+    observedAt,
+    factType,
+    value,
+    confidence: 1,
+    confidenceProvenance: "rule-v1",
+    rawPayloadRef: `protected:cloud:${semanticKey}`,
+    sensitivity: "confidential",
+    incomplete: false,
+  };
 }
 
 function fact(
