@@ -115,3 +115,54 @@ export function readPhase4Config(
     }),
   });
 }
+
+const phase6EnvironmentSchema = z.object({
+  DEMO_MODE: z.enum(["mock", "staging", "production"]).default("mock"),
+  MOCK_DECISIONS_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  MOCK_DECISION_SECRET: z.string().min(32).optional(),
+  APPROVAL_RESUME_SECRET: z.string().min(32).optional(),
+  CONTAINMENT_ACTION_TIMEOUT_MS: integer(1_000, 100, 10_000),
+  CONTAINMENT_RATE_LIMIT: integer(8, 1, 32),
+});
+
+export type Phase6Config = Readonly<{
+  mode: "mock" | "staging" | "production";
+  mockDecisionsEnabled: boolean;
+  mockDecisionSecret?: string;
+  approvalResumeSecret?: string;
+  actionTimeoutMs: number;
+  rateLimit: number;
+}>;
+
+export function readPhase6Config(
+  environment: NodeJS.ProcessEnv = process.env,
+): Phase6Config {
+  const parsed = phase6EnvironmentSchema.safeParse(environment);
+  if (!parsed.success) throw new Error("Invalid Phase 6 configuration.");
+  const value = parsed.data;
+  if (
+    value.MOCK_DECISIONS_ENABLED &&
+    (value.DEMO_MODE !== "mock" ||
+      !value.MOCK_DECISION_SECRET ||
+      !value.APPROVAL_RESUME_SECRET)
+  ) {
+    throw new Error(
+      "Mock decisions require mock mode and dedicated decision/resume secrets.",
+    );
+  }
+  return Object.freeze({
+    mode: value.DEMO_MODE,
+    mockDecisionsEnabled: value.MOCK_DECISIONS_ENABLED,
+    ...(value.MOCK_DECISION_SECRET
+      ? { mockDecisionSecret: value.MOCK_DECISION_SECRET }
+      : {}),
+    ...(value.APPROVAL_RESUME_SECRET
+      ? { approvalResumeSecret: value.APPROVAL_RESUME_SECRET }
+      : {}),
+    actionTimeoutMs: value.CONTAINMENT_ACTION_TIMEOUT_MS,
+    rateLimit: value.CONTAINMENT_RATE_LIMIT,
+  });
+}

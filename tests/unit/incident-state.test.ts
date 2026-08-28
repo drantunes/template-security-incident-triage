@@ -24,7 +24,11 @@ describe("incident state machine", () => {
 
   it("keeps closed terminal and allows controlled failed recovery", () => {
     expect(incidentTransitions.closed).toEqual([]);
-    expect(incidentTransitions.failed).toEqual(["investigating", "closed"]);
+    expect(incidentTransitions.failed).toEqual([
+      "investigating",
+      "containing",
+      "closed",
+    ]);
   });
 
   it("maps invalid statuses while preserving forbidden-transition errors", () => {

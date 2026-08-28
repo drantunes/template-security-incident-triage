@@ -5,6 +5,7 @@ import { operationalIndexStatements } from "./0002-operational-indexes.js";
 import { runbookCatalogStatements } from "./0003-runbook-catalog.js";
 import { runbookRetrievalStatements } from "./0004-runbook-retrieval.js";
 import { evidenceIntegrityVersionStatements } from "./0005-evidence-integrity-version.js";
+import { phase6ApprovalContainmentStatements } from "./0006-phase6-approval-containment.js";
 
 export type Migration = Readonly<{
   version: number;
@@ -35,5 +36,10 @@ export const migrations = Object.freeze([
     5,
     "evidence-integrity-version",
     evidenceIntegrityVersionStatements,
+  ),
+  defineMigration(
+    6,
+    "phase6-approval-containment",
+    phase6ApprovalContainmentStatements,
   ),
 ]);

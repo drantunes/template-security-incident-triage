@@ -29,10 +29,13 @@ describe("SOC migrations", () => {
             'identity_snapshots','provider_deliveries','outbox_events','dead_letter_events',
             'runbook_versions','runbook_generations','runbook_chunks','runbook_activations',
             'runbook_activation_events','runbook_generation_cleanup_claims',
-            'runbook_retrievals','runbook_retrieval_chunks'
+            'runbook_retrievals','runbook_retrieval_chunks','approval_resume_tokens',
+            'containment_action_attempts','containment_gateway_audit',
+            'approval_decision_audit','mock_incident_provider_effects',
+            'mock_containment_effects'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(22);
+      expect(tables.rows).toHaveLength(28);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
       );
@@ -40,7 +43,24 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(27);
+      expect(Number(indexes.rows[0]?.count)).toBe(35);
+      const tokenForeignKeys = await store.execute({
+        sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
+      });
+      expect(
+        tokenForeignKeys.rows.filter((row) => row.table === "approvals"),
+      ).toHaveLength(7);
+      const attemptForeignKeys = await store.execute({
+        sql: "PRAGMA foreign_key_list(containment_action_attempts)",
+      });
+      expect(
+        attemptForeignKeys.rows.filter(
+          (row) => row.table === "containment_actions",
+        ),
+      ).toHaveLength(5);
+      expect(
+        attemptForeignKeys.rows.filter((row) => row.table === "approvals"),
+      ).toHaveLength(4);
 
       await expect(
         store.execute({
@@ -88,6 +108,7 @@ describe("SOC migrations", () => {
         { version: 3 },
         { version: 4 },
         { version: 5 },
+        { version: 6 },
       ]);
     } finally {
       store.close();
@@ -135,6 +156,16 @@ describe("SOC migrations", () => {
         ) VALUES ('plan-1', 'incident-1', 'tenant-1', 1, 1, 1, ?, '{}',
           '2026-08-27T13:00:00.000Z', '2026-08-27T12:00:00.000Z')`,
         args: ["a".repeat(64)],
+      });
+      await store.execute({
+        sql: `INSERT INTO workflow_runs(
+          id, incident_id, tenant_id, run_id, workflow_id, status, started_at
+        ) VALUES ('workflow-row-1', 'incident-1', 'tenant-1', 'run-1',
+          'incident-ingestion-workflow', 'running', '2026-08-27T12:00:00.000Z')`,
+      });
+      await store.execute({
+        sql: `UPDATE incidents SET current_run_id = 'run-1'
+          WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
       });
       await expect(
         store.execute({
@@ -383,13 +414,23 @@ describe("SOC migrations", () => {
           '2026-08-27T13:00:00.000Z', '2026-08-27T12:00:00.000Z')`,
         args: ["a".repeat(64)],
       });
+      await store.execute({
+        sql: `INSERT INTO workflow_runs(
+          id, incident_id, tenant_id, run_id, workflow_id, status, started_at
+        ) VALUES ('workflow-temporal', 'incident-1', 'tenant-1', 'run-1',
+          'incident-ingestion-workflow', 'running', '2026-08-27T12:00:00.000Z')`,
+      });
+      await store.execute({
+        sql: `UPDATE incidents SET current_run_id = 'run-1'
+          WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
+      });
       await expect(
         store.execute({
           sql: `INSERT INTO approvals(
             id, plan_id, incident_id, tenant_id, plan_hash_version, plan_hash,
-            requested_at, expires_at
+            requested_at, expires_at, workflow_run_id
           ) VALUES ('invalid-time-approval', 'plan-1', 'incident-1', 'tenant-1', 1, ?,
-            '2026-08-27T12:01:00.000Z', '2026-08-27T12:00:00.000Z')`,
+            '2026-08-27T12:01:00.000Z', '2026-08-27T12:00:00.000Z', 'run-1')`,
           args: ["a".repeat(64)],
         }),
       ).rejects.toMatchObject({ code: "STORAGE_UNAVAILABLE" });
@@ -397,9 +438,9 @@ describe("SOC migrations", () => {
       await store.execute({
         sql: `INSERT INTO approvals(
           id, plan_id, incident_id, tenant_id, plan_hash_version, plan_hash,
-          requested_at, expires_at
-        ) VALUES ('approval-1', 'plan-1', 'incident-1', 'tenant-1', 1, ?,
-          '2026-08-27T12:02:00.000Z', '2026-08-27T13:00:00.000Z')`,
+            requested_at, expires_at, workflow_run_id
+          ) VALUES ('approval-1', 'plan-1', 'incident-1', 'tenant-1', 1, ?,
+            '2026-08-27T12:02:00.000Z', '2026-08-27T13:00:00.000Z', 'run-1')`,
         args: ["a".repeat(64)],
       });
       await expect(

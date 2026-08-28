@@ -28,7 +28,7 @@ import type {
 } from "../../providers/evidence-provider.js";
 import type { Clock } from "../../domain/clock.js";
 import type { IdGenerator } from "../../domain/id-generator.js";
-import { readPhase4Config } from "../../env.js";
+import { readPhase4Config, readPhase6Config } from "../../env.js";
 import type { InvestigatorInvoker } from "../agents/investigator-output.js";
 import type { SupervisorInvoker } from "../agents/soc-supervisor.js";
 import type { CorrelationAnalystInvoker } from "../agents/correlation-analyst.js";
@@ -41,6 +41,17 @@ import { createGenerateSummaryStep } from "../steps/generate-summary.js";
 import { createProposeContainmentStep } from "../steps/propose-containment.js";
 import { createValidateContainmentStep } from "../steps/validate-containment.js";
 import { Phase5ResultSchema } from "../../triage/decision-contracts.js";
+import { Phase6ResultSchema } from "../../approval/phase6-contracts.js";
+import { createRequestApprovalStep } from "../steps/request-approval.js";
+import { createOpenExternalIncidentStep } from "../steps/open-external-incident.js";
+import { createAwaitApprovalStep } from "../steps/await-approval.js";
+import { createExecuteContainmentStep } from "../steps/execute-containment.js";
+import { createVerifyContainmentStep } from "../steps/verify-containment.js";
+import { createUpdateExternalIncidentStep } from "../steps/update-external-incident.js";
+import { createFinalizeIncidentStep } from "../steps/finalize-incident.js";
+import type { IncidentProvider } from "../../providers/incident-provider.js";
+import { MockIncidentProvider } from "../../providers/mock-incident-provider.js";
+import type { MockContainmentState } from "../../containment/mock-state.js";
 
 export const IncidentIngestionInputSchema = z
   .object({
@@ -74,6 +85,16 @@ export function createIncidentIngestionWorkflow(
     ids?: IdGenerator;
   }> = {},
   phase5Dependencies: Phase5StepDependencies = {},
+  phase6Dependencies: Readonly<{
+    enabled?: boolean;
+    provider?: IncidentProvider;
+    state?: MockContainmentState;
+    mode?: "mock" | "staging" | "production";
+    timeoutMs?: number;
+    rateLimit?: number;
+    clock?: Clock;
+    ids?: IdGenerator;
+  }> = {},
 ) {
   const startInvestigation = createStep({
     id: "start-investigation",
@@ -187,12 +208,36 @@ export function createIncidentIngestionWorkflow(
     ...phase5Dependencies,
     openStore: phase5Dependencies.openStore ?? openStore,
   };
-  return createWorkflow({
+  const phase6Config = readPhase6Config();
+  const phase6Provider =
+    phase6Dependencies.provider ?? new MockIncidentProvider({ openStore });
+  const phase6State: MockContainmentState = phase6Dependencies.state ?? {
+    sessions: new Map(),
+    roles: new Map(),
+    devices: new Map(),
+    reauthentication: new Map(),
+    calls: new Map(),
+  };
+  const phase6Shared = {
+    openStore,
+    ...(phase6Dependencies.clock
+      ? { clock: phase6Dependencies.clock }
+      : evidenceDependencies.clock
+        ? { clock: evidenceDependencies.clock }
+        : {}),
+    ...(phase6Dependencies.ids
+      ? { ids: phase6Dependencies.ids }
+      : evidenceDependencies.ids
+        ? { ids: evidenceDependencies.ids }
+        : {}),
+  };
+  const phase6Enabled = phase6Dependencies.enabled === true;
+  const workflow = createWorkflow({
     id: INCIDENT_INGESTION_WORKFLOW_ID,
     description:
-      "Gathers evidence, retrieves policy, classifies, summarizes, proposes, and validates a non-executable plan.",
+      "Triages an incident, persists approval, suspends for a manager decision, and executes only approved mock containment.",
     inputSchema: IncidentIngestionInputSchema,
-    outputSchema: Phase5ResultSchema,
+    outputSchema: phase6Enabled ? Phase6ResultSchema : Phase5ResultSchema,
   })
     .then(startInvestigation)
     .then(loadContext)
@@ -204,7 +249,34 @@ export function createIncidentIngestionWorkflow(
     .then(createClassifySeverityStep(phase5))
     .then(createGenerateSummaryStep(phase5))
     .then(createProposeContainmentStep(phase5))
-    .then(createValidateContainmentStep(phase5))
+    .then(createValidateContainmentStep(phase5));
+  if (!phase6Enabled) return workflow.commit();
+  return workflow
+    .then(createRequestApprovalStep(phase6Shared))
+    .then(
+      createOpenExternalIncidentStep({
+        ...phase6Shared,
+        provider: phase6Provider,
+      }),
+    )
+    .then(createAwaitApprovalStep(phase6Shared))
+    .then(
+      createExecuteContainmentStep({
+        ...phase6Shared,
+        state: phase6State,
+        mode: phase6Dependencies.mode ?? phase6Config.mode,
+        timeoutMs: phase6Dependencies.timeoutMs ?? phase6Config.actionTimeoutMs,
+        rateLimit: phase6Dependencies.rateLimit ?? phase6Config.rateLimit,
+      }),
+    )
+    .then(createVerifyContainmentStep())
+    .then(
+      createUpdateExternalIncidentStep({
+        ...phase6Shared,
+        provider: phase6Provider,
+      }),
+    )
+    .then(createFinalizeIncidentStep(phase6Shared))
     .commit();
 }
 
@@ -213,4 +285,6 @@ export const incidentIngestionWorkflow = createIncidentIngestionWorkflow(
   createLibSqlOperationalStore,
   {},
   { timeouts: phase4Config.timeouts },
+  {},
+  { enabled: true },
 );

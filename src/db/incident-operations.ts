@@ -24,6 +24,11 @@ export type OperationDependencies = Readonly<{
   enforceAlertOrdering?: boolean;
 }>;
 
+type TransitionDependencies = OperationDependencies &
+  Readonly<{
+    assertReady?: (tx: StoreTransaction) => Promise<void>;
+  }>;
+
 const reservedTransitionPayloadKeys = new Set([
   "category",
   "causationId",
@@ -244,7 +249,7 @@ export async function transitionIncident(
     causationId?: string;
     payload?: Readonly<Record<string, string | number | boolean | null>>;
   }>,
-  dependencies: OperationDependencies = {},
+  dependencies: TransitionDependencies = {},
 ): Promise<Incident> {
   if (input.to === "approved" || input.to === "rejected") {
     throw new DomainError("VALIDATION_FAILED");
@@ -264,6 +269,7 @@ export async function transitionIncident(
   const occurredAt = clock.now();
 
   return store.transaction(async (tx) => {
+    await dependencies.assertReady?.(tx);
     const current = await tx.execute({
       sql: "SELECT status, updated_at FROM incidents WHERE tenant_id = ? AND id = ?",
       args: [input.tenantId, input.incidentId],

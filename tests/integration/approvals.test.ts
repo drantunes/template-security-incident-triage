@@ -20,6 +20,7 @@ import {
   makeApprovalRequest,
   makePlan,
   planHash,
+  seedAuthoritativePhase5Result,
 } from "../fixtures/domain.js";
 import {
   createTempDatabase,
@@ -56,6 +57,17 @@ async function setupApproval() {
       ids: sequenceIdGenerator(["timeline-2", "outbox-2"]),
     },
   );
+  await store.execute({
+    sql: `INSERT INTO workflow_runs(
+      id, incident_id, tenant_id, run_id, workflow_id, status, started_at
+    ) VALUES ('workflow-row-1', 'incident-1', 'tenant-1', 'run-1',
+      'incident-ingestion-workflow', 'running', '2026-08-27T12:00:30.000Z')`,
+  });
+  await store.execute({
+    sql: `UPDATE incidents SET current_run_id = 'run-1'
+      WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
+  });
+  await seedAuthoritativePhase5Result(store);
   await requestApproval(
     store,
     {
@@ -596,24 +608,37 @@ describe("approval decisions", () => {
         },
       );
 
-      const secondHash = "b".repeat(64);
+      const secondPlan = makePlan({
+        planId: "plan-2",
+        planVersion: 2,
+        createdAt: "2026-08-27T12:05:00.000Z",
+        expiresAt: "2026-08-27T12:20:00.000Z",
+      });
+      const secondHash = secondPlan.planHash;
+      await store.execute({
+        sql: `INSERT INTO workflow_runs(
+          id, incident_id, tenant_id, run_id, workflow_id, status, started_at
+        ) VALUES ('workflow-row-2', 'incident-1', 'tenant-1', 'run-2',
+          'incident-ingestion-workflow', 'running', '2026-08-27T12:04:30.000Z')`,
+      });
+      await store.execute({
+        sql: `UPDATE incidents SET current_run_id = 'run-2'
+          WHERE tenant_id = 'tenant-1' AND id = 'incident-1'`,
+      });
+      await seedAuthoritativePhase5Result(store, secondPlan, "run-2");
       await requestApproval(
         store,
         {
-          plan: makePlan({
-            planId: "plan-2",
-            planVersion: 2,
-            planHash: secondHash,
-            createdAt: "2026-08-27T12:05:00.000Z",
-          }),
+          plan: secondPlan,
           approval: makeApprovalRequest({
             approvalId: "approval-2",
             planId: "plan-2",
             planHash: secondHash,
             requestedAt: "2026-08-27T12:05:00.000Z",
+            expiresAt: "2026-08-27T12:20:00.000Z",
           }),
           expectedIncidentVersion: 4,
-          runId: "run-1",
+          runId: "run-2",
           correlationId: "correlation-1",
         },
         {

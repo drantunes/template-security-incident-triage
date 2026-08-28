@@ -1,0 +1,307 @@
+import { DomainError } from "../domain/errors.js";
+import type { OperationalStore } from "../db/operational-store.js";
+import {
+  ExternalIncidentSupersededError,
+  ExternalIncidentProjectionSchema,
+  type ExternalIncidentProjection,
+  type ExternalIncidentResult,
+  type IncidentProvider,
+} from "./incident-provider.js";
+
+export class MockIncidentProvider implements IncidentProvider {
+  readonly calls: Array<
+    Readonly<{
+      operation: "create" | "update";
+      projection: ExternalIncidentProjection;
+      idempotencyKey: string;
+      generation: number;
+    }>
+  > = [];
+  private readonly results = new Map<
+    string,
+    Readonly<{
+      operation: "create" | "update";
+      projectionJson: string;
+      generation: number;
+      result: ExternalIncidentResult;
+    }>
+  >();
+  private failuresRemaining: number;
+  private readonly store?: OperationalStore;
+  private readonly openStore?: () => OperationalStore;
+  private readonly beforePersist?: (
+    input: Readonly<{
+      operation: "create" | "update";
+      projection: ExternalIncidentProjection;
+      idempotencyKey: string;
+      generation: number;
+    }>,
+  ) => Promise<void> | void;
+
+  constructor(
+    options: Readonly<{
+      failAttempts?: number;
+      store?: OperationalStore;
+      openStore?: () => OperationalStore;
+      beforePersist?: (
+        input: Readonly<{
+          operation: "create" | "update";
+          projection: ExternalIncidentProjection;
+          idempotencyKey: string;
+          generation: number;
+        }>,
+      ) => Promise<void> | void;
+    }> = {},
+  ) {
+    if (options.store && options.openStore) throw new DomainError("CONFLICT");
+    this.failuresRemaining = options.failAttempts ?? 0;
+    this.store = options.store;
+    this.openStore = options.openStore;
+    this.beforePersist = options.beforePersist;
+  }
+
+  async create(input: {
+    projection: ExternalIncidentProjection;
+    idempotencyKey: string;
+    generation: number;
+  }): Promise<ExternalIncidentResult> {
+    return this.deliver("create", input);
+  }
+
+  async update(input: {
+    externalRef: string;
+    projection: ExternalIncidentProjection;
+    idempotencyKey: string;
+    generation: number;
+  }): Promise<ExternalIncidentResult> {
+    if (!/^mock-incident-[a-f0-9]{16}$/u.test(input.externalRef)) {
+      throw new DomainError("VALIDATION_FAILED");
+    }
+    return this.deliver("update", input);
+  }
+
+  private async deliver(
+    operation: "create" | "update",
+    input: {
+      projection: ExternalIncidentProjection;
+      idempotencyKey: string;
+      generation: number;
+    },
+  ): Promise<ExternalIncidentResult> {
+    const projection = ExternalIncidentProjectionSchema.parse(input.projection);
+    if (!Number.isSafeInteger(input.generation) || input.generation <= 0) {
+      throw new DomainError("VALIDATION_FAILED");
+    }
+    const projectionJson = JSON.stringify(projection);
+    if (this.store || this.openStore) {
+      const persisted = await this.readPersistedEffect(
+        operation,
+        input.idempotencyKey,
+        input.generation,
+        projection,
+        projectionJson,
+      );
+      if (persisted) return persisted;
+    } else {
+      const latestGeneration = Math.max(
+        0,
+        ...[...this.results.values()].map((entry) => entry.generation),
+      );
+      if (latestGeneration > input.generation) {
+        throw new ExternalIncidentSupersededError();
+      }
+      const existing = this.results.get(input.idempotencyKey);
+      if (existing) {
+        if (
+          existing.operation !== operation ||
+          existing.generation !== input.generation ||
+          existing.projectionJson !== projectionJson
+        ) {
+          throw new DomainError("CONFLICT");
+        }
+        return existing.result;
+      }
+    }
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1;
+      this.calls.push({
+        operation,
+        projection,
+        idempotencyKey: input.idempotencyKey,
+        generation: input.generation,
+      });
+      throw new DomainError("STORAGE_UNAVAILABLE", { retryable: true });
+    }
+    const ref = `mock-incident-${simpleHash(input.idempotencyKey)}`;
+    const result = Object.freeze({ externalRef: ref });
+    await this.beforePersist?.({
+      operation,
+      projection,
+      idempotencyKey: input.idempotencyKey,
+      generation: input.generation,
+    });
+    if (this.store || this.openStore) {
+      return this.persistEffect(
+        operation,
+        input.idempotencyKey,
+        input.generation,
+        projection,
+        projectionJson,
+        result,
+      );
+    }
+    const latestGeneration = Math.max(
+      0,
+      ...[...this.results.values()].map((entry) => entry.generation),
+    );
+    if (latestGeneration > input.generation) {
+      throw new ExternalIncidentSupersededError();
+    }
+    if (latestGeneration === input.generation && latestGeneration !== 0) {
+      throw new DomainError("CONFLICT");
+    }
+    this.calls.push({
+      operation,
+      projection,
+      idempotencyKey: input.idempotencyKey,
+      generation: input.generation,
+    });
+    this.results.set(input.idempotencyKey, {
+      operation,
+      projectionJson,
+      generation: input.generation,
+      result,
+    });
+    return result;
+  }
+
+  private async readPersistedEffect(
+    operation: "create" | "update",
+    idempotencyKey: string,
+    generation: number,
+    projection: ExternalIncidentProjection,
+    projectionJson: string,
+  ): Promise<ExternalIncidentResult | undefined> {
+    const store = this.store ?? this.openStore!();
+    try {
+      const result = await store.execute({
+        sql: `SELECT effect.operation, effect.tenant_id, effect.incident_id,
+          effect.generation, effect.projection_json, effect.external_ref,
+          (SELECT max(latest.generation) FROM mock_incident_provider_effects latest
+            WHERE latest.tenant_id = effect.tenant_id
+              AND latest.incident_id = effect.incident_id) AS latest_generation
+          FROM mock_incident_provider_effects effect
+          WHERE effect.idempotency_key = ?`,
+        args: [idempotencyKey],
+      });
+      const row = result.rows[0];
+      if (!row) return undefined;
+      if (Number(row.latest_generation) > generation) {
+        throw new ExternalIncidentSupersededError();
+      }
+      if (
+        row.operation !== operation ||
+        Number(row.generation) !== generation ||
+        row.tenant_id !== projection.tenantId ||
+        row.incident_id !== projection.incidentId ||
+        row.projection_json !== projectionJson
+      ) {
+        throw new DomainError("CONFLICT");
+      }
+      return Object.freeze({ externalRef: String(row.external_ref) });
+    } finally {
+      if (!this.store) store.close();
+    }
+  }
+
+  private async persistEffect(
+    operation: "create" | "update",
+    idempotencyKey: string,
+    generation: number,
+    projection: ExternalIncidentProjection,
+    projectionJson: string,
+    result: ExternalIncidentResult,
+  ): Promise<ExternalIncidentResult> {
+    const store = this.store ?? this.openStore!();
+    try {
+      let inserted = false;
+      const outcome = await store.transaction(async (tx) => {
+        const latest = await tx.execute({
+          sql: `SELECT max(generation) AS generation
+            FROM mock_incident_provider_effects
+            WHERE tenant_id = ? AND incident_id = ?`,
+          args: [projection.tenantId, projection.incidentId],
+        });
+        const latestGeneration = Number(latest.rows[0]?.generation ?? 0);
+        if (latestGeneration > generation) {
+          return { state: "superseded" as const };
+        }
+        if (latestGeneration === generation && latestGeneration !== 0) {
+          const concurrent = await tx.execute({
+            sql: `SELECT operation, tenant_id, incident_id, generation, projection_json,
+              external_ref FROM mock_incident_provider_effects
+              WHERE idempotency_key = ?`,
+            args: [idempotencyKey],
+          });
+          return concurrent.rows[0]
+            ? { state: "persisted" as const, row: concurrent.rows[0] }
+            : { state: "conflict" as const };
+        }
+        const created = await tx.execute({
+          sql: `INSERT OR IGNORE INTO mock_incident_provider_effects(
+            idempotency_key, operation, tenant_id, incident_id, generation,
+            projection_json, external_ref
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            idempotencyKey,
+            operation,
+            projection.tenantId,
+            projection.incidentId,
+            generation,
+            projectionJson,
+            result.externalRef,
+          ],
+        });
+        inserted = created.rowsAffected === 1;
+        const current = await tx.execute({
+          sql: `SELECT operation, tenant_id, incident_id, generation, projection_json,
+            external_ref FROM mock_incident_provider_effects
+            WHERE idempotency_key = ?`,
+          args: [idempotencyKey],
+        });
+        return { state: "persisted" as const, row: current.rows[0] };
+      });
+      if (outcome.state === "superseded") {
+        throw new ExternalIncidentSupersededError();
+      }
+      if (outcome.state === "conflict") throw new DomainError("CONFLICT");
+      const persisted = outcome.row;
+      if (
+        !persisted ||
+        persisted.operation !== operation ||
+        Number(persisted.generation) !== generation ||
+        persisted.tenant_id !== projection.tenantId ||
+        persisted.incident_id !== projection.incidentId ||
+        persisted.projection_json !== projectionJson ||
+        persisted.external_ref !== result.externalRef
+      ) {
+        throw new DomainError("CONFLICT");
+      }
+      if (inserted) {
+        this.calls.push({ operation, projection, idempotencyKey, generation });
+      }
+      return Object.freeze({ externalRef: String(persisted.external_ref) });
+    } finally {
+      if (!this.store) store.close();
+    }
+  }
+}
+
+function simpleHash(value: string): string {
+  let state = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(value)) {
+    state ^= BigInt(byte);
+    state = BigInt.asUintN(64, state * 0x100000001b3n);
+  }
+  return state.toString(16).padStart(16, "0");
+}

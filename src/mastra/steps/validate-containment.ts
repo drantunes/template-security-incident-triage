@@ -7,6 +7,7 @@ import {
 } from "../../containment/action-registry.js";
 import { buildValidatedContainmentPlan } from "../../containment/plan-builder.js";
 import { createLibSqlOperationalStore } from "../../db/libsql-operational-store.js";
+import { persistAuthoritativePhase5Result } from "../../db/phase5-result-operations.js";
 import { DomainError } from "../../domain/errors.js";
 import { canonicalJson } from "../../evidence/canonicalize.js";
 import {
@@ -94,12 +95,19 @@ export function createValidateContainmentStep(
               actionCount: plan.actions.length,
             },
           );
-          return Phase5ResultSchema.parse({
+          const result = Phase5ResultSchema.parse({
             status: "ready-for-approval",
             decision: inputData.decision,
             summary: inputData.summary,
             plan,
           });
+          await persistAuthoritativePhase5Result(store, {
+            tenantId: context.correlation.context.tenantId,
+            incidentId: context.correlation.context.incidentId,
+            workflowRunId: context.correlation.context.workflowRunId,
+            result,
+          });
+          return result;
         } catch {
           const stopped = {
             status: "blocked" as const,

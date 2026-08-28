@@ -1,0 +1,206 @@
+import { createStep } from "@mastra/core/workflows";
+
+import {
+  ApprovalResolvedResultSchema,
+  ContainmentExecutionResultSchema,
+} from "../../approval/phase6-contracts.js";
+import { ContainmentGateway } from "../../containment/gateway.js";
+import type { MockContainmentState } from "../../containment/mock-state.js";
+import { recordContainmentOutcome } from "../../db/containment-outcome-operations.js";
+import {
+  getIncident,
+  transitionIncident,
+} from "../../db/incident-operations.js";
+import { createLibSqlOperationalStore } from "../../db/libsql-operational-store.js";
+import type { OperationalStore } from "../../db/operational-store.js";
+import type { Clock } from "../../domain/clock.js";
+import type { IdGenerator } from "../../domain/id-generator.js";
+import { ContainmentActionOutcomeSchema } from "../../schemas/containment.js";
+
+export function createExecuteContainmentStep(
+  dependencies: Readonly<{
+    openStore?: () => OperationalStore;
+    state: MockContainmentState;
+    mode: "mock" | "staging" | "production";
+    timeoutMs: number;
+    rateLimit: number;
+    clock?: Clock;
+    ids?: IdGenerator;
+  }>,
+) {
+  return createStep({
+    id: "execute-containment",
+    description:
+      "Executes approved mock actions sequentially and stops at the first failed verification.",
+    inputSchema: ApprovalResolvedResultSchema,
+    outputSchema: ContainmentExecutionResultSchema,
+    execute: async ({ inputData }) => {
+      if (inputData.status !== "approval-resolved") return inputData;
+      if (inputData.authoritative.decision === "expired") {
+        return {
+          status: "expired" as const,
+          decision: inputData.decision,
+          summary: inputData.summary,
+          plan: inputData.plan,
+          authoritative: inputData.authoritative,
+          workflowRunId: inputData.workflowRunId,
+          correlationId: inputData.correlationId,
+        };
+      }
+      const common = {
+        decision: inputData.decision,
+        summary: inputData.summary,
+        plan: inputData.plan,
+        authoritative: inputData.authoritative,
+        workflowRunId: inputData.workflowRunId,
+        correlationId: inputData.correlationId,
+      };
+      if (inputData.authoritative.decision === "rejected") {
+        return { status: "rejected" as const, ...common };
+      }
+      const store = (dependencies.openStore ?? createLibSqlOperationalStore)();
+      try {
+        const approved = await getIncident(
+          store,
+          inputData.plan.tenantId,
+          inputData.plan.incidentId,
+        );
+        if (approved.status === "contained" || approved.status === "failed") {
+          const persisted = await store.execute({
+            sql: `SELECT attempt.action_id, attempt.status, attempt.verification,
+              attempt.provider_ref, attempt.error_code
+              FROM containment_action_attempts attempt
+              WHERE attempt.tenant_id = ? AND attempt.plan_id = ?
+                AND attempt.attempt = (
+                  SELECT max(latest.attempt) FROM containment_action_attempts latest
+                  WHERE latest.tenant_id = attempt.tenant_id
+                    AND latest.plan_id = attempt.plan_id
+                    AND latest.action_id = attempt.action_id
+                ) ORDER BY (
+                  SELECT ordinal FROM containment_actions action
+                  WHERE action.tenant_id = attempt.tenant_id
+                    AND action.plan_id = attempt.plan_id
+                    AND action.action_id = attempt.action_id
+                )`,
+            args: [inputData.plan.tenantId, inputData.plan.planId],
+          });
+          const outcomes = persisted.rows.map((row) =>
+            ContainmentActionOutcomeSchema.parse({
+              actionId: row.action_id,
+              status: row.status,
+              verification: row.verification,
+              ...(row.provider_ref ? { providerRef: row.provider_ref } : {}),
+              ...(row.error_code ? { errorCode: row.error_code } : {}),
+            }),
+          );
+          return approved.status === "contained"
+            ? {
+                status: "containment-succeeded" as const,
+                ...common,
+                outcomes,
+              }
+            : {
+                status: "containment-failed" as const,
+                ...common,
+                partial: outcomes.some(
+                  (outcome) =>
+                    outcome.status === "completed" &&
+                    outcome.verification === "verified",
+                ),
+                outcomes,
+              };
+        }
+        if (approved.status === "approved") {
+          await transitionIncident(
+            store,
+            {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              expectedVersion: approved.version,
+              to: "containing",
+              runId: inputData.workflowRunId,
+              correlationId: inputData.correlationId,
+              causationId: inputData.authoritative.approvalId,
+            },
+            {
+              ...(dependencies.clock ? { clock: dependencies.clock } : {}),
+              ...(dependencies.ids ? { ids: dependencies.ids } : {}),
+            },
+          );
+        } else if (approved.status !== "containing") {
+          throw new Error("incident is not recoverable for containment");
+        }
+        const gateway = new ContainmentGateway({
+          store,
+          state: dependencies.state,
+          mode: dependencies.mode,
+          timeoutMs: dependencies.timeoutMs,
+          rateLimit: dependencies.rateLimit,
+          ...(dependencies.clock ? { clock: dependencies.clock } : {}),
+          ...(dependencies.ids ? { ids: dependencies.ids } : {}),
+        });
+        const outcomes = [];
+        for (const action of inputData.plan.actions) {
+          const outcome = await gateway.executeApprovedAction({
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+            approvalId: inputData.authoritative.approvalId,
+            plan: inputData.plan,
+            action,
+          });
+          outcomes.push(outcome);
+          if (
+            outcome.status !== "completed" ||
+            outcome.verification !== "verified"
+          )
+            break;
+        }
+        const failed = outcomes.some(
+          (outcome) =>
+            outcome.status !== "completed" ||
+            outcome.verification !== "verified",
+        );
+        const completedCount = outcomes.filter(
+          (outcome) =>
+            outcome.status === "completed" &&
+            outcome.verification === "verified",
+        ).length;
+        const containing = await getIncident(
+          store,
+          inputData.plan.tenantId,
+          inputData.plan.incidentId,
+        );
+        await recordContainmentOutcome(
+          store,
+          {
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+            correlationId: inputData.correlationId,
+            approvalId: inputData.authoritative.approvalId,
+            expectedVersion: containing.version,
+            status: failed ? "failed" : "contained",
+            partial: failed && completedCount > 0,
+            completedCount,
+            failedCount: failed ? 1 : 0,
+          },
+          {
+            ...(dependencies.clock ? { clock: dependencies.clock } : {}),
+            ...(dependencies.ids ? { ids: dependencies.ids } : {}),
+          },
+        );
+        return failed
+          ? {
+              status: "containment-failed" as const,
+              ...common,
+              partial: completedCount > 0,
+              outcomes,
+            }
+          : { status: "containment-succeeded" as const, ...common, outcomes };
+      } finally {
+        store.close();
+      }
+    },
+  });
+}
