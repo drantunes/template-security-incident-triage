@@ -1,49 +1,33 @@
-import { z } from "zod";
-
 import type { OperationalStore } from "../db/operational-store.js";
 import {
   claimRetrievalSelection,
   findSuccessfulRetrieval,
   listAuthoritativeChunks,
-  persistFailedRetrieval,
   persistSuccessfulRetrieval,
-  type PersistedRetrievalChunk,
   type PersistedSelection,
 } from "../db/runbook-retrieval-operations.js";
 import { resolveEligibleGeneration } from "../db/runbook-operations.js";
 import { DomainError } from "../domain/errors.js";
 import type { IdGenerator } from "../domain/id-generator.js";
 import type { Clock } from "../domain/clock.js";
-import { opaqueId } from "../schemas/common.js";
-import { IncidentKindSchema } from "../schemas/incident.js";
 import { validatePersistedAllowedActions } from "./allowlist.js";
 import type { RunbookEmbedder } from "./embeddings.js";
-import { RunbookError, type RunbookErrorCode } from "./errors.js";
-import { canonicalJson, sha256 } from "./hashes.js";
-import { RunbookChunkMetadataSchema } from "./schemas.js";
+import { RunbookError } from "./errors.js";
+import { sha256 } from "./hashes.js";
+import {
+  RetrieveRunbookInputSchema,
+  type RetrieveRunbookInput,
+  type RetrieveRunbookResult,
+} from "./retrieve-contract.js";
+import { auditRetrievalFailure } from "./retrieval-audit.js";
+import { queryAndRankEligibleChunks } from "./retrieval-matches.js";
 import type { RunbookVectorStore } from "./vector-store.js";
 
-export const RetrieveRunbookInputSchema = z
-  .object({
-    incidentId: opaqueId,
-    tenantId: opaqueId,
-    workflowRunId: opaqueId,
-    correlationId: opaqueId,
-    incidentKind: IncidentKindSchema,
-    queryText: z.string().max(2_048),
-  })
-  .strict();
-
-export type RetrieveRunbookInput = z.infer<typeof RetrieveRunbookInputSchema>;
-export type RetrieveRunbookResult = Readonly<{
-  retrievalId: string;
-  runbookId: string;
-  version: string;
-  generationId: string;
-  citation: string;
-  chunkIds: readonly string[];
-  duplicate: boolean;
-}>;
+export {
+  RetrieveRunbookInputSchema,
+  type RetrieveRunbookInput,
+  type RetrieveRunbookResult,
+} from "./retrieve-contract.js";
 
 const DEFAULT_TOP_K = 3;
 const DEFAULT_THRESHOLD = 0.15;
@@ -78,7 +62,7 @@ export async function retrieveRunbook(
   const queryText = input.queryText.trim();
   const queryHash = sha256(queryText);
   if (!queryText) {
-    await auditFailure(
+    await auditRetrievalFailure(
       store,
       input,
       queryHash,
@@ -124,7 +108,7 @@ export async function retrieveRunbook(
           : error instanceof DomainError && error.code === "CONFLICT"
             ? "RUNBOOK_INELIGIBLE"
             : "RUNBOOK_BACKEND_UNAVAILABLE";
-      await auditFailure(
+      await auditRetrievalFailure(
         store,
         input,
         queryHash,
@@ -136,7 +120,7 @@ export async function retrieveRunbook(
       throw new RunbookError(code, code === "RUNBOOK_BACKEND_UNAVAILABLE");
     }
     if (!eligible) {
-      await auditFailure(
+      await auditRetrievalFailure(
         store,
         input,
         queryHash,
@@ -167,7 +151,7 @@ export async function retrieveRunbook(
       generation.allowedActionsJson,
     );
   } catch (error) {
-    await auditFailure(
+    await auditRetrievalFailure(
       store,
       input,
       queryHash,
@@ -187,7 +171,7 @@ export async function retrieveRunbook(
       generation.generationId,
     );
   } catch {
-    await auditFailure(
+    await auditRetrievalFailure(
       store,
       input,
       queryHash,
@@ -213,7 +197,7 @@ export async function retrieveRunbook(
     authoritative.size !== generation.chunkCount ||
     aggregate !== generation.aggregateHash
   ) {
-    await auditFailure(
+    await auditRetrievalFailure(
       store,
       input,
       queryHash,
@@ -226,12 +210,11 @@ export async function retrieveRunbook(
     throw new RunbookError("RUNBOOK_INTEGRITY_FAILED");
   }
 
-  let matches;
+  let queryVector;
   try {
-    const queryVector = await embedder.embedQuery(queryText);
-    matches = await vectorStore.query(generation.indexName, queryVector, topK);
+    queryVector = await embedder.embedQuery(queryText);
   } catch {
-    await auditFailure(
+    await auditRetrievalFailure(
       store,
       input,
       queryHash,
@@ -243,67 +226,35 @@ export async function retrieveRunbook(
     );
     throw new RunbookError("RUNBOOK_BACKEND_UNAVAILABLE", true);
   }
-  const selected: PersistedRetrievalChunk[] = [];
-  const matchedIds = new Set<string>();
-  for (const match of matches) {
-    if (!Number.isFinite(match.score) || matchedIds.has(match.id)) {
-      await auditFailure(
-        store,
-        input,
-        queryHash,
-        "RUNBOOK_INTEGRITY_FAILED",
-        threshold,
-        topK,
-        options,
-        selection,
-      );
-      throw new RunbookError("RUNBOOK_INTEGRITY_FAILED");
-    }
-    matchedIds.add(match.id);
-    const chunk = authoritative.get(match.id);
-    const metadata = RunbookChunkMetadataSchema.safeParse(match.metadata);
-    if (
-      !chunk ||
-      !metadata.success ||
-      metadata.data.generationId !== generation.generationId ||
-      metadata.data.indexName !== generation.indexName ||
-      metadata.data.incidentKind !== input.incidentKind ||
-      metadata.data.runbookId !== generation.runbookId ||
-      metadata.data.runbookVersion !== generation.version ||
-      metadata.data.sourceHash !== generation.sourceHash ||
-      metadata.data.status !== "active" ||
-      metadata.data.text !== chunk.text ||
-      metadata.data.contentHash !== chunk.contentHash ||
-      metadata.data.metadataHash !== chunk.metadataHash ||
-      recomputeMetadataHash(metadata.data) !== metadata.data.metadataHash
-    ) {
-      await auditFailure(
-        store,
-        input,
-        queryHash,
-        "RUNBOOK_INTEGRITY_FAILED",
-        threshold,
-        topK,
-        options,
-        selection,
-      );
-      throw new RunbookError("RUNBOOK_INTEGRITY_FAILED");
-    }
-    if (match.score >= threshold)
-      selected.push({ ...chunk, score: match.score, rank: 0 });
+  let ranked;
+  try {
+    ranked = await queryAndRankEligibleChunks(
+      vectorStore,
+      generation,
+      authoritative,
+      queryVector,
+      threshold,
+      topK,
+    );
+  } catch (error) {
+    const code =
+      error instanceof RunbookError
+        ? error.code
+        : "RUNBOOK_BACKEND_UNAVAILABLE";
+    await auditRetrievalFailure(
+      store,
+      input,
+      queryHash,
+      code,
+      threshold,
+      topK,
+      options,
+      selection,
+    );
+    throw new RunbookError(code, code === "RUNBOOK_BACKEND_UNAVAILABLE");
   }
-  selected.sort(
-    (left, right) =>
-      right.score - left.score ||
-      left.metadata.sectionOrdinal - right.metadata.sectionOrdinal ||
-      left.metadata.chunkOrdinal - right.metadata.chunkOrdinal ||
-      left.metadata.chunkId.localeCompare(right.metadata.chunkId),
-  );
-  const ranked = selected
-    .slice(0, topK)
-    .map((chunk, index) => ({ ...chunk, rank: index + 1 }));
   if (ranked.length === 0) {
-    await auditFailure(
+    await auditRetrievalFailure(
       store,
       input,
       queryHash,
@@ -329,31 +280,4 @@ export async function retrieveRunbook(
     chunkIds: ranked.map((chunk) => chunk.metadata.chunkId),
     duplicate: false,
   };
-}
-
-function recomputeMetadataHash(
-  metadata: z.infer<typeof RunbookChunkMetadataSchema>,
-): string {
-  const unsigned: Partial<z.infer<typeof RunbookChunkMetadataSchema>> = {
-    ...metadata,
-  };
-  delete unsigned.metadataHash;
-  return sha256(canonicalJson(unsigned));
-}
-
-async function auditFailure(
-  store: OperationalStore,
-  input: RetrieveRunbookInput,
-  queryHash: string,
-  errorCode: RunbookErrorCode,
-  threshold: number,
-  topK: number,
-  options: Readonly<{ clock?: Clock; ids?: IdGenerator }>,
-  selection?: PersistedSelection,
-): Promise<void> {
-  await persistFailedRetrieval(
-    store,
-    { ...input, queryHash, errorCode, threshold, topK, selection },
-    options,
-  );
 }

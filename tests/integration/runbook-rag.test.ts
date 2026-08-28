@@ -1029,6 +1029,88 @@ describe("runbook indexing and retrieval", () => {
       store.close();
     }
   });
+
+  it("applies the deterministic tie-break across every eligible chunk before top-K", async () => {
+    const { store, vector, runbooks } = await setupCatalog();
+    const embedder = new DeterministicRunbookEmbedder();
+    const kind = "unknown_device_login" as const;
+    const runbook = runbooks.find(
+      (item) => item.metadata.incidentKinds[0] === kind,
+    ) as LoadedRunbook;
+    try {
+      const indexed = await indexRunbook(store, vector, embedder, runbook, {
+        generationId: "generation-global-tie-break",
+        now: "2026-08-27T12:00:00.000Z",
+      });
+      const authoritative = await store.execute({
+        sql: `SELECT chunk_id FROM runbook_chunks WHERE generation_id = ?
+          ORDER BY section_ordinal, chunk_ordinal, chunk_id`,
+        args: [indexed.generationId],
+      });
+      await seedIncident(store, kind, 80);
+      vector.reverseQueryOrder = true;
+      vector.equalScores = true;
+      const result = await retrieveRunbook(
+        store,
+        vector,
+        embedder,
+        retrievalInput(kind, 80),
+        {
+          threshold: 0.5,
+          topK: 3,
+          clock: fixedClock("2026-08-27T12:01:00.000Z"),
+          ids: sequenceIdGenerator(["retrieval-tie", "timeline-tie"]),
+        },
+      );
+      expect(result.chunkIds).toEqual(
+        authoritative.rows.slice(0, 3).map((row) => row.chunk_id),
+      );
+      expect(vector.queryTopKs.at(-1)).toBe(indexed.chunkCount);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("fails closed when an active vector index loses a non-top-K chunk", async () => {
+    const { store, vector, runbooks } = await setupCatalog();
+    const embedder = new DeterministicRunbookEmbedder();
+    const kind = "disallowed_country_login" as const;
+    const runbook = runbooks.find(
+      (item) => item.metadata.incidentKinds[0] === kind,
+    ) as LoadedRunbook;
+    try {
+      const indexed = await indexRunbook(store, vector, embedder, runbook, {
+        generationId: "generation-partial-index",
+        now: "2026-08-27T12:00:00.000Z",
+      });
+      const index = vector.indexes.get(indexed.indexName);
+      const removedId = [...(index?.rows.keys() ?? [])].at(-1);
+      expect(removedId).toBeDefined();
+      index?.rows.delete(String(removedId));
+      await seedIncident(store, kind, 90);
+      await expect(
+        retrieveRunbook(store, vector, embedder, retrievalInput(kind, 90), {
+          threshold: 0.5,
+          topK: 3,
+          clock: fixedClock("2026-08-27T12:01:00.000Z"),
+          ids: sequenceIdGenerator(["retrieval-partial", "timeline-partial"]),
+        }),
+      ).rejects.toMatchObject({ code: "RUNBOOK_INTEGRITY_FAILED" });
+      const persisted = await store.execute({
+        sql: `SELECT status, error_code,
+          (SELECT count(*) FROM runbook_retrieval_chunks c
+            WHERE c.retrieval_id = r.retrieval_id) AS chunks
+          FROM runbook_retrievals r WHERE retrieval_id = 'retrieval-partial'`,
+      });
+      expect(persisted.rows[0]).toEqual({
+        status: "failed",
+        error_code: "RUNBOOK_INTEGRITY_FAILED",
+        chunks: 0,
+      });
+    } finally {
+      store.close();
+    }
+  });
 });
 
 class MemoryVectorStore implements RunbookVectorStore {
@@ -1043,10 +1125,13 @@ class MemoryVectorStore implements RunbookVectorStore {
     }
   >();
   readonly queries: string[] = [];
+  readonly queryTopKs: number[] = [];
   tamperMetadata = false;
   failQuery = false;
   failUpsert = false;
   score = 0.95;
+  equalScores = false;
+  reverseQueryOrder = false;
   metadataMutation?: (
     metadata: Record<string, unknown>,
   ) => Record<string, unknown>;
@@ -1094,6 +1179,7 @@ class MemoryVectorStore implements RunbookVectorStore {
     topK: number,
   ): Promise<readonly VectorMatch[]> {
     this.queries.push(indexName);
+    this.queryTopKs.push(topK);
     if (this.pausedQuery) {
       this.pausedQuery = false;
       this.markQueryEntered();
@@ -1104,17 +1190,17 @@ class MemoryVectorStore implements RunbookVectorStore {
     if (this.failQuery) throw new Error("backend unavailable");
     const index = this.indexes.get(indexName);
     if (!index) throw new Error("missing index");
-    return [...index.rows.entries()]
-      .slice(0, topK)
-      .map(([id, row], offset) => ({
-        id,
-        score: this.score - offset * 0.01,
-        metadata: this.metadataMutation
-          ? this.metadataMutation({ ...row.metadata })
-          : this.tamperMetadata
-            ? { ...row.metadata, sourceHash: "f".repeat(64) }
-            : { ...row.metadata },
-      }));
+    const rows = [...index.rows.entries()];
+    if (this.reverseQueryOrder) rows.reverse();
+    return rows.slice(0, topK).map(([id, row], offset) => ({
+      id,
+      score: this.equalScores ? this.score : this.score - offset * 0.01,
+      metadata: this.metadataMutation
+        ? this.metadataMutation({ ...row.metadata })
+        : this.tamperMetadata
+          ? { ...row.metadata, sourceHash: "f".repeat(64) }
+          : { ...row.metadata },
+    }));
   }
   async describe(indexName: string) {
     const index = this.indexes.get(indexName);
