@@ -35,19 +35,25 @@ describe("Phase 5 agent and workflow boundaries", () => {
     expect(prompt).toMatch(/fact-1|value-1|type-1/u);
   });
 
-  it("extends the single graph through exactly the four Phase 5 steps and no later capability", () => {
+  it("preserves the four Phase 5 steps before the Phase 6 approval boundary", () => {
     const stepIds = incidentIngestionWorkflow.stepGraph.flatMap((entry) =>
       entry.type === "step" ? [entry.step.id] : [],
     );
-    expect(stepIds.slice(-5)).toEqual([
+    expect(stepIds.slice(-12, -7)).toEqual([
       "retrieve-runbook",
       "classify-severity",
       "generate-summary",
       "propose-containment",
       "validate-containment",
     ]);
-    expect(stepIds.join(" ")).not.toMatch(
-      /request-approval|await-approval|execute-containment|suspend/iu,
-    );
+    expect(stepIds.slice(-7)).toEqual([
+      "request-approval",
+      "open-external-incident",
+      "await-approval",
+      "execute-containment",
+      "verify-containment",
+      "update-external-incident",
+      "finalize-incident",
+    ]);
   });
 });

@@ -18,6 +18,83 @@ const approvalBase = {
   planHash: sha256,
 };
 
+export const ApprovalSuspendPayloadSchema = z
+  .object({
+    incidentId: opaqueId,
+    workflowRunId: opaqueId,
+    approvalId: opaqueId,
+    planHashVersion: z.literal(1),
+    planHash: sha256,
+    expiresAt: utcTimestamp,
+  })
+  .strict();
+
+export const ApprovalResumePayloadSchema = z
+  .object({
+    resumeReceiptId: opaqueId,
+  })
+  .strict();
+
+export const AuthenticatedDecisionContextSchema = z
+  .object({
+    actorId: opaqueId,
+    tenantId: opaqueId,
+    role: z.enum(["viewer", "soc_analyst", "soc_manager"]),
+    synthetic: z.boolean(),
+  })
+  .strict();
+
+export const ApprovalDecisionRequestSchema = z
+  .object({
+    decision: z.enum(["approved", "rejected"]),
+    reason: longText.optional(),
+    planId: opaqueId,
+    planHashVersion: z.literal(1),
+    planHash: sha256,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.decision === "rejected" && !value.reason?.trim()) {
+      context.addIssue({
+        code: "custom",
+        path: ["reason"],
+        message: "reason is required for rejection",
+      });
+    }
+  });
+
+export const AuthoritativeApprovalResultSchema = z
+  .object({
+    approvalId: opaqueId,
+    planId: opaqueId,
+    incidentId: opaqueId,
+    tenantId: opaqueId,
+    workflowRunId: opaqueId,
+    planHashVersion: z.literal(1),
+    planHash: sha256,
+    decision: z.enum(["approved", "rejected"]),
+    decidedBy: opaqueId,
+    decidedByRole: z.literal("soc_manager"),
+    decidedAt: utcTimestamp,
+    expiresAt: utcTimestamp,
+  })
+  .strict();
+
+export const ExpiredApprovalResultSchema = z
+  .object({
+    approvalId: opaqueId,
+    planId: opaqueId,
+    incidentId: opaqueId,
+    tenantId: opaqueId,
+    workflowRunId: opaqueId,
+    planHashVersion: z.literal(1),
+    planHash: sha256,
+    decision: z.literal("expired"),
+    expiredAt: utcTimestamp,
+    expiresAt: utcTimestamp,
+  })
+  .strict();
+
 export const ApprovalRequestSchema = z
   .object({
     ...approvalBase,
@@ -56,3 +133,17 @@ export const ApprovalDecisionSchema = z.discriminatedUnion("decision", [
 
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
 export type ApprovalDecision = z.infer<typeof ApprovalDecisionSchema>;
+export type ApprovalSuspendPayload = z.infer<
+  typeof ApprovalSuspendPayloadSchema
+>;
+export type ApprovalResumePayload = z.infer<typeof ApprovalResumePayloadSchema>;
+export type AuthenticatedDecisionContext = z.infer<
+  typeof AuthenticatedDecisionContextSchema
+>;
+export type ApprovalDecisionRequest = z.infer<
+  typeof ApprovalDecisionRequestSchema
+>;
+export type AuthoritativeApprovalResult = z.infer<
+  typeof AuthoritativeApprovalResultSchema
+>;
+export type ExpiredApprovalResult = z.infer<typeof ExpiredApprovalResultSchema>;

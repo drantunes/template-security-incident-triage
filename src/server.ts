@@ -17,6 +17,13 @@ import {
   type StructuredLogger,
 } from "./logging.js";
 import { registerWebhookRoutes } from "./webhooks/routes.js";
+import { registerApprovalRoutes } from "./approval/routes.js";
+import { MockDecisionAuthenticator } from "./approval/mock-decision-authenticator.js";
+import {
+  createWorkflowApprovalRunReconciler,
+  type ApprovalWorkflow,
+} from "./approval/workflow-resume-reconciler.js";
+import { readPhase6Config, type Phase6Config } from "./env.js";
 
 export async function createApp(
   input: Readonly<{
@@ -26,6 +33,7 @@ export async function createApp(
     createRequestId?: () => string;
     nowMs?: () => number;
     mastraInstance?: Mastra;
+    phase6Config?: Phase6Config;
   }>,
 ): Promise<Hono<AppEnv>> {
   const logger = input.logger ?? consoleLogger;
@@ -54,6 +62,29 @@ export async function createApp(
 
   const appMastra =
     input.mastraInstance ?? (await import("./mastra/index.js")).mastra;
+  const phase6Config = input.phase6Config ?? readPhase6Config();
+  if (
+    phase6Config.mockDecisionsEnabled &&
+    phase6Config.mockDecisionSecret &&
+    phase6Config.approvalResumeSecret
+  ) {
+    const approvalWorkflow = (appMastra.getWorkflow as (id: string) => unknown)(
+      "incidentIngestionWorkflow",
+    ) as ApprovalWorkflow;
+    registerApprovalRoutes(app, {
+      config: phase6Config,
+      store: input.store,
+      logger,
+      authenticator: new MockDecisionAuthenticator({
+        mode: phase6Config.mode,
+        enabled: phase6Config.mockDecisionsEnabled,
+        secret: phase6Config.mockDecisionSecret,
+        ...(input.nowMs ? { nowMs: input.nowMs } : {}),
+      }),
+      reconcileApprovalRun:
+        createWorkflowApprovalRunReconciler(approvalWorkflow),
+    });
+  }
 
   const server = new MastraServer({
     app,

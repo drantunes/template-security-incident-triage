@@ -12,7 +12,7 @@ export const incidentTransitions = {
   rejected: ["closed"],
   containing: ["contained", "failed"],
   contained: ["closed"],
-  failed: ["investigating", "closed"],
+  failed: ["investigating", "containing", "closed"],
   closed: [],
 } as const satisfies Record<IncidentStatus, readonly IncidentStatus[]>;
 

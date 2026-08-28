@@ -48,6 +48,49 @@ export const ContainmentPlanSchema = z
     path: ["expiresAt"],
   });
 
+export const ContainmentExecutionStatusSchema = z.enum([
+  "completed",
+  "blocked",
+  "failed",
+  "timed_out",
+]);
+
+export const ContainmentVerificationSchema = z.enum([
+  "verified",
+  "not_verified",
+  "not_run",
+]);
+
+export const ContainmentActionOutcomeSchema = z
+  .object({
+    actionId: opaqueId,
+    status: ContainmentExecutionStatusSchema,
+    verification: ContainmentVerificationSchema,
+    providerRef: opaqueId.optional(),
+    errorCode: z
+      .enum([
+        "ACTION_BLOCKED",
+        "PRECONDITION_FAILED",
+        "RATE_LIMITED",
+        "PROVIDER_FAILED",
+        "PROVIDER_TIMEOUT",
+        "VERIFICATION_FAILED",
+      ])
+      .optional(),
+  })
+  .strict();
+
+export const ContainmentAggregateSchema = z
+  .object({
+    status: z.enum(["succeeded", "failed", "partial"]),
+    outcomes: z.array(ContainmentActionOutcomeSchema).min(1).max(2),
+  })
+  .strict();
+
 export type ContainmentActionType = z.infer<typeof ContainmentActionTypeSchema>;
 export type ContainmentAction = z.infer<typeof ContainmentActionSchema>;
 export type ContainmentPlan = z.infer<typeof ContainmentPlanSchema>;
+export type ContainmentActionOutcome = z.infer<
+  typeof ContainmentActionOutcomeSchema
+>;
+export type ContainmentAggregate = z.infer<typeof ContainmentAggregateSchema>;
