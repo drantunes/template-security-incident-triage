@@ -5,6 +5,7 @@ import { deliverExternalIncident } from "../../db/provider-delivery-operations.j
 import { createLibSqlOperationalStore } from "../../db/libsql-operational-store.js";
 import type { OperationalStore } from "../../db/operational-store.js";
 import type { Clock } from "../../domain/clock.js";
+import { DomainError } from "../../domain/errors.js";
 import type { IdGenerator } from "../../domain/id-generator.js";
 import {
   ExternalIncidentProjectionSchema,
@@ -58,7 +59,7 @@ export function createOpenExternalIncidentStep(
           planHash: inputData.plan.planHash,
           actionTypes: inputData.plan.actions.map((action) => action.type),
         });
-        await deliverExternalIncident(
+        const delivery = await deliverExternalIncident(
           store,
           provider,
           {
@@ -78,6 +79,11 @@ export function createOpenExternalIncidentStep(
               : {}),
           },
         );
+        // D-026 orders the externally traceable, redacted issue before the
+        // first suspend.  A durable retry/uncertain record is not evidence of
+        // the remote state, so let the workflow retry instead of suspending.
+        if (delivery.status !== "succeeded")
+          throw new DomainError("STORAGE_UNAVAILABLE", { retryable: true });
         return inputData;
       } finally {
         store.close();

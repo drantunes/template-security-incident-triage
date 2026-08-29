@@ -4,7 +4,11 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 
 import type { OperationalStore } from "./db/operational-store.js";
-import type { Phase2Config } from "./env.js";
+import {
+  hasRealPhase8Provider,
+  type Phase2Config,
+  type Phase8Config,
+} from "./env.js";
 import { errorResponse } from "./http-errors.js";
 import {
   defensiveHeadersMiddleware,
@@ -38,6 +42,7 @@ export async function createApp(
     mastraInstance?: Mastra;
     phase6Config?: Phase6Config;
     phase7Config?: Phase7Config;
+    phase8Config?: Phase8Config;
   }>,
 ): Promise<Hono<AppEnv>> {
   const logger = input.logger ?? consoleLogger;
@@ -50,6 +55,7 @@ export async function createApp(
   app.get("/health", (context) => context.json({ status: "ok" }));
   registerWebhookRoutes(app, {
     config: input.config,
+    ...(input.phase8Config ? { phase8Config: input.phase8Config } : {}),
     store: input.store,
     logger,
     ...(input.nowMs ? { nowMs: input.nowMs } : {}),
@@ -102,19 +108,35 @@ export async function createApp(
     ...(input.nowMs ? { nowMs: input.nowMs } : {}),
   });
 
-  const server = new MastraServer({
-    app,
-    mastra: appMastra,
-    bodyLimitOptions: {
-      maxSize: input.config.mastraMaxBodyBytes,
-      onError: () => ({
-        code: "PAYLOAD_TOO_LARGE",
-        message: "The request body is too large.",
-        retryable: false,
-      }),
-    },
-  });
-  await server.init();
+  if (input.phase8Config && hasRealPhase8Provider(input.phase8Config)) {
+    // Exact dashboard routes above are tenant-scoped and authenticate their
+    // own session. Everything else under /api would be the generic native
+    // Mastra control plane, which is intentionally absent in real staging.
+    app.all("/api/*", (context) =>
+      errorResponse(context, "AUTHENTICATION_REQUIRED", 401, false, logger),
+    );
+  }
+
+  // The native Mastra API exposes generic workflow/run/tool resources whose
+  // IDs do not carry our tenant ownership model.  In real-provider staging we
+  // deliberately do not mount that broad control plane at all: workers own
+  // ingestion and the dashboard exposes only tenant-scoped incident routes.
+  // Mock mode keeps Studio/API ergonomics for local development.
+  if (!input.phase8Config || !hasRealPhase8Provider(input.phase8Config)) {
+    const server = new MastraServer({
+      app,
+      mastra: appMastra,
+      bodyLimitOptions: {
+        maxSize: input.config.mastraMaxBodyBytes,
+        onError: () => ({
+          code: "PAYLOAD_TOO_LARGE",
+          message: "The request body is too large.",
+          retryable: false,
+        }),
+      },
+    });
+    await server.init();
+  }
 
   app.notFound((context) =>
     context.json(

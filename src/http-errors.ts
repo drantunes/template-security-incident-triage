@@ -10,6 +10,8 @@ export type HttpErrorCode =
   | "SIGNATURE_MALFORMED"
   | "SIGNATURE_INVALID"
   | "SIGNATURE_EXPIRED"
+  | "AUTHENTICATION_REQUIRED"
+  | "ACCESS_DENIED"
   | "PAYLOAD_INVALID"
   | "ALERT_CONFLICT"
   | "STORAGE_UNAVAILABLE"
@@ -18,7 +20,7 @@ export type HttpErrorCode =
 export function errorResponse(
   context: Context<AppEnv>,
   code: HttpErrorCode,
-  status: 401 | 409 | 413 | 415 | 422 | 500 | 503,
+  status: 401 | 403 | 409 | 413 | 415 | 422 | 500 | 503,
   retryable: boolean,
   logger: StructuredLogger,
 ) {
@@ -54,6 +56,10 @@ function publicMessage(code: HttpErrorCode): string {
       return "Storage is temporarily unavailable.";
     case "INTERNAL_ERROR":
       return "An internal error occurred.";
+    case "AUTHENTICATION_REQUIRED":
+      return "Authentication is required.";
+    case "ACCESS_DENIED":
+      return "Access is denied.";
     default:
       return "Webhook signature validation failed.";
   }

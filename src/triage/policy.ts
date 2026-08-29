@@ -160,16 +160,24 @@ export function resolveEvidenceRequirement(
   const item = matches[0]!;
   if (item.incomplete)
     return { status: "invalid", evidence: item, reason: "incomplete" };
-  if (item.confidence < PHASE5_MIN_CONFIDENCE)
-    return { status: "invalid", evidence: item, reason: "low-confidence" };
-  const provenance = item.fact.confidenceProvenance;
-  if (
-    !requirement.sources.includes(item.source) ||
-    !requirement.providers.includes(item.provider) ||
-    (provenance !== "provider" && provenance !== "rule-v1") ||
-    !requirement.provenances.includes(provenance)
-  )
+  const origin = requirement.origins.find(
+    (candidate) =>
+      candidate.source === item.source &&
+      candidate.provider === item.provider &&
+      candidate.confidenceProvenance === item.fact.confidenceProvenance &&
+      (candidate.exactConfidence === undefined ||
+        candidate.exactConfidence === item.confidence),
+  );
+  if (!origin)
     return { status: "invalid", evidence: item, reason: "provenance" };
+  // An exact-confidence origin is a reviewed policy capability (GeoIP lite
+  // currently emits 0.70); applying the generic 0.80 threshold first would
+  // make that explicitly approved origin unreachable.
+  if (
+    origin.exactConfidence === undefined &&
+    item.confidence < PHASE5_MIN_CONFIDENCE
+  )
+    return { status: "invalid", evidence: item, reason: "low-confidence" };
   if (!requirement.valueIsValid(item.fact.value, context))
     return { status: "invalid", evidence: item, reason: "value" };
   return { status: "valid", evidence: item };

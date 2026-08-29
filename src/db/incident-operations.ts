@@ -22,6 +22,22 @@ export type OperationDependencies = Readonly<{
   ids?: IdGenerator;
   correlationId?: string;
   enforceAlertOrdering?: boolean;
+  /** May enrich an alert only with local, transactionally verified facts. */
+  beforeIncidentWrite?: (
+    tx: StoreTransaction,
+    alert: Alert,
+    incidentId: string,
+  ) => Promise<Alert | void>;
+  /**
+   * Reserves provider-owned ordering state before an incident exists. A
+   * canonical duplicate returns the already durable incident identity, so no
+   * second alert, timeline or outbox record is written.
+   */
+  preflightAlert?: (
+    tx: StoreTransaction,
+    alert: Alert,
+    incidentId: string,
+  ) => Promise<Alert | Readonly<{ duplicateIncidentId: string }> | void>;
 }>;
 
 type TransitionDependencies = OperationDependencies &
@@ -83,8 +99,8 @@ export async function createIncidentFromAlertResult(
           const existingIdentity = await tx.execute({
             sql: `SELECT a.canonical_json, i.* FROM alerts a
               JOIN incidents i ON i.tenant_id = a.tenant_id AND i.id = a.incident_id
-              WHERE a.tenant_id = ? AND a.source = ? AND a.source_event_id = ?`,
-            args: [alert.tenantId, alert.source, alert.sourceEventId],
+              WHERE a.source_event_id = ?`,
+            args: [alert.sourceEventId],
           });
           const existingRow = existingIdentity.rows[0];
           if (existingRow) {
@@ -100,16 +116,28 @@ export async function createIncidentFromAlertResult(
             };
           }
 
+          const orderingObject = alertOrderingObject(alert);
           const newerInStream = await tx.execute({
             sql: `SELECT 1 FROM alerts
-              WHERE source = ? AND tenant_id = ? AND subject_id = ? AND kind = ?
-                AND occurred_at > ?
+              WHERE source = ? AND tenant_id = ?
+                AND CASE
+                  WHEN json_extract(canonical_json, '$.sessionId') IS NOT NULL THEN 'session'
+                  WHEN json_extract(canonical_json, '$.changes.membershipId') IS NOT NULL THEN 'membership'
+                  ELSE json_extract(canonical_json, '$.target.type')
+                END = ?
+                AND CASE
+                  WHEN json_extract(canonical_json, '$.sessionId') IS NOT NULL
+                    THEN json_extract(canonical_json, '$.sessionId')
+                  WHEN json_extract(canonical_json, '$.changes.membershipId') IS NOT NULL
+                    THEN json_extract(canonical_json, '$.changes.membershipId')
+                  ELSE json_extract(canonical_json, '$.target.id')
+                END = ? AND occurred_at > ?
               LIMIT 1`,
             args: [
               alert.source,
               alert.tenantId,
-              alert.subjectId,
-              alert.kind,
+              orderingObject.type,
+              orderingObject.id,
               alert.occurredAt,
             ],
           });
@@ -117,6 +145,23 @@ export async function createIncidentFromAlertResult(
             throw new DomainError("EVENT_OUT_OF_ORDER");
           }
         }
+
+        const preflight = await dependencies.preflightAlert?.(
+          tx,
+          alert,
+          incidentId,
+        );
+        if (isDuplicatePreflight(preflight)) {
+          const existingIncident = await tx.execute({
+            sql: "SELECT * FROM incidents WHERE tenant_id = ? AND id = ?",
+            args: [alert.tenantId, preflight.duplicateIncidentId],
+          });
+          const row = existingIncident.rows[0];
+          if (!row) throw new DomainError("CONFLICT");
+          return { duplicate: true, incident: incidentFromRow(row) };
+        }
+        const preflightAlert = preflight ?? alert;
+        assertAlertIdentityUnchanged(alert, preflightAlert);
 
         await tx.execute({
           sql: `INSERT INTO incidents(
@@ -131,48 +176,61 @@ export async function createIncidentFromAlertResult(
             now,
           ],
         });
+        // The incident is intentionally durable before a provider-specific
+        // enrichment runs. This gives derived records (such as a WorkOS
+        // restore snapshot) the exact incident identity that will be
+        // authorized later, while the surrounding transaction still rolls the
+        // whole ingest back on any failure.
+        const persistedAlert =
+          (await dependencies.beforeIncidentWrite?.(
+            tx,
+            preflightAlert,
+            incidentId,
+          )) ?? preflightAlert;
+        assertAlertIdentityUnchanged(alert, persistedAlert);
         await tx.execute({
           sql: `INSERT INTO alerts(
           id, incident_id, tenant_id, source, source_event_id, kind, occurred_at,
           subject_id, canonical_json, raw_payload_ref, schema_version, idempotency_key
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
-            alert.alertId,
+            persistedAlert.alertId,
             incidentId,
-            alert.tenantId,
-            alert.source,
-            alert.sourceEventId,
-            alert.kind,
-            alert.occurredAt,
-            alert.subjectId,
-            JSON.stringify(alert),
-            alert.rawPayloadRef,
-            alert.schemaVersion,
-            alert.idempotencyKey,
+            persistedAlert.tenantId,
+            persistedAlert.source,
+            persistedAlert.sourceEventId,
+            persistedAlert.kind,
+            persistedAlert.occurredAt,
+            persistedAlert.subjectId,
+            JSON.stringify(persistedAlert),
+            persistedAlert.rawPayloadRef,
+            persistedAlert.schemaVersion,
+            persistedAlert.idempotencyKey,
           ],
         });
         await insertTimelineAndOutbox(tx, {
           timelineId,
           eventId,
           incidentId,
-          tenantId: alert.tenantId,
+          tenantId: persistedAlert.tenantId,
           sequence: 1,
           type: "incident.received",
           eventType: "security.alert.received",
           runId: incidentId,
-          correlationId: dependencies.correlationId ?? alert.idempotencyKey,
-          causationId: alert.sourceEventId,
+          correlationId:
+            dependencies.correlationId ?? persistedAlert.idempotencyKey,
+          causationId: persistedAlert.sourceEventId,
           occurredAt: now,
-          payload: { alertId: alert.alertId, status: "received" },
+          payload: { alertId: persistedAlert.alertId, status: "received" },
         });
         return {
           duplicate: false,
           incident: parseDomainSchema(IncidentSchema, {
             schemaVersion: 1,
             incidentId,
-            tenantId: alert.tenantId,
-            subjectId: alert.subjectId,
-            kind: alert.kind,
+            tenantId: persistedAlert.tenantId,
+            subjectId: persistedAlert.subjectId,
+            kind: persistedAlert.kind,
             status: "received",
             version: 0,
             timelineSequence: 1,
@@ -187,8 +245,8 @@ export async function createIncidentFromAlertResult(
         const existing = await store.execute({
           sql: `SELECT a.incident_id, a.canonical_json
             FROM alerts a
-            WHERE a.tenant_id = ? AND a.source = ? AND a.source_event_id = ?`,
-          args: [alert.tenantId, alert.source, alert.sourceEventId],
+            WHERE a.source_event_id = ?`,
+          args: [alert.sourceEventId],
         });
         const row = existing.rows[0];
         if (
@@ -219,6 +277,27 @@ export async function createIncidentFromAlertResult(
     }
   }
   throw lastError;
+}
+
+function isDuplicatePreflight(
+  value: Alert | Readonly<{ duplicateIncidentId: string }> | void,
+): value is Readonly<{ duplicateIncidentId: string }> {
+  return Boolean(value && "duplicateIncidentId" in value);
+}
+
+/**
+ * Order is an object property, not a user or incident-kind property. Sessions
+ * and memberships are authoritative when supplied; other normalized events
+ * use their declared target as a narrow, stable fallback.
+ */
+function alertOrderingObject(
+  alert: Alert,
+): Readonly<{ type: string; id: string }> {
+  if (alert.sessionId) return { type: "session", id: alert.sessionId };
+  const membershipId = alert.changes?.membershipId;
+  if (typeof membershipId === "string")
+    return { type: "membership", id: membershipId };
+  return { type: alert.target.type, id: alert.target.id };
 }
 
 export async function getIncident(
@@ -336,10 +415,39 @@ function alertsAreEquivalent(canonicalJson: string, alert: Alert): boolean {
   delete retriedCommand.alertId;
   delete persistedCommand.rawPayloadRef;
   delete retriedCommand.rawPayloadRef;
+  // A verified official WorkOS event may acquire local predecessor facts in
+  // the write transaction. Retries carry the original provider shape, so the
+  // derived facts are deliberately excluded from idempotency comparison.
+  if (persisted.source === "workos" && alert.source === "workos") {
+    for (const command of [persistedCommand, retriedCommand]) {
+      delete (command.changes as Record<string, unknown> | undefined)
+        ?.contextVersion;
+      delete (command.changes as Record<string, unknown> | undefined)
+        ?.previousRole;
+      delete (command.changes as Record<string, unknown> | undefined)?.nextRole;
+    }
+  }
   return (
     JSON.stringify(canonicalizeJson(persistedCommand)) ===
     JSON.stringify(canonicalizeJson(retriedCommand))
   );
+}
+
+function assertAlertIdentityUnchanged(original: Alert, candidate: Alert): void {
+  const immutable = [
+    "schemaVersion",
+    "alertId",
+    "source",
+    "sourceEventId",
+    "kind",
+    "occurredAt",
+    "tenantId",
+    "subjectId",
+    "rawPayloadRef",
+    "idempotencyKey",
+  ] as const;
+  if (immutable.some((key) => candidate[key] !== original[key]))
+    throw new DomainError("VALIDATION_FAILED");
 }
 
 function canonicalizeJson(value: unknown): unknown {

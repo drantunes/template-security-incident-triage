@@ -1,4 +1,11 @@
-import type { EvidenceFact } from "../evidence/contracts.js";
+import { createHash } from "node:crypto";
+
+import {
+  EvidenceProviderResultSchema,
+  type EvidenceFact,
+  type EvidenceProviderInput,
+} from "../evidence/contracts.js";
+import { DomainError } from "../domain/errors.js";
 import type {
   IdentityEvidenceProvider,
   SafeProviderCall,
@@ -7,6 +14,7 @@ import {
   executeMockInspection,
   type MockProviderOptions,
 } from "./mock-evidence.js";
+import type { IdentityProvider } from "./identity-provider.js";
 
 export class MockIdentityEvidenceProvider implements IdentityEvidenceProvider {
   readonly source = "identity" as const;
@@ -31,6 +39,218 @@ export class MockIdentityEvidenceProvider implements IdentityEvidenceProvider {
       facts: identityFacts,
     });
   }
+}
+
+/** Read-only projection of the F8 WorkOS domain boundary for investigation. */
+export class WorkOsIdentityEvidenceProvider implements IdentityEvidenceProvider {
+  readonly source = "identity" as const;
+  readonly providerId = "workos-identity";
+  constructor(private readonly identity: IdentityProvider) {}
+
+  async inspect(
+    input: EvidenceProviderInput,
+    options: Readonly<{ signal: AbortSignal; attempt: 1 | 2 }>,
+  ): Promise<unknown> {
+    if (options.signal.aborted)
+      return failure(
+        this.providerId,
+        "aborted",
+        "ABORTED",
+        false,
+        options.attempt,
+      );
+    try {
+      const [user, sessions] = await Promise.all([
+        this.identity.getUser({
+          tenantId: input.tenantId,
+          userId: input.subjectId,
+        }),
+        this.identity.listSessions({
+          tenantId: input.tenantId,
+          userId: input.subjectId,
+        }),
+      ]);
+      if (options.signal.aborted)
+        return failure(
+          this.providerId,
+          "aborted",
+          "ABORTED",
+          false,
+          options.attempt,
+        );
+      const facts: EvidenceFact[] = [
+        identityFact(
+          input.occurredAt,
+          "identity.user.status",
+          "user.status",
+          user.status,
+        ),
+      ];
+      if (input.sessionId) {
+        const session = sessions.find(
+          (candidate) => candidate.id === input.sessionId,
+        );
+        if (!session)
+          return failure(
+            this.providerId,
+            "not_found",
+            "NOT_FOUND",
+            false,
+            options.attempt,
+          );
+        facts.push(
+          identityFact(
+            input.occurredAt,
+            "identity.session.status",
+            "session.status",
+            session.status,
+          ),
+          identityFact(
+            input.occurredAt,
+            "identity.session.subject",
+            "session.subject",
+            input.subjectId,
+          ),
+        );
+      }
+      facts.push(...contextPrivilegeFacts(input));
+      return EvidenceProviderResultSchema.parse({
+        status: "success",
+        provider: this.providerId,
+        facts,
+      });
+    } catch (error) {
+      if (options.signal.aborted)
+        return failure(
+          this.providerId,
+          "aborted",
+          "ABORTED",
+          false,
+          options.attempt,
+        );
+      if (error instanceof DomainError && error.code === "NOT_FOUND")
+        return failure(
+          this.providerId,
+          "not_found",
+          "NOT_FOUND",
+          false,
+          options.attempt,
+        );
+      if (error instanceof DomainError && error.code === "VALIDATION_FAILED")
+        return failure(
+          this.providerId,
+          "invalid_response",
+          "INVALID_RESPONSE",
+          false,
+          options.attempt,
+        );
+      return failure(
+        this.providerId,
+        "unavailable",
+        "UNAVAILABLE",
+        true,
+        options.attempt,
+      );
+    }
+  }
+}
+
+/** Staging never silently replaces a disabled WorkOS boundary with a mock. */
+export class DisabledIdentityEvidenceProvider implements IdentityEvidenceProvider {
+  readonly source = "identity" as const;
+  readonly providerId = "disabled-identity";
+  async inspect(
+    _input: EvidenceProviderInput,
+    options: Readonly<{ signal: AbortSignal; attempt: 1 | 2 }>,
+  ) {
+    return failure(
+      this.providerId,
+      options.signal.aborted ? "aborted" : "operational_error",
+      options.signal.aborted ? "ABORTED" : "UNAVAILABLE",
+      false,
+      options.attempt,
+    );
+  }
+}
+
+function identityFact(
+  observedAt: string,
+  semanticKey: string,
+  factType: string,
+  value: string,
+): EvidenceFact {
+  return {
+    semanticKey,
+    observedAt,
+    factType,
+    value,
+    confidence: 1,
+    confidenceProvenance: "provider",
+    rawPayloadRef: `sha256:${createHash("sha256").update(`${semanticKey}\0${value}`).digest("hex")}`,
+    sensitivity: "confidential",
+    incomplete: false,
+  };
+}
+
+function contextPrivilegeFacts(input: EvidenceProviderInput): EvidenceFact[] {
+  if (
+    input.incidentKind !== "unauthorized_privilege_change" ||
+    !input.actorId ||
+    !input.roleChange
+  )
+    return [];
+  const facts: EvidenceFact[] = [
+    identityFact(
+      input.occurredAt,
+      "identity.role.previous",
+      "role.previous",
+      input.roleChange.previousRole,
+    ),
+    identityFact(
+      input.occurredAt,
+      "identity.role.current",
+      "role.current",
+      input.roleChange.currentRole,
+    ),
+    identityFact(input.occurredAt, "identity.actor", "actor.id", input.actorId),
+  ];
+  if (input.changeApproved !== undefined) {
+    facts.push({
+      ...booleanFact(
+        input.occurredAt,
+        "identity.change.approved",
+        "change.approved",
+        input.changeApproved,
+      ),
+      confidenceProvenance: "rule-v1",
+      rawPayloadRef: "protected:local-role-change-authorization",
+    });
+  }
+  return facts;
+}
+
+function failure(
+  provider: string,
+  status:
+    | "not_found"
+    | "aborted"
+    | "unavailable"
+    | "operational_error"
+    | "invalid_response",
+  code: "NOT_FOUND" | "ABORTED" | "UNAVAILABLE" | "INVALID_RESPONSE",
+  retryable: boolean,
+  attempt: 1 | 2,
+) {
+  return EvidenceProviderResultSchema.parse({
+    status,
+    provider,
+    error: {
+      code,
+      retryable,
+      safeRef: `provider:${provider}:attempt-${attempt}`,
+      attempt,
+    },
+  });
 }
 
 function identityFacts(

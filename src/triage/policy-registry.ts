@@ -2,14 +2,18 @@ import type { InvestigationContext } from "../evidence/contracts.js";
 import type { Evidence, EvidenceSource } from "../schemas/evidence.js";
 import type { IncidentKind } from "../schemas/incident.js";
 
-type ConfidenceProvenance = "provider" | "rule-v1";
+type ConfidenceProvenance = "provider" | "rule-v1" | "policy-v1";
 
 export type EvidenceRequirement = Readonly<{
   factType: string;
-  sources: readonly EvidenceSource[];
-  providers: readonly string[];
-  provenances: readonly ConfidenceProvenance[];
+  origins: readonly EvidenceOrigin[];
   valueIsValid: (value: unknown, context: InvestigationContext) => boolean;
+}>;
+export type EvidenceOrigin = Readonly<{
+  source: EvidenceSource;
+  provider: string;
+  confidenceProvenance: ConfidenceProvenance;
+  exactConfidence?: number;
 }>;
 
 type SeverityRule = Readonly<{
@@ -26,13 +30,18 @@ const rule = ["rule-v1"] as const;
 const identity = ["identity"] as const;
 const endpoint = ["endpoint"] as const;
 const cloud = ["cloud"] as const;
-const identityProviders = ["mock-identity"] as const;
+const identityProviders = ["mock-identity", "workos-identity"] as const;
 const endpointProviders = ["mock-endpoint"] as const;
 const cloudProviders = ["mock-cloud"] as const;
 const nonEmptyString = (value: unknown) =>
   typeof value === "string" && value.trim().length > 0;
 const booleanValue = (value: unknown) => typeof value === "boolean";
-const knownCountry = (value: unknown) => value === "US" || value === "CA";
+const regionNames = new Intl.DisplayNames(["en"], { type: "region" });
+const knownCountry = (value: unknown) => {
+  if (typeof value !== "string" || !/^[A-Z]{2}$/u.test(value)) return false;
+  const name = regionNames.of(value);
+  return name !== undefined && name !== "Unknown Region";
+};
 
 export const evidenceRequirements = {
   rolePrevious: requirement(
@@ -64,7 +73,7 @@ export const evidenceRequirements = {
     "change.approved",
     identity,
     identityProviders,
-    rule,
+    [...provider, ...rule],
     booleanValue,
   ),
   sessionActive: requirement(
@@ -74,18 +83,37 @@ export const evidenceRequirements = {
     rule,
     (value, context) => context.sessionId !== undefined && booleanValue(value),
   ),
-  ipPresent: requirement(
+  ipPresent: originsRequirement(
     "login.ipPresent",
-    cloud,
-    cloudProviders,
-    rule,
+    [
+      {
+        source: "cloud",
+        provider: "mock-cloud",
+        confidenceProvenance: "rule-v1",
+      },
+      {
+        source: "identity",
+        provider: "identity-geoip",
+        confidenceProvenance: "rule-v1",
+      },
+    ],
     (value, context) => value === true && context.ip !== undefined,
   ),
-  loginCountry: requirement(
+  loginCountry: originsRequirement(
     "login.country",
-    cloud,
-    cloudProviders,
-    provider,
+    [
+      {
+        source: "cloud",
+        provider: "mock-cloud",
+        confidenceProvenance: "provider",
+      },
+      {
+        source: "identity",
+        provider: "identity-geoip",
+        confidenceProvenance: "policy-v1",
+        exactConfidence: 0.7,
+      },
+    ],
     (value, context) => context.ip !== undefined && knownCountry(value),
   ),
   allowedCountry: requirement(
@@ -236,7 +264,27 @@ function requirement(
   provenances: readonly ConfidenceProvenance[],
   valueIsValid: EvidenceRequirement["valueIsValid"],
 ): EvidenceRequirement {
-  return { factType, sources, providers, provenances, valueIsValid };
+  return {
+    factType,
+    origins: sources.flatMap((source) =>
+      providers.flatMap((provider) =>
+        provenances.map((confidenceProvenance) => ({
+          source,
+          provider,
+          confidenceProvenance,
+        })),
+      ),
+    ),
+    valueIsValid,
+  };
+}
+
+function originsRequirement(
+  factType: string,
+  origins: readonly EvidenceOrigin[],
+  valueIsValid: EvidenceRequirement["valueIsValid"],
+): EvidenceRequirement {
+  return { factType, origins, valueIsValid };
 }
 
 function value(

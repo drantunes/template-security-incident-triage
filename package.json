@@ -25,11 +25,17 @@
     "runbooks:inspect": "node --import tsx scripts/runbooks.mts inspect",
     "runbooks:rollback": "node --import tsx scripts/runbooks.mts rollback",
     "runbooks:cleanup": "node --import tsx scripts/runbooks.mts cleanup",
-    "audit": "npm audit --audit-level=high"
+    "staging:workos:check": "node --env-file-if-exists=.env --import tsx scripts/phase8-staging-harness.mts workos",
+    "staging:ipinfo:check": "node --env-file-if-exists=.env --import tsx scripts/phase8-staging-harness.mts ipinfo",
+    "staging:linear:check": "node --env-file-if-exists=.env --import tsx scripts/phase8-staging-harness.mts linear",
+    "staging:upstash:check": "node --env-file-if-exists=.env --import tsx scripts/phase8-staging-harness.mts upstash",
+    "audit": "npm audit --audit-level=high",
+    "postinstall": "node scripts/apply-vendored-redis-streams-patch.mjs"
   },
   "dependencies": {
     "@hono/node-server": "2.1.1",
     "@libsql/client": "0.17.4",
+    "@linear/sdk": "92.0.0",
     "@mastra/auth-workos": "1.6.4",
     "@mastra/core": "1.63.0",
     "@mastra/fastembed": "1.2.0",

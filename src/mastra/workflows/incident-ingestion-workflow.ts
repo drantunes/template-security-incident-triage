@@ -52,6 +52,7 @@ import { createFinalizeIncidentStep } from "../steps/finalize-incident.js";
 import type { IncidentProvider } from "../../providers/incident-provider.js";
 import { MockIncidentProvider } from "../../providers/mock-incident-provider.js";
 import type { MockContainmentState } from "../../containment/mock-state.js";
+import type { IdentityProvider } from "../../providers/identity-provider.js";
 
 export const IncidentIngestionInputSchema = z
   .object({
@@ -92,6 +93,7 @@ export function createIncidentIngestionWorkflow(
     mode?: "mock" | "staging" | "production";
     timeoutMs?: number;
     rateLimit?: number;
+    identityProvider?: IdentityProvider;
     clock?: Clock;
     ids?: IdGenerator;
   }> = {},
@@ -267,6 +269,9 @@ export function createIncidentIngestionWorkflow(
         mode: phase6Dependencies.mode ?? phase6Config.mode,
         timeoutMs: phase6Dependencies.timeoutMs ?? phase6Config.actionTimeoutMs,
         rateLimit: phase6Dependencies.rateLimit ?? phase6Config.rateLimit,
+        ...(phase6Dependencies.identityProvider
+          ? { identityProvider: phase6Dependencies.identityProvider }
+          : {}),
       }),
     )
     .then(createVerifyContainmentStep())

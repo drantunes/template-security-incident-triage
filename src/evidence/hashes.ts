@@ -19,7 +19,7 @@ export type EvidenceEnvelope = Readonly<{
   collectedAt: string;
   fact: Readonly<Record<string, string | number | boolean | null>>;
   confidence: number;
-  confidenceProvenance: "provider" | "rule-v1";
+  confidenceProvenance: "provider" | "rule-v1" | "policy-v1";
   rawPayloadRef: string;
   sensitivity: "public" | "internal" | "confidential" | "restricted";
   incomplete: boolean;

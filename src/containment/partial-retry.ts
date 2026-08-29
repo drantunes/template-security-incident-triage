@@ -12,6 +12,7 @@ import { getIncident, transitionIncident } from "../db/incident-operations.js";
 import { recordContainmentOutcome } from "../db/containment-outcome-operations.js";
 import { ContainmentGateway } from "./gateway.js";
 import type { MockContainmentState } from "./mock-state.js";
+import type { IdentityProvider } from "../providers/identity-provider.js";
 import { closeValidatedTerminalIncident } from "./terminal-readiness.js";
 
 export async function retryPartialContainment(
@@ -26,6 +27,7 @@ export async function retryPartialContainment(
     mode: "mock" | "staging" | "production";
     timeoutMs: number;
     rateLimit: number;
+    identityProvider?: IdentityProvider;
   }>,
   dependencies: Readonly<{ clock?: Clock; ids?: IdGenerator }> = {},
 ) {
@@ -137,6 +139,9 @@ export async function retryPartialContainment(
     mode: input.mode,
     timeoutMs: input.timeoutMs,
     rateLimit: input.rateLimit,
+    ...(input.identityProvider
+      ? { identityProvider: input.identityProvider }
+      : {}),
     ...dependencies,
   });
   const outcomes = [];

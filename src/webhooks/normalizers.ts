@@ -7,7 +7,9 @@ import {
   WorkOsEnvelopeSchema,
   WorkOsRoleChangedDataSchema,
   WorkOsUnknownDeviceDataSchema,
-  type DemoAlertWebhook,
+  WorkOsMembershipObjectSchema,
+  WorkOsRealEnvelopeSchema,
+  WorkOsSessionObjectSchema,
 } from "./schemas.js";
 
 export type NormalizationResult =
@@ -113,7 +115,107 @@ export function normalizeWorkOsMock(
   }
 }
 
-function buildAlert(input: DemoAlertWebhook, rawBody: Uint8Array): Alert {
+export function normalizeWorkOsReal(
+  value: unknown,
+  rawBody: Uint8Array,
+  allowlist: Readonly<{
+    organizationId: string;
+    userIds: ReadonlySet<string>;
+    roleSlugs: ReadonlySet<string>;
+  }>,
+): NormalizationResult {
+  const envelope = WorkOsRealEnvelopeSchema.parse(value);
+  if (envelope.event === "organization_membership.updated") {
+    const data = WorkOsMembershipObjectSchema.parse(envelope.data);
+    if (
+      data.organization_id !== allowlist.organizationId ||
+      !allowlist.userIds.has(data.user_id) ||
+      !allowlist.roleSlugs.has(data.role.slug)
+    )
+      throw new Error("WORKOS_ALLOWLIST_REJECTED");
+    // Only supported role values can enter the v2 context/policy. Unknown
+    // allowlisted slugs are a configuration error, not a permissive fallback.
+    if (!isPolicyRole(data.role.slug))
+      throw new Error("WORKOS_ALLOWLIST_REJECTED");
+    return {
+      disposition: "alert",
+      alert: buildAlert(
+        {
+          schemaVersion: 1,
+          source: "workos",
+          sourceEventId: envelope.id,
+          kind: "unauthorized_privilege_change",
+          occurredAt: data.updated_at ?? envelope.created_at,
+          tenantId: data.organization_id,
+          subjectId: data.user_id,
+          // Membership.updated has no actor or previous role in the 8.13
+          // serialized contract; never infer either from current state.
+          actor: { id: `workos:unknown:${envelope.id}`, type: "unknown" },
+          // A membership is the authoritative object for ordering a role
+          // change. A user can have independent memberships and must not let
+          // one tenant/object make another object's event appear stale.
+          target: { id: data.id, type: "membership" },
+          changes: {
+            membershipId: data.id,
+            // Preserve the closed provider discriminator for the ordering
+            // preflight. The incident kind is intentionally broader and
+            // cannot distinguish future provider lifecycle event types.
+            workosEventType: envelope.event,
+            observedCurrentRole: data.role.slug,
+            // Status is part of the authoritative membership state.  Leaving
+            // it out would make two otherwise identical ordering positions
+            // (for example active vs inactive) look safely equivalent.
+            observedStatus: data.status,
+          },
+        },
+        rawBody,
+      ),
+    };
+  }
+  const data = WorkOsSessionObjectSchema.parse(envelope.data);
+  if (
+    data.organization_id !== allowlist.organizationId ||
+    !allowlist.userIds.has(data.user_id)
+  )
+    throw new Error("WORKOS_ALLOWLIST_REJECTED");
+  return {
+    disposition: "alert",
+    alert: buildAlert(
+      {
+        schemaVersion: 1,
+        source: "workos",
+        sourceEventId: envelope.id,
+        kind: "disallowed_country_login",
+        occurredAt: data.updated_at ?? data.created_at ?? envelope.created_at,
+        tenantId: data.organization_id,
+        subjectId: data.user_id,
+        sessionId: data.id,
+        ...(data.ip_address ? { ip: data.ip_address } : {}),
+        actor: { id: `workos:unknown:${envelope.id}`, type: "unknown" },
+        target: { id: data.id, type: "session" },
+        // Do not collapse session.created and session.revoked into the
+        // broader incident kind: the preflight hashes this allowlisted type
+        // with the normalized session state.
+        changes: {
+          workosEventType: envelope.event,
+          sessionStatus: data.status,
+        },
+      },
+      rawBody,
+    ),
+  };
+}
+
+function isPolicyRole(
+  value: string | undefined,
+): value is "admin" | "member" | "viewer" {
+  return value === "admin" || value === "member" || value === "viewer";
+}
+
+function buildAlert(
+  input: Omit<Alert, "alertId" | "rawPayloadRef" | "idempotencyKey">,
+  rawBody: Uint8Array,
+): Alert {
   const identityHash = createHash("sha256")
     .update(input.source, "utf8")
     .update(Buffer.from([0]))

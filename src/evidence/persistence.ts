@@ -43,7 +43,7 @@ export async function persistEvidenceItems(
       workflowRunId: input.context.workflowRunId,
       subjectId: input.context.subjectId,
       source: input.source,
-      provider: input.provider,
+      provider: fact.provider ?? input.provider,
       collectedAt,
       fact,
     }),
@@ -119,7 +119,7 @@ export async function persistEvidenceItems(
           payload: {
             evidenceId: evidence.evidenceId,
             source: input.source,
-            provider: input.provider,
+            provider: envelope.provider,
             hashVersion: 1,
           },
         });

@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const WEBHOOK_TOLERANCE_MS = 300_000;
+export const WORKOS_WEBHOOK_TOLERANCE_MS = 180_000;
 
 export type SignatureFailureCode =
   | "SIGNATURE_MISSING"
@@ -18,25 +19,36 @@ export class SignatureError extends Error {
 export function verifyWebhookSignature(
   input: Readonly<{
     header: string | undefined;
-    secret: string;
+    secret?: string;
+    secrets?: readonly string[];
     rawBody: Uint8Array;
     nowMs?: number;
+    toleranceMs?: number;
   }>,
 ): void {
   if (!input.header) throw new SignatureError("SIGNATURE_MISSING");
   const parsed = parseSignatureHeader(input.header);
   const nowMs = input.nowMs ?? Date.now();
-  if (Math.abs(nowMs - parsed.timestampMs) > WEBHOOK_TOLERANCE_MS) {
+  if (
+    Math.abs(nowMs - parsed.timestampMs) >
+    (input.toleranceMs ?? WEBHOOK_TOLERANCE_MS)
+  ) {
     throw new SignatureError("SIGNATURE_EXPIRED");
   }
   const prefix = Buffer.from(`${parsed.timestamp}.`, "utf8");
-  const expected = createHmac("sha256", input.secret)
-    .update(prefix)
-    .update(input.rawBody)
-    .digest();
+  const secrets = input.secrets ?? (input.secret ? [input.secret] : []);
+  if (secrets.length === 0) throw new SignatureError("SIGNATURE_INVALID");
   let matched = 0;
-  for (const candidate of parsed.signatures) {
-    matched |= Number(timingSafeEqual(expected, candidate));
+  // Do not short-circuit: rotations and multiple v1 signatures get the same
+  // timing treatment. Length is fixed by parseSignatureHeader.
+  for (const secret of secrets) {
+    const expected = createHmac("sha256", secret)
+      .update(prefix)
+      .update(input.rawBody)
+      .digest();
+    for (const candidate of parsed.signatures) {
+      matched |= Number(timingSafeEqual(expected, candidate));
+    }
   }
   if (matched === 0) throw new SignatureError("SIGNATURE_INVALID");
 }

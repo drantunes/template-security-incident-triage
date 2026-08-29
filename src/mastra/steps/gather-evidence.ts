@@ -68,6 +68,11 @@ export function createGatherEvidenceStep<Source extends EvidenceSourceV1>(
         ...(inputData.sessionId ? { sessionId: inputData.sessionId } : {}),
         ...(inputData.deviceId ? { deviceId: inputData.deviceId } : {}),
         ...(inputData.ip ? { ip: inputData.ip } : {}),
+        ...(inputData.actorId ? { actorId: inputData.actorId } : {}),
+        ...(inputData.roleChange ? { roleChange: inputData.roleChange } : {}),
+        ...(inputData.changeApproved === undefined
+          ? {}
+          : { changeApproved: inputData.changeApproved }),
       };
       const parsedRequest = EvidenceProviderInputSchema.parse(request);
       const executeTool = dependencies.tool.execute;
@@ -225,6 +230,10 @@ function trustedRequestContext(request: EvidenceProviderInput) {
   if (request.sessionId) context.set("sessionId", request.sessionId);
   if (request.deviceId) context.set("deviceId", request.deviceId);
   if (request.ip) context.set("ip", request.ip);
+  if (request.actorId) context.set("actorId", request.actorId);
+  if (request.roleChange) context.set("roleChange", request.roleChange);
+  if (request.changeApproved !== undefined)
+    context.set("changeApproved", request.changeApproved);
   return context;
 }
 

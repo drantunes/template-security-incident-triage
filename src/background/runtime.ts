@@ -3,16 +3,21 @@ import type { Mastra } from "@mastra/core/mastra";
 
 import { createLibSqlOperationalStore } from "../db/libsql-operational-store.js";
 import { migrateOperationalStore } from "../db/migrate.js";
+import { purgeExpiredGeoIpCache } from "../db/geoip-cache-operations.js";
 import type { OperationalStore } from "../db/operational-store.js";
 import {
   readPhase2Config,
+  readPhase8Config,
+  assertPhase8ControlPlaneAuth,
   readPhase6Config,
   type Phase2Config,
+  type Phase8Config,
   type Phase6Config,
 } from "../env.js";
 import { consoleLogger, type StructuredLogger } from "../logging.js";
 import { createApp } from "../server.js";
-import { MockIncidentProvider } from "../providers/mock-incident-provider.js";
+import { createPhase8IncidentProvider } from "../providers/runtime-factory.js";
+import { createPhase8IdentityProvider } from "../providers/runtime-factory.js";
 import { OutboxDispatcher } from "./outbox-dispatcher.js";
 import {
   startWorkflowWorker,
@@ -44,9 +49,13 @@ export async function startServerRuntime(
     mastraInstance?: Mastra;
     bindServer?: BindServer;
     phase6Config?: Phase6Config;
+    /** A validated F8 config is injected once into every runtime boundary. */
+    phase8Config?: Phase8Config;
   }> = {},
 ): Promise<ServerRuntime> {
   const config = overrides.config ?? readPhase2Config();
+  const phase8Config = overrides.phase8Config ?? readPhase8Config();
+  assertPhase8ControlPlaneAuth(phase8Config);
   const store = overrides.store ?? createLibSqlOperationalStore();
   const logger = overrides.logger ?? consoleLogger;
   const runtimeMastra =
@@ -65,6 +74,7 @@ export async function startServerRuntime(
       logger,
       mastraInstance: runtimeMastra,
       phase6Config,
+      phase8Config,
     });
     await runtimeMastra.startWorkers();
     unsubscribe = await startWorkflowWorker({
@@ -74,7 +84,15 @@ export async function startServerRuntime(
       ) as IngestionWorkflow,
       store,
       logger,
-      maxAttempts: config.outbox.maxAttempts,
+      maxAttempts: phase8Config.upstash.enabled
+        ? phase8Config.upstash.maxDeliveryAttempts
+        : config.outbox.maxAttempts,
+      ...(phase8Config.upstash.enabled
+        ? {
+            retryBackoffMs: phase8Config.upstash.retryBackoffMs,
+            concurrency: phase8Config.upstash.concurrency,
+          }
+        : {}),
     });
     const dispatcher = new OutboxDispatcher(
       store,
@@ -87,7 +105,7 @@ export async function startServerRuntime(
     )("incidentIngestionWorkflow") as ApprovalWorkflow;
     const recovery = new Phase6RecoveryDispatcher({
       store,
-      provider: new MockIncidentProvider({ store }),
+      provider: createPhase8IncidentProvider(phase8Config, { store }),
       containmentState: {
         sessions: new Map(),
         roles: new Map(),
@@ -98,15 +116,20 @@ export async function startServerRuntime(
       mode: phase6Config.mode,
       actionTimeoutMs: phase6Config.actionTimeoutMs,
       rateLimit: phase6Config.rateLimit,
+      identityProvider: createPhase8IdentityProvider(phase8Config, () => true, {
+        openStore: createLibSqlOperationalStore,
+      }),
       reconcileApprovalRun:
         createWorkflowApprovalRunReconciler(approvalWorkflow),
     });
     await dispatcher.reconcile();
+    await purgeExpiredGeoIpCache(store, new Date());
     timer = setInterval(() => {
       if (iteration) return;
       iteration = dispatcher
         .reconcile()
         .then(() => dispatcher.runOnce())
+        .then(() => purgeExpiredGeoIpCache(store, new Date()))
         .then(() => recovery.runOnce())
         .catch(() => {
           logger.write({

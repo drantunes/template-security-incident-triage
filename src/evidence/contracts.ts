@@ -7,9 +7,11 @@ export const MAX_CORRELATED_EVIDENCE_ITEMS = 3 * 16;
 export const MAX_PAIRWISE_CONTRADICTIONS =
   (MAX_CORRELATED_EVIDENCE_ITEMS * (MAX_CORRELATED_EVIDENCE_ITEMS - 1)) / 2;
 
-export const InvestigationContextSchema = z
+const InvestigationContextObjectSchema = z
   .object({
-    schemaVersion: z.literal(1),
+    // v1 remains readable for existing workflow runs. v2 is emitted only for a
+    // validated privilege-change alert and carries no inferred authority.
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
     eventId: opaqueId,
     alertId: opaqueId,
     incidentId: opaqueId,
@@ -22,20 +24,56 @@ export const InvestigationContextSchema = z
     sessionId: opaqueId.optional(),
     deviceId: opaqueId.optional(),
     ip: z.ipv4().or(z.ipv6()).optional(),
+    actorId: opaqueId.optional(),
+    roleChange: z
+      .object({
+        previousRole: z.enum(["admin", "member", "viewer"]),
+        currentRole: z.enum(["admin", "member", "viewer"]),
+      })
+      .strict()
+      .optional(),
+    // This field is populated exclusively from the local authorization ledger
+    // by loadInvestigationContext. A webhook/provider value is never trusted.
+    changeApproved: z.boolean().optional(),
   })
   .strict();
 
-export const EvidenceProviderInputSchema = InvestigationContextSchema.pick({
-  tenantId: true,
-  incidentId: true,
-  subjectId: true,
-  workflowRunId: true,
-  incidentKind: true,
-  occurredAt: true,
-  sessionId: true,
-  deviceId: true,
-  ip: true,
-}).strict();
+export const InvestigationContextSchema =
+  InvestigationContextObjectSchema.superRefine((value, context) => {
+    if (
+      value.schemaVersion === 2 &&
+      value.incidentKind === "unauthorized_privilege_change" &&
+      (!value.actorId || !value.roleChange)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Privilege-change context v2 requires actor and role change.",
+      });
+    }
+  });
+
+export const EvidenceProviderInputSchema =
+  InvestigationContextObjectSchema.pick({
+    tenantId: true,
+    incidentId: true,
+    subjectId: true,
+    workflowRunId: true,
+    incidentKind: true,
+    occurredAt: true,
+    sessionId: true,
+    deviceId: true,
+    ip: true,
+    actorId: true,
+    roleChange: true,
+    changeApproved: true,
+  }).strict();
+
+export const EvidenceProviderIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z][a-z0-9-]*$/u);
 
 export const EvidenceFactSchema = z
   .object({
@@ -44,10 +82,13 @@ export const EvidenceFactSchema = z
     factType: z.string().trim().min(1).max(64),
     value: z.union([z.string().max(2_048), z.number().finite(), z.boolean()]),
     confidence: z.number().finite().min(0).max(1),
-    confidenceProvenance: z.enum(["provider", "rule-v1"]),
+    confidenceProvenance: z.enum(["provider", "rule-v1", "policy-v1"]),
     rawPayloadRef: z.string().regex(/^(sha256:|protected:)[^\s]{1,480}$/u),
     sensitivity: z.enum(["public", "internal", "confidential", "restricted"]),
     incomplete: z.boolean().default(false),
+    // v2 composition may carry facts from more than one provider in a single
+    // branch result. Omitting this optional field preserves v1 behavior.
+    provider: EvidenceProviderIdSchema.optional(),
   })
   .strict();
 
@@ -66,13 +107,6 @@ export const ProviderErrorSchema = z
     attempt: z.number().int().min(1).max(2),
   })
   .strict();
-
-export const EvidenceProviderIdSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(64)
-  .regex(/^[a-z][a-z0-9-]*$/u);
 
 export const EvidenceProviderResultSchema = z.discriminatedUnion("status", [
   z

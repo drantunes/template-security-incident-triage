@@ -16,6 +16,7 @@ import type { OperationalStore } from "../../db/operational-store.js";
 import type { Clock } from "../../domain/clock.js";
 import type { IdGenerator } from "../../domain/id-generator.js";
 import { ContainmentActionOutcomeSchema } from "../../schemas/containment.js";
+import type { IdentityProvider } from "../../providers/identity-provider.js";
 
 export function createExecuteContainmentStep(
   dependencies: Readonly<{
@@ -24,6 +25,7 @@ export function createExecuteContainmentStep(
     mode: "mock" | "staging" | "production";
     timeoutMs: number;
     rateLimit: number;
+    identityProvider?: IdentityProvider;
     clock?: Clock;
     ids?: IdGenerator;
   }>,
@@ -136,6 +138,9 @@ export function createExecuteContainmentStep(
           mode: dependencies.mode,
           timeoutMs: dependencies.timeoutMs,
           rateLimit: dependencies.rateLimit,
+          ...(dependencies.identityProvider
+            ? { identityProvider: dependencies.identityProvider }
+            : {}),
           ...(dependencies.clock ? { clock: dependencies.clock } : {}),
           ...(dependencies.ids ? { ids: dependencies.ids } : {}),
         });

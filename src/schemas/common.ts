@@ -39,6 +39,13 @@ export const actorSchema = z
 export const targetSchema = z
   .object({
     id: opaqueId,
-    type: z.enum(["user", "session", "device", "role", "resource"]),
+    type: z.enum([
+      "user",
+      "session",
+      "membership",
+      "device",
+      "role",
+      "resource",
+    ]),
   })
   .strict();

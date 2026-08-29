@@ -128,8 +128,8 @@ export async function requestApproval(
     await tx.batch(
       plan.actions.map((action, ordinal) => ({
         sql: `INSERT INTO containment_actions(id, plan_id, incident_id, tenant_id,
-        action_id, action_type, ordinal, input_json, idempotency_key, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+        action_id, action_type, target_id, ordinal, input_json, idempotency_key, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
         args: [
           ids.next(),
           plan.planId,
@@ -137,6 +137,7 @@ export async function requestApproval(
           plan.tenantId,
           action.actionId,
           action.type,
+          action.targetId,
           ordinal,
           JSON.stringify(action.input),
           `${plan.planId}:${action.actionId}`,

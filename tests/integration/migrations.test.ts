@@ -32,18 +32,29 @@ describe("SOC migrations", () => {
             'runbook_retrievals','runbook_retrieval_chunks','approval_resume_tokens',
             'containment_action_attempts','containment_gateway_audit',
             'approval_decision_audit','mock_incident_provider_effects',
-            'mock_containment_effects'
+            'mock_containment_effects','geoip_cache_entries','geoip_cache_leases','provider_effect_ledger',
+            'consumer_effect_ledger','workos_observed_memberships','workos_observed_sessions',
+            'workos_observed_positions'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(28);
+      expect(tables.rows).toHaveLength(35);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
+      );
+      expect(tables.rows.map((row) => row.name)).toContain(
+        "workos_observed_memberships",
+      );
+      expect(tables.rows.map((row) => row.name)).toContain(
+        "workos_observed_sessions",
+      );
+      expect(tables.rows.map((row) => row.name)).toContain(
+        "workos_observed_positions",
       );
 
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(35);
+      expect(Number(indexes.rows[0]?.count)).toBe(46);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -75,7 +86,7 @@ describe("SOC migrations", () => {
     }
   });
 
-  it("supports 0001 to 0002 to 0004 upgrade, no-op reapplication and reopening", async () => {
+  it("upgrades 0001–0006 to the single 0007 Phase 8 delta, then reapplies safely", async () => {
     const database = await createTempDatabase();
     databases.push(database);
     let store = database.createStore();
@@ -87,8 +98,9 @@ describe("SOC migrations", () => {
       ) VALUES ('incident-preserved', 'tenant-1', 'unknown_device_login', 'subject-1',
         'received', '2026-08-27T12:00:00.000Z', '2026-08-27T12:00:00.000Z')`,
     });
-    await migrateOperationalStore(store);
-    await migrateOperationalStore(store);
+    await migrateOperationalStore(store, { targetVersion: 6 });
+    await migrateOperationalStore(store, { targetVersion: 7 });
+    await migrateOperationalStore(store, { targetVersion: 7 });
     store.close();
 
     store = database.createStore();
@@ -109,7 +121,13 @@ describe("SOC migrations", () => {
         { version: 4 },
         { version: 5 },
         { version: 6 },
+        { version: 7 },
       ]);
+      await expect(
+        store.execute({
+          sql: `SELECT decision_provenance FROM approvals WHERE 1 = 0`,
+        }),
+      ).resolves.toBeDefined();
     } finally {
       store.close();
     }
