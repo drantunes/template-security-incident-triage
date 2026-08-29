@@ -34,6 +34,18 @@ describe("WorkOS-compatible webhook signature", () => {
     ).not.toThrow();
   });
 
+  it("accepts HTTP optional whitespace around WorkOS signature members", () => {
+    const valid = signBody(body);
+    expect(() =>
+      verifyWebhookSignature({
+        header: ` \t${valid.replace(",", " \t, \t")} \t`,
+        secret: alertSecret,
+        rawBody: body,
+        nowMs: phase2NowMs,
+      }),
+    ).not.toThrow();
+  });
+
   it("rejects altered bytes and malformed members", () => {
     expect(() =>
       verifyWebhookSignature({
@@ -49,6 +61,10 @@ describe("WorkOS-compatible webhook signature", () => {
       `t=${phase2Timestamp},t=${phase2Timestamp},v1=${"a".repeat(64)}`,
       `t=${phase2Timestamp},v1=xyz`,
       `t=${phase2Timestamp},v2=${"a".repeat(64)}`,
+      `t=${phase2Timestamp}, v 1=${"a".repeat(64)}`,
+      `t= ${phase2Timestamp},v1=${"a".repeat(64)}`,
+      `t=${phase2Timestamp}, \r\nv1=${"a".repeat(64)}`,
+      `t=${phase2Timestamp},\u00a0v1=${"a".repeat(64)}`,
     ]) {
       expect(() =>
         verifyWebhookSignature({

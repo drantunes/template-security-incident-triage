@@ -60,7 +60,11 @@ function parseSignatureHeader(header: string): Readonly<{
 }> {
   let timestamp: string | undefined;
   const signatures: Buffer[] = [];
-  for (const member of header.split(",")) {
+  for (const rawMember of header.split(",")) {
+    // HTTP optional whitespace is limited to SP / HTAB. Trim it only at the
+    // member boundary so separators, keys, timestamps, and signatures remain
+    // strict tokens.
+    const member = rawMember.replace(/^[ \t]+|[ \t]+$/gu, "");
     const separator = member.indexOf("=");
     if (separator <= 0 || separator === member.length - 1) {
       throw new SignatureError("SIGNATURE_MALFORMED");
