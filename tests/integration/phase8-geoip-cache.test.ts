@@ -260,6 +260,47 @@ describe("Phase 8 durable GeoIP cache", () => {
     store.close();
   });
 
+  it("does not return or locally cache evidence after the durable fence is lost", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    await migrateOperationalStore(store);
+    const now = new Date("2026-08-29T00:00:00.000Z");
+    let calls = 0;
+    const provider = new IpinfoLiteProvider({
+      token: "test-token",
+      cacheHmacKey,
+      timeoutMs: 1_500,
+      store,
+      now: () => now,
+      transport: async () => {
+        calls += 1;
+        if (calls === 1)
+          await store.execute({ sql: "DELETE FROM geoip_cache_leases" });
+        return { status: 200, json: async () => ({ country_code: "BR" }) };
+      },
+    });
+    await expect(
+      provider.lookup({
+        tenantId: "tenant-1",
+        ip: "8.8.8.8",
+        deadline: new Date(now.getTime() + 1_000),
+      }),
+    ).resolves.toEqual({ outcome: "unknown", reasonCode: "unavailable" });
+    await expect(
+      store.execute({ sql: "SELECT * FROM geoip_cache_entries" }),
+    ).resolves.toMatchObject({ rows: [] });
+    await expect(
+      provider.lookup({
+        tenantId: "tenant-1",
+        ip: "8.8.8.8",
+        deadline: new Date(now.getTime() + 1_000),
+      }),
+    ).resolves.toMatchObject({ outcome: "known", countryCode: "BR" });
+    expect(calls).toBe(2);
+    store.close();
+  });
+
   it("isolates the local tier by tenant and purges retained rows without a lookup", async () => {
     const database = await createTempDatabase();
     databases.push(database);

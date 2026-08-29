@@ -16,7 +16,10 @@ export type NormalizationResult =
   | Readonly<{ disposition: "alert"; alert: Alert }>
   | Readonly<{
       disposition: "dead_letter";
-      reasonCode: "EVENT_UNKNOWN" | "EVENT_VERSION_UNSUPPORTED";
+      reasonCode:
+        | "EVENT_UNKNOWN"
+        | "EVENT_VERSION_UNSUPPORTED"
+        | "WORKOS_ALLOWLIST_REJECTED";
       eventRef: string;
     }>;
 
@@ -132,11 +135,11 @@ export function normalizeWorkOsReal(
       !allowlist.userIds.has(data.user_id) ||
       !allowlist.roleSlugs.has(data.role.slug)
     )
-      throw new Error("WORKOS_ALLOWLIST_REJECTED");
+      return deadLetter("WORKOS_ALLOWLIST_REJECTED", rawBody);
     // Only supported role values can enter the v2 context/policy. Unknown
     // allowlisted slugs are a configuration error, not a permissive fallback.
     if (!isPolicyRole(data.role.slug))
-      throw new Error("WORKOS_ALLOWLIST_REJECTED");
+      return deadLetter("WORKOS_ALLOWLIST_REJECTED", rawBody);
     return {
       disposition: "alert",
       alert: buildAlert(
@@ -177,7 +180,7 @@ export function normalizeWorkOsReal(
     data.organization_id !== allowlist.organizationId ||
     !allowlist.userIds.has(data.user_id)
   )
-    throw new Error("WORKOS_ALLOWLIST_REJECTED");
+    return deadLetter("WORKOS_ALLOWLIST_REJECTED", rawBody);
   return {
     disposition: "alert",
     alert: buildAlert(
@@ -238,7 +241,8 @@ function canonicalizeIp(ip: string): string {
 }
 
 function deadLetter(
-  reasonCode: "EVENT_UNKNOWN" | "EVENT_VERSION_UNSUPPORTED",
+  reasonCode:
+    "EVENT_UNKNOWN" | "EVENT_VERSION_UNSUPPORTED" | "WORKOS_ALLOWLIST_REJECTED",
   rawBody: Uint8Array,
 ): NormalizationResult {
   return {

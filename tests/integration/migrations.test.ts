@@ -54,7 +54,7 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(46);
+      expect(Number(indexes.rows[0]?.count)).toBe(45);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -86,7 +86,7 @@ describe("SOC migrations", () => {
     }
   });
 
-  it("upgrades 0001–0006 to the single 0007 Phase 8 delta, then reapplies safely", async () => {
+  it("upgrades 0001–0006 through the Phase 8 dedupe correction, then reapplies safely", async () => {
     const database = await createTempDatabase();
     databases.push(database);
     let store = database.createStore();
@@ -100,7 +100,8 @@ describe("SOC migrations", () => {
     });
     await migrateOperationalStore(store, { targetVersion: 6 });
     await migrateOperationalStore(store, { targetVersion: 7 });
-    await migrateOperationalStore(store, { targetVersion: 7 });
+    await migrateOperationalStore(store, { targetVersion: 8 });
+    await migrateOperationalStore(store, { targetVersion: 8 });
     store.close();
 
     store = database.createStore();
@@ -122,6 +123,7 @@ describe("SOC migrations", () => {
         { version: 5 },
         { version: 6 },
         { version: 7 },
+        { version: 8 },
       ]);
       await expect(
         store.execute({

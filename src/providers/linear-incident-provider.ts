@@ -332,15 +332,25 @@ export class LinearIncidentProvider implements IncidentProvider {
     return { externalRef };
   }
   private async assertDestination(): Promise<void> {
-    this.binding ??= this.options.resolveDestination().then((actual) => {
-      if (
-        actual.workspaceId !== this.options.workspaceId ||
-        actual.teamId !== this.options.teamId ||
-        actual.projectId !== this.options.projectId
-      )
-        throw new DomainError("VALIDATION_FAILED");
-    });
-    return this.binding;
+    const pending =
+      this.binding ??
+      this.options.resolveDestination().then((actual) => {
+        if (
+          actual.workspaceId !== this.options.workspaceId ||
+          actual.teamId !== this.options.teamId ||
+          actual.projectId !== this.options.projectId
+        )
+          throw new DomainError("VALIDATION_FAILED");
+      });
+    this.binding = pending;
+    try {
+      await pending;
+    } catch (error) {
+      // Only successful validation is cacheable. Preserve an in-flight newer
+      // resolution if one was installed while this failed.
+      if (this.binding === pending) this.binding = undefined;
+      throw error;
+    }
   }
 }
 

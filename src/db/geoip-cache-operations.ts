@@ -187,14 +187,14 @@ export async function completeGeoIpCache(
     ttlMs: number;
     retentionDays: number;
   }>,
-): Promise<void> {
+): Promise<boolean> {
   const ipHash = hashIp(input.tenantId, input.ip, input.keys.current.key);
   const observedAt = input.now.toISOString();
   const expiresAt = new Date(input.now.getTime() + input.ttlMs).toISOString();
   const purgeAfter = new Date(
     input.now.getTime() + input.retentionDays * 86_400_000,
   ).toISOString();
-  await store.transaction(async (tx) => {
+  return store.transaction(async (tx) => {
     const lease = await tx.execute({
       sql: `DELETE FROM geoip_cache_leases
         WHERE tenant_id = ? AND policy_version = ? AND key_version = ?
@@ -207,7 +207,7 @@ export async function completeGeoIpCache(
         input.fenceToken,
       ],
     });
-    if (lease.rowsAffected !== 1) return;
+    if (lease.rowsAffected !== 1) return false;
     await tx.execute({
       sql: `INSERT INTO geoip_cache_entries(
         tenant_id, policy_version, key_version, ip_hash, result_json, observed_at, expires_at, purge_after
@@ -226,6 +226,7 @@ export async function completeGeoIpCache(
         purgeAfter,
       ],
     });
+    return true;
   });
 }
 

@@ -99,8 +99,8 @@ export async function createIncidentFromAlertResult(
           const existingIdentity = await tx.execute({
             sql: `SELECT a.canonical_json, i.* FROM alerts a
               JOIN incidents i ON i.tenant_id = a.tenant_id AND i.id = a.incident_id
-              WHERE a.source_event_id = ?`,
-            args: [alert.sourceEventId],
+              WHERE a.source = ? AND a.source_event_id = ?`,
+            args: [alert.source, alert.sourceEventId],
           });
           const existingRow = existingIdentity.rows[0];
           if (existingRow) {
@@ -245,8 +245,8 @@ export async function createIncidentFromAlertResult(
         const existing = await store.execute({
           sql: `SELECT a.incident_id, a.canonical_json
             FROM alerts a
-            WHERE a.source_event_id = ?`,
-          args: [alert.sourceEventId],
+            WHERE a.source = ? AND a.source_event_id = ?`,
+          args: [alert.source, alert.sourceEventId],
         });
         const row = existing.rows[0];
         if (

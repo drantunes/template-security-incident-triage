@@ -4,8 +4,10 @@ import {
   IpinfoLiteProvider,
   MockGeoIpProvider,
 } from "../../src/providers/geoip-provider.js";
-import { LinearIncidentProvider } from "../../src/providers/linear-incident-provider.js";
-import { AmbiguousLinearUpdateError } from "../../src/providers/linear-incident-provider.js";
+import {
+  AmbiguousLinearUpdateError,
+  LinearIncidentProvider,
+} from "../../src/providers/linear-incident-provider.js";
 import { MockIncidentProvider } from "../../src/providers/mock-incident-provider.js";
 
 const projection = {
@@ -251,6 +253,56 @@ for (const [name, create] of [
 }
 
 describe("IncidentProvider shared contract", () => {
+  it("retries destination resolution after a transient failure and writes once after validation", async () => {
+    let resolutionAttempts = 0;
+    let creates = 0;
+    let title = "";
+    const linear = new LinearIncidentProvider({
+      client: {
+        createIssue: async (input) => {
+          creates += 1;
+          title = input.title;
+          return { success: true, issueId: "issue_destination_retry" };
+        },
+        updateIssue: async () => ({ success: false }),
+        searchIssues: async () => ({ nodes: [] }),
+        issue: async (id) => ({
+          id,
+          title,
+          state: { id: "state_1" },
+          team: { id: "team_1" },
+        }),
+      },
+      workspaceId: "workspace_1",
+      teamId: "team_1",
+      severityLabelIds: { low: "l", medium: "m", high: "h", critical: "c" },
+      statusStateIds: { awaiting_approval: "state_1" },
+      internalBaseUrl: "https://linear.example/base",
+      resolveDestination: async () => {
+        resolutionAttempts += 1;
+        if (resolutionAttempts === 1)
+          throw new Error("transient destination read");
+        return { workspaceId: "workspace_1", teamId: "team_1" };
+      },
+    });
+    await expect(
+      linear.create({
+        projection,
+        idempotencyKey: "destination-retry",
+        generation: 1,
+      }),
+    ).rejects.toThrow("transient destination read");
+    await expect(
+      linear.create({
+        projection,
+        idempotencyKey: "destination-retry",
+        generation: 1,
+      }),
+    ).resolves.toEqual({ externalRef: "linear:issue_destination_retry" });
+    expect(resolutionAttempts).toBe(2);
+    expect(creates).toBe(1);
+  });
+
   it("supports idempotent mock and SDK-shaped Linear fake create/update/reconcile", async () => {
     const mock = new MockIncidentProvider();
     const first = await mock.create({

@@ -61,6 +61,139 @@ const realWorkosConfig = () =>
   });
 
 describe("Phase 8 WorkOS raw webhook and InvestigationContext v2", () => {
+  it("scopes event dedupe to provider source while preserving WorkOS replay idempotency", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    await migrateOperationalStore(store);
+    const workos = makeAlert({
+      alertId: "workos-shared-event",
+      source: "workos",
+      sourceEventId: "shared-source-event",
+      tenantId: "tenant-workos",
+      idempotencyKey: "workos-shared-delivery",
+    });
+    const otherSource = makeAlert({
+      alertId: "other-shared-event",
+      source: "other-provider",
+      sourceEventId: "shared-source-event",
+      tenantId: "tenant-other",
+      idempotencyKey: "other-shared-delivery",
+    });
+    await expect(
+      createIncidentFromAlertResult(store, workos, {
+        enforceAlertOrdering: true,
+      }),
+    ).resolves.toMatchObject({ duplicate: false });
+    await expect(
+      createIncidentFromAlertResult(store, otherSource, {
+        enforceAlertOrdering: true,
+      }),
+    ).resolves.toMatchObject({ duplicate: false });
+    await expect(
+      createIncidentFromAlertResult(store, workos, {
+        enforceAlertOrdering: true,
+      }),
+    ).resolves.toMatchObject({ duplicate: true });
+    await expect(
+      store.execute({
+        sql: `SELECT source, tenant_id FROM alerts
+          WHERE source_event_id = 'shared-source-event' ORDER BY source`,
+      }),
+    ).resolves.toMatchObject({
+      rows: [
+        { source: "other-provider", tenant_id: "tenant-other" },
+        { source: "workos", tenant_id: "tenant-workos" },
+      ],
+    });
+    store.close();
+  });
+
+  it("dead-letters allowlist mismatches terminally without creating incidents or logging IDs", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    await migrateOperationalStore(store);
+    const logs: unknown[] = [];
+    const app = await createApp({
+      config: makePhase2Config(),
+      phase8Config: realWorkosConfig(),
+      store,
+      logger: { write: (entry) => logs.push(entry) },
+      nowMs: () => phase2NowMs,
+      mastraInstance: testMastra,
+    });
+    const send = async (
+      id: string,
+      overrides: Readonly<{
+        organizationId?: string;
+        userId?: string;
+        roleSlug?: string;
+      }>,
+    ) => {
+      const body = new TextEncoder().encode(
+        JSON.stringify({
+          id,
+          event: "organization_membership.updated",
+          created_at: "2026-08-27T12:00:00.000Z",
+          data: {
+            object: "organization_membership",
+            id: "membership-rejected",
+            organization_id: overrides.organizationId ?? "tenant-1",
+            user_id: overrides.userId ?? "subject-1",
+            status: "active",
+            created_at: "2026-08-27T11:00:00.000Z",
+            updated_at: "2026-08-27T12:00:00.000Z",
+            role: { slug: overrides.roleSlug ?? "member" },
+          },
+        }),
+      );
+      return app.request("/webhooks/workos", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "WorkOS-Signature": sign(body, "current-workos-webhook-secret"),
+        },
+        body,
+      });
+    };
+    for (const [id, overrides] of [
+      ["rejected-org", { organizationId: "other-organization" }],
+      ["rejected-user", { userId: "other-user" }],
+      ["rejected-role", { roleSlug: "operator" }],
+    ] as const) {
+      const response = await send(id, overrides);
+      expect(response.status).toBe(202);
+      await expect(response.json()).resolves.toMatchObject({
+        accepted: false,
+        disposition: "dead_lettered",
+        reasonCode: "WORKOS_ALLOWLIST_REJECTED",
+      });
+    }
+    await expect(
+      store.execute({
+        sql: `SELECT error_code FROM dead_letter_events
+          WHERE error_code = 'WORKOS_ALLOWLIST_REJECTED' ORDER BY id`,
+      }),
+    ).resolves.toMatchObject({
+      rows: [
+        { error_code: "WORKOS_ALLOWLIST_REJECTED" },
+        { error_code: "WORKOS_ALLOWLIST_REJECTED" },
+        { error_code: "WORKOS_ALLOWLIST_REJECTED" },
+      ],
+    });
+    await expect(
+      store.execute({
+        sql: `SELECT
+          (SELECT count(*) FROM incidents) AS incidents,
+          (SELECT count(*) FROM outbox_events) AS outbox`,
+      }),
+    ).resolves.toMatchObject({ rows: [{ incidents: 0, outbox: 0 }] });
+    expect(JSON.stringify(logs)).not.toContain("other-organization");
+    expect(JSON.stringify(logs)).not.toContain("other-user");
+    store.close();
+  });
+
   it("seeds the first official observation and atomically forms the next member→admin transition", async () => {
     const database = await createTempDatabase();
     databases.push(database);

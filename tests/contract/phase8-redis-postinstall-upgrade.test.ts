@@ -111,7 +111,10 @@ beforeAll(async () => {
   await writeFile(join(cleanRoot, typesRelativePath), baseTypes, "utf8");
   await runPostinstall(cleanRoot);
   ({ runtime: cleanRuntime, types: cleanTypes } = await readFixture(cleanRoot));
-});
+  // The fixture deliberately performs an offline npm install of the real
+  // package.  Hosted runners can take longer than Vitest's 10 s default even
+  // when the install succeeds, so this setup has an explicit bounded budget.
+}, 60_000);
 
 afterAll(async () => {
   if (fixtureRoot) await rm(fixtureRoot, { recursive: true, force: true });

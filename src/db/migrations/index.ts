@@ -7,6 +7,7 @@ import { runbookRetrievalStatements } from "./0004-runbook-retrieval.js";
 import { evidenceIntegrityVersionStatements } from "./0005-evidence-integrity-version.js";
 import { phase6ApprovalContainmentStatements } from "./0006-phase6-approval-containment.js";
 import { phase8ProviderDurabilityStatements } from "./0007-phase8-provider-durability.js";
+import { phase8AlertSourceDedupeStatements } from "./0008-phase8-alert-source-dedupe.js";
 
 export type Migration = Readonly<{
   version: number;
@@ -47,5 +48,10 @@ export const migrations = Object.freeze([
     7,
     "phase8-provider-durability",
     phase8ProviderDurabilityStatements,
+  ),
+  defineMigration(
+    8,
+    "phase8-alert-source-dedupe",
+    phase8AlertSourceDedupeStatements,
   ),
 ]);

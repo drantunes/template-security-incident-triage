@@ -180,10 +180,6 @@ export class IpinfoLiteProvider implements GeoIpProvider {
         return { outcome: "unknown", reasonCode: "bogon" };
       const known = parseLiteResponse(body, now);
       if (!known) return { outcome: "unknown", reasonCode: "invalid_response" };
-      this.cache.set(cacheKey, {
-        expiresAt: now.getTime() + (this.options.cacheTtlMs ?? 86_400_000),
-        result: known,
-      });
       if (
         useDurableCache &&
         cacheStore &&
@@ -191,7 +187,7 @@ export class IpinfoLiteProvider implements GeoIpProvider {
         durableClaim &&
         cacheKeys
       ) {
-        await completeGeoIpCache(cacheStore, {
+        const completed = await completeGeoIpCache(cacheStore, {
           tenantId: input.tenantId,
           ip: normalized,
           keys: cacheKeys,
@@ -201,8 +197,19 @@ export class IpinfoLiteProvider implements GeoIpProvider {
           ttlMs: this.options.cacheTtlMs ?? 86_400_000,
           retentionDays: this.options.retentionDays ?? 30,
         });
+        // A lost fence means another owner may now be authoritative. Never
+        // expose or warm process-local evidence that was not durably
+        // committed by this claim.
+        if (!completed) {
+          durableClaim = undefined;
+          return { outcome: "unknown", reasonCode: "unavailable" };
+        }
         durableClaim = undefined;
       }
+      this.cache.set(cacheKey, {
+        expiresAt: now.getTime() + (this.options.cacheTtlMs ?? 86_400_000),
+        result: known,
+      });
       return known;
     } catch {
       return {
