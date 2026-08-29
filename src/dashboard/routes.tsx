@@ -1,6 +1,7 @@
 /** @jsxImportSource hono/jsx */
 import type { Context, Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { bodyLimit } from "hono/body-limit";
 
 import {
   createCsrfToken,
@@ -49,6 +50,7 @@ import {
 const sessionCookie = "__Host-authkit-session";
 const stateCookie = "__Host-authkit-pkce";
 const issuedCookie = "__Host-authkit-issued-at";
+const defaultAuthMutationMaxBodyBytes = 1_048_576;
 type DashboardDependencies = Readonly<{
   store: OperationalStore;
   logger: StructuredLogger;
@@ -56,6 +58,7 @@ type DashboardDependencies = Readonly<{
   phase6Config: Phase6Config;
   sessionClient: DashboardSessionClient | null;
   reconcileApprovalRun: ReconcileApprovalRun;
+  authMutationMaxBodyBytes?: number;
   nowMs?: () => number;
 }>;
 
@@ -64,6 +67,11 @@ export function registerDashboardRoutes(
   dependencies: DashboardDependencies,
 ): void {
   const nowMs = dependencies.nowMs ?? Date.now;
+  const authMutationBodyLimit = bodyLimit({
+    maxSize:
+      dependencies.authMutationMaxBodyBytes ?? defaultAuthMutationMaxBodyBytes,
+    onError: (context) => dashboardError(context, "PAYLOAD_TOO_LARGE", 413),
+  });
   const activeSse = new Map<string, number>();
   const rateWindows = new Map<string, { startedAt: number; count: number }>();
   const clientKey = (context: Context<AppEnv>) => {
@@ -199,6 +207,9 @@ export function registerDashboardRoutes(
       return dashboardError(context, "STORAGE_UNAVAILABLE", 503, true);
     }
   });
+  // These form mutations are intentionally outside `/api/*`, so they need the
+  // same bounded-body boundary before they read cookies, CSRF, or form data.
+  app.use("/auth/logout", authMutationBodyLimit);
   app.post("/auth/logout", async (context) => {
     const loaded = await loadPrincipal(context, dependencies);
     const body = await context.req.parseBody();
@@ -225,6 +236,7 @@ export function registerDashboardRoutes(
       ? context.redirect(safeLogoutUrl, 302)
       : context.body(null, 204);
   });
+  app.use("/auth/organization", authMutationBodyLimit);
   app.post("/auth/organization", async (context) => {
     const loaded = await loadPrincipal(context, dependencies);
     const body = await context.req.parseBody();
@@ -303,7 +315,7 @@ export function registerDashboardRoutes(
       false,
       dependencies.config.csrfSecret,
     );
-    return context.body(null, 204);
+    return context.redirect("/dashboard", 303);
   });
   app.get("/", async (context) => dashboardPage(context, dependencies));
   app.get("/dashboard", async (context) =>
@@ -833,7 +845,7 @@ function setSessionCookie(
 function dashboardError(
   context: Context<AppEnv>,
   code: string,
-  status: 400 | 401 | 403 | 404 | 409 | 422 | 429 | 503,
+  status: 400 | 401 | 403 | 404 | 409 | 413 | 422 | 429 | 503,
   retryable = false,
 ) {
   return context.json(

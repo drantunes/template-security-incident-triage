@@ -98,6 +98,7 @@ export async function createApp(
     phase6Config,
     sessionClient: createWorkosDashboardSessionClient(phase7Config),
     reconcileApprovalRun,
+    authMutationMaxBodyBytes: input.config.mastraMaxBodyBytes,
     ...(input.nowMs ? { nowMs: input.nowMs } : {}),
   });
 

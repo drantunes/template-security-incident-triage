@@ -520,6 +520,49 @@ describe("Phase 7 HTTP boundaries", () => {
     expect(response.status).toBe(204);
     expect(seen).toEqual(["sealed", "rotated"]);
   });
+  it("rejects oversized public auth form mutations before authentication or CSRF", async () => {
+    const calls: string[] = [];
+    const application = app({
+      ...sessionClient,
+      authenticate: async () => {
+        calls.push("authenticate");
+        return sessionClient.authenticate("sealed");
+      },
+      refresh: async () => {
+        calls.push("refresh");
+        return { kind: "terminal" };
+      },
+      getLogoutUrl: async () => {
+        calls.push("logout-url");
+        return null;
+      },
+    });
+    const oversizedForm = new URLSearchParams({
+      csrfToken: "x".repeat(1_100_002),
+    });
+    for (const path of ["/auth/logout", "/auth/organization"]) {
+      const response = await application.request(
+        `https://dashboard.test${path}`,
+        {
+          method: "POST",
+          headers: {
+            Cookie: cookie(),
+            Origin: "https://dashboard.test",
+            "Sec-Fetch-Site": "same-origin",
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: oversizedForm,
+        },
+      );
+      expect(response.status).toBe(413);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "PAYLOAD_TOO_LARGE",
+        retryable: false,
+      });
+      expect(response.headers.get("set-cookie")).toBeNull();
+    }
+    expect(calls).toEqual([]);
+  });
   it("E2E mock SOC benign: UI/API projects an investigating incident without containment", async () => {
     const operationalStore = await benignStore();
     const client = {
@@ -1269,12 +1312,20 @@ describe("Phase 7 HTTP boundaries", () => {
           roles: [],
         },
       }),
-      authenticate: async () => ({
-        userId: "user_123",
-        sessionId: "session_123",
-        organizationId: undefined,
-        roles: [],
-      }),
+      authenticate: async (sealed) =>
+        sealed === "rotated"
+          ? {
+              userId: "user_123",
+              sessionId: "session_456",
+              organizationId: "tenant_456",
+              roles: ["soc_manager"],
+            }
+          : {
+              userId: "user_123",
+              sessionId: "session_123",
+              organizationId: undefined,
+              roles: [],
+            },
       listOrganizations: async () => [
         {
           organizationId: "tenant_456",
@@ -1314,6 +1365,7 @@ describe("Phase 7 HTTP boundaries", () => {
     const chosen = await application.request(
       "https://dashboard.test/auth/organization",
       {
+        redirect: "manual",
         method: "POST",
         headers: {
           Cookie: cookie(),
@@ -1327,7 +1379,21 @@ describe("Phase 7 HTTP boundaries", () => {
         }),
       },
     );
-    expect(chosen.status).toBe(204);
+    expect(chosen.status).toBe(303);
+    expect(chosen.headers.get("location")).toBe("/dashboard");
+    expect(chosen.headers.get("set-cookie")).toContain(
+      "__Host-authkit-session=rotated",
+    );
+    const dashboard = await application.request(
+      "https://dashboard.test/dashboard",
+      {
+        headers: {
+          Cookie: `__Host-authkit-session=rotated; __Host-authkit-issued-at=${sealSessionIssuedAt(secret, now)}`,
+        },
+      },
+    );
+    expect(dashboard.status).toBe(200);
+    expect(await dashboard.text()).toContain("Tenant: tenant_456");
   });
 
   it("keeps the self-only dashboard CSP on detail pages", async () => {
