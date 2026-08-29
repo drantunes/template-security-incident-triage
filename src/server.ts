@@ -24,6 +24,9 @@ import {
   type ApprovalWorkflow,
 } from "./approval/workflow-resume-reconciler.js";
 import { readPhase6Config, type Phase6Config } from "./env.js";
+import { readPhase7Config, type Phase7Config } from "./env.js";
+import { createWorkosDashboardSessionClient } from "./auth/workos-session.js";
+import { registerDashboardRoutes } from "./dashboard/routes.js";
 
 export async function createApp(
   input: Readonly<{
@@ -34,6 +37,7 @@ export async function createApp(
     nowMs?: () => number;
     mastraInstance?: Mastra;
     phase6Config?: Phase6Config;
+    phase7Config?: Phase7Config;
   }>,
 ): Promise<Hono<AppEnv>> {
   const logger = input.logger ?? consoleLogger;
@@ -63,14 +67,17 @@ export async function createApp(
   const appMastra =
     input.mastraInstance ?? (await import("./mastra/index.js")).mastra;
   const phase6Config = input.phase6Config ?? readPhase6Config();
+  const phase7Config = input.phase7Config ?? readPhase7Config();
+  const approvalWorkflow = (appMastra.getWorkflow as (id: string) => unknown)(
+    "incidentIngestionWorkflow",
+  ) as ApprovalWorkflow;
+  const reconcileApprovalRun =
+    createWorkflowApprovalRunReconciler(approvalWorkflow);
   if (
     phase6Config.mockDecisionsEnabled &&
     phase6Config.mockDecisionSecret &&
     phase6Config.approvalResumeSecret
   ) {
-    const approvalWorkflow = (appMastra.getWorkflow as (id: string) => unknown)(
-      "incidentIngestionWorkflow",
-    ) as ApprovalWorkflow;
     registerApprovalRoutes(app, {
       config: phase6Config,
       store: input.store,
@@ -81,10 +88,19 @@ export async function createApp(
         secret: phase6Config.mockDecisionSecret,
         ...(input.nowMs ? { nowMs: input.nowMs } : {}),
       }),
-      reconcileApprovalRun:
-        createWorkflowApprovalRunReconciler(approvalWorkflow),
+      reconcileApprovalRun,
     });
   }
+  registerDashboardRoutes(app, {
+    store: input.store,
+    logger,
+    config: phase7Config,
+    phase6Config,
+    sessionClient: createWorkosDashboardSessionClient(phase7Config),
+    reconcileApprovalRun,
+    authMutationMaxBodyBytes: input.config.mastraMaxBodyBytes,
+    ...(input.nowMs ? { nowMs: input.nowMs } : {}),
+  });
 
   const server = new MastraServer({
     app,
