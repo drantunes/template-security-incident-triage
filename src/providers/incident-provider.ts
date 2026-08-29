@@ -39,7 +39,12 @@ export type ExternalIncidentProjection = z.infer<
 
 export const ExternalIncidentResultSchema = z
   .object({
-    externalRef: z.string().regex(/^mock-incident-[a-f0-9]{16}$/u),
+    // A provider reference is an opaque identifier, never a URL. Keeping the
+    // provider prefix closed prevents a Linear create from being rejected by
+    // the authoritative delivery boundary after the remote effect happened.
+    externalRef: z
+      .string()
+      .regex(/^(?:mock-incident-[a-f0-9]{16}|linear:[A-Za-z0-9_-]{1,120})$/u),
   })
   .strict();
 
@@ -50,6 +55,7 @@ export type ExternalIncidentResult = z.infer<
 export class ExternalIncidentSupersededError extends Error {}
 
 export interface IncidentProvider {
+  readonly providerId?: "mock-incident" | "linear" | "disabled";
   create(input: {
     projection: ExternalIncidentProjection;
     idempotencyKey: string;
@@ -61,4 +67,17 @@ export interface IncidentProvider {
     idempotencyKey: string;
     generation: number;
   }): Promise<ExternalIncidentResult>;
+  /**
+   * A timeout after a non-idempotent create is uncertain, never a permission
+   * to create again. Providers that can search their authoritative marker
+   * implement this bounded reconciliation hook.
+   */
+  reconcile?(input: {
+    operation: "create" | "update";
+    idempotencyKey: string;
+    externalRef?: string;
+    generation?: number;
+    /** The authoritative projection expected to be visible after an update. */
+    projection?: ExternalIncidentProjection;
+  }): Promise<ExternalIncidentResult | undefined>;
 }

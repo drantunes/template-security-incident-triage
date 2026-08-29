@@ -36,6 +36,7 @@ export async function authorizeGatewayAction(
     mode: "mock" | "staging" | "production";
     timeoutMs: number;
     rateLimit: number;
+    identityEffectsEnabled?: boolean;
     clock?: Clock;
     ids?: IdGenerator;
   }>,
@@ -47,6 +48,8 @@ export async function authorizeGatewayAction(
       action: ContainmentAction;
       fenceToken: string;
       attempt: number;
+      subjectId: string;
+      idempotencyKey: string;
     }>
 > {
   const clock = config.clock ?? systemClock;
@@ -88,7 +91,11 @@ export async function authorizeGatewayAction(
     );
     throw new DomainError("VALIDATION_FAILED");
   };
-  if (config.mode !== "mock") return deny("blocked", "MODE_BLOCKED");
+  if (
+    config.mode === "production" ||
+    (config.mode === "staging" && !config.identityEffectsEnabled)
+  )
+    return deny("blocked", "MODE_BLOCKED");
   try {
     assertSingleTarget(action.targetId);
   } catch {
@@ -98,8 +105,8 @@ export async function authorizeGatewayAction(
     return deny("invalid", "BINDING_INVALID");
   if (clock.now() >= plan.expiresAt) return deny("expired", "APPROVAL_EXPIRED");
   const persisted = await store.execute({
-    sql: `SELECT i.status AS incident_status, i.current_plan_id, i.current_run_id,
-      a.decision, a.decided_by, a.decided_by_role,
+    sql: `SELECT i.status AS incident_status, i.subject_id, i.current_plan_id, i.current_run_id,
+      a.decision, a.decided_by, a.decided_by_role, a.decision_provenance,
       a.expires_at AS approval_expires_at, a.workflow_run_id,
       a.plan_hash, a.plan_hash_version, p.plan_json, ca.action_type,
       ca.ordinal, ca.input_json, ca.idempotency_key
@@ -140,7 +147,12 @@ export async function authorizeGatewayAction(
     row.current_plan_id !== plan.planId ||
     row.decision !== "approved" ||
     row.decided_by_role !== "soc_manager" ||
-    row.decided_by !== "studio-soc-manager" ||
+    (config.mode === "mock"
+      ? row.decided_by !== "studio-soc-manager"
+      : row.decision_provenance !== "dashboard" ||
+        typeof row.decided_by !== "string" ||
+        row.decided_by.length === 0 ||
+        row.decided_by === "studio-soc-manager") ||
     !["approved", "containing"].includes(String(row.incident_status)) ||
     String(row.approval_expires_at) <= clock.now() ||
     row.plan_hash !== plan.planHash ||
@@ -188,6 +200,8 @@ export async function authorizeGatewayAction(
     action,
     fenceToken: claim.fenceToken,
     attempt: claim.attempt,
+    subjectId: String(row.subject_id),
+    idempotencyKey: String(row.idempotency_key),
   };
 }
 

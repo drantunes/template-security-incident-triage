@@ -4,7 +4,7 @@ import { systemClock, type Clock } from "../domain/clock.js";
 import type { OperationalStore } from "./operational-store.js";
 
 export async function persistStandaloneDeadLetter(
-  store: OperationalStore,
+  store: Pick<OperationalStore, "execute">,
   input: Readonly<{
     eventType: string;
     eventRef: string;

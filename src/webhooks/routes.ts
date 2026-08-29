@@ -2,19 +2,35 @@ import { bodyLimit } from "hono/body-limit";
 import type { Context, Hono, MiddlewareHandler } from "hono";
 import { ZodError } from "zod";
 
-import { createIncidentFromAlertResult } from "../db/incident-operations.js";
+import {
+  createIncidentFromAlertResult,
+  type OperationDependencies,
+} from "../db/incident-operations.js";
 import type { OperationalStore } from "../db/operational-store.js";
 import { persistStandaloneDeadLetter } from "../db/webhook-operations.js";
 import { DomainError } from "../domain/errors.js";
-import type { Phase2Config } from "../env.js";
+import type { Phase2Config, Phase8Config } from "../env.js";
+import {
+  persistWorkosSnapshotBeforeIncident,
+  reserveWorkosObservedState,
+} from "../db/workos-webhook-operations.js";
 import { errorResponse } from "../http-errors.js";
 import type { AppEnv } from "../http-context.js";
 import type { StructuredLogger } from "../logging.js";
-import { normalizeDemoAlert, normalizeWorkOsMock } from "./normalizers.js";
-import { SignatureError, verifyWebhookSignature } from "./signature.js";
+import {
+  normalizeDemoAlert,
+  normalizeWorkOsMock,
+  normalizeWorkOsReal,
+} from "./normalizers.js";
+import {
+  SignatureError,
+  verifyWebhookSignature,
+  WORKOS_WEBHOOK_TOLERANCE_MS,
+} from "./signature.js";
 
 type WebhookRouteDependencies = Readonly<{
   config: Phase2Config;
+  phase8Config?: Phase8Config;
   store: OperationalStore;
   logger: StructuredLogger;
   nowMs?: () => number;
@@ -52,14 +68,43 @@ export function registerWebhookRoutes(
         ),
     });
   });
-  app.post("/webhooks/workos", mediaType, limit, async (context) => {
-    return handleWebhook(context, dependencies, {
-      signatureHeader: "WorkOS-Signature",
-      secret: dependencies.config.workosWebhookSecret!,
-      eventType: "workos.mock",
-      normalize: normalizeWorkOsMock,
+  const phase8 = dependencies.phase8Config;
+  if (phase8?.workos.enabled) {
+    app.post("/webhooks/workos", mediaType, limit, async (context) => {
+      return handleWebhook(context, dependencies, {
+        signatureHeader: "WorkOS-Signature",
+        secrets: [
+          phase8.workos.webhookSecret!,
+          ...(phase8.workos.previousWebhookSecret
+            ? [phase8.workos.previousWebhookSecret]
+            : []),
+        ],
+        toleranceMs: WORKOS_WEBHOOK_TOLERANCE_MS,
+        eventType: "workos.webhook",
+        normalize: (value, bytes) =>
+          normalizeWorkOsReal(value, bytes, {
+            organizationId: phase8.workos.organizationId!,
+            userIds: phase8.workos.allowedUserIds,
+            roleSlugs: phase8.workos.allowedRoleSlugs,
+          }),
+        preflightAlert: reserveWorkosObservedState,
+        beforeIncidentWrite: persistWorkosSnapshotBeforeIncident,
+      });
     });
-  });
+  }
+  app.post(
+    phase8?.workos.enabled ? "/webhooks/workos/mock" : "/webhooks/workos",
+    mediaType,
+    limit,
+    async (context) => {
+      return handleWebhook(context, dependencies, {
+        signatureHeader: "WorkOS-Signature",
+        secret: dependencies.config.workosWebhookSecret!,
+        eventType: "workos.mock",
+        normalize: normalizeWorkOsMock,
+      });
+    },
+  );
 }
 
 async function handleWebhook(
@@ -67,12 +112,16 @@ async function handleWebhook(
   dependencies: WebhookRouteDependencies,
   route: Readonly<{
     signatureHeader: string;
-    secret: string;
+    secret?: string;
+    secrets?: readonly string[];
+    toleranceMs?: number;
     eventType: string;
     normalize: (
       value: unknown,
       rawBody: Uint8Array,
     ) => ReturnType<typeof normalizeDemoAlert>;
+    preflightAlert?: OperationDependencies["preflightAlert"];
+    beforeIncidentWrite?: OperationDependencies["beforeIncidentWrite"];
   }>,
 ) {
   let outOfOrderEventRef: string | undefined;
@@ -80,9 +129,11 @@ async function handleWebhook(
     const rawBody = new Uint8Array(await context.req.arrayBuffer());
     verifyWebhookSignature({
       header: context.req.header(route.signatureHeader),
-      secret: route.secret,
+      ...(route.secret ? { secret: route.secret } : {}),
+      ...(route.secrets ? { secrets: route.secrets } : {}),
       rawBody,
       nowMs: dependencies.nowMs?.(),
+      ...(route.toleranceMs ? { toleranceMs: route.toleranceMs } : {}),
     });
     const value = parseJsonStrictUtf8(rawBody);
     const normalized = route.normalize(value, rawBody);
@@ -110,6 +161,12 @@ async function handleWebhook(
       {
         correlationId: context.get("correlationId"),
         enforceAlertOrdering: true,
+        ...(route.preflightAlert
+          ? { preflightAlert: route.preflightAlert }
+          : {}),
+        ...(route.beforeIncidentWrite
+          ? { beforeIncidentWrite: route.beforeIncidentWrite }
+          : {}),
       },
     );
     context.set("incidentId", result.incident.incidentId);
@@ -200,6 +257,35 @@ async function handleWebhook(
         );
       }
       if (error.code === "CONFLICT") {
+        // A WorkOS object may not use an equal timestamp to replace a
+        // different observed role/status.  Keep an auditable, redacted
+        // receipt of that fail-closed conflict just as we do for stale order.
+        if (outOfOrderEventRef && route.eventType === "workos.webhook") {
+          try {
+            await persistStandaloneDeadLetter(dependencies.store, {
+              eventType: route.eventType,
+              eventRef: outOfOrderEventRef,
+              errorCode: "EVENT_STATE_CONFLICT",
+            });
+          } catch (persistenceError) {
+            return persistenceError instanceof DomainError &&
+              persistenceError.code === "STORAGE_UNAVAILABLE"
+              ? errorResponse(
+                  context,
+                  "STORAGE_UNAVAILABLE",
+                  503,
+                  true,
+                  dependencies.logger,
+                )
+              : errorResponse(
+                  context,
+                  "INTERNAL_ERROR",
+                  500,
+                  false,
+                  dependencies.logger,
+                );
+          }
+        }
         return errorResponse(
           context,
           "ALERT_CONFLICT",

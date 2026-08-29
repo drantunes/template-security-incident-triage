@@ -15,6 +15,7 @@ import {
 } from "../providers/incident-provider.js";
 import { retryPartialContainment } from "../containment/partial-retry.js";
 import type { MockContainmentState } from "../containment/mock-state.js";
+import type { IdentityProvider } from "../providers/identity-provider.js";
 import { ContainmentPlanSchema } from "../schemas/containment.js";
 import type { ReconcileApprovalRun } from "../approval/workflow-resume-reconciler.js";
 
@@ -32,6 +33,7 @@ export class Phase6RecoveryDispatcher {
       mode?: "mock" | "staging" | "production";
       actionTimeoutMs?: number;
       rateLimit?: number;
+      identityProvider?: IdentityProvider;
     }>,
   ) {}
 
@@ -87,6 +89,10 @@ export class Phase6RecoveryDispatcher {
   }
 
   private async retryContainmentOne(): Promise<boolean> {
+    // Approval expiry never grants another mutation. It does not, however,
+    // permit an old uncertain WorkOS ledger to remain non-terminal forever.
+    // Sweep that read-only recovery budget before considering normal retries.
+    if (await this.sweepExhaustedWorkOsReconciliationOne()) return true;
     if (!this.dependencies.containmentState) return false;
     const now = (this.dependencies.clock ?? systemClock).now();
     const due = await this.dependencies.store.execute({
@@ -153,6 +159,9 @@ export class Phase6RecoveryDispatcher {
         mode: this.dependencies.mode ?? "mock",
         timeoutMs: this.dependencies.actionTimeoutMs ?? 1_000,
         rateLimit: this.dependencies.rateLimit ?? 8,
+        ...(this.dependencies.identityProvider
+          ? { identityProvider: this.dependencies.identityProvider }
+          : {}),
       },
       {
         clock: this.dependencies.clock,
@@ -182,6 +191,72 @@ export class Phase6RecoveryDispatcher {
       );
     }
     return true;
+  }
+
+  private async sweepExhaustedWorkOsReconciliationOne(): Promise<boolean> {
+    const now = (this.dependencies.clock ?? systemClock).now();
+    return this.dependencies.store.transaction(async (tx) => {
+      const due = await tx.execute({
+        sql: `SELECT ledger.idempotency_key, ledger.tenant_id, ledger.incident_id,
+          ledger.plan_id, ledger.action_id, attempt.id AS attempt_id,
+          attempt.fence_token
+          FROM provider_effect_ledger ledger
+          JOIN containment_action_attempts attempt
+            ON attempt.tenant_id = ledger.tenant_id
+            AND attempt.incident_id = ledger.incident_id
+            AND attempt.plan_id = ledger.plan_id
+            AND attempt.action_id = ledger.action_id
+            AND attempt.status = 'executing'
+            AND attempt.lease_expires_at <= ?
+          WHERE ledger.provider = 'workos' AND ledger.status = 'uncertain'
+            AND (SELECT count(*) FROM containment_action_attempts attempt
+              WHERE attempt.tenant_id = ledger.tenant_id
+                AND attempt.plan_id = ledger.plan_id
+                AND attempt.action_id = ledger.action_id) >= 6
+            AND NOT EXISTS (
+              SELECT 1 FROM containment_action_attempts active
+              WHERE active.tenant_id = ledger.tenant_id
+                AND active.incident_id = ledger.incident_id
+                AND active.plan_id = ledger.plan_id
+                AND active.action_id = ledger.action_id
+                AND active.status = 'executing'
+                AND active.lease_expires_at > ?
+            )
+          ORDER BY ledger.claimed_at, ledger.idempotency_key, attempt.attempt DESC LIMIT 1`,
+        args: [now, now],
+      });
+      const row = due.rows[0];
+      if (!row) return false;
+      const attempt = await tx.execute({
+        sql: `UPDATE containment_action_attempts SET status = 'failed', finished_at = ?,
+          error_code = 'PROVIDER_FAILED', verification = 'not_run'
+          WHERE id = ? AND status = 'executing' AND fence_token = ?
+            AND lease_expires_at <= ?`,
+        args: [now, String(row.attempt_id), String(row.fence_token), now],
+      });
+      if (attempt.rowsAffected !== 1)
+        throw new Error("stale containment attempt fence");
+      const action = await tx.execute({
+        sql: `UPDATE containment_actions SET status = 'failed'
+          WHERE tenant_id = ? AND incident_id = ? AND plan_id = ? AND action_id = ?
+            AND status = 'executing'`,
+        args: [
+          String(row.tenant_id),
+          String(row.incident_id),
+          String(row.plan_id),
+          String(row.action_id),
+        ],
+      });
+      if (action.rowsAffected !== 1)
+        throw new Error("stale containment action fence");
+      const ledger = await tx.execute({
+        sql: `UPDATE provider_effect_ledger SET status = 'failed', completed_at = ?
+          WHERE provider = 'workos' AND idempotency_key = ? AND status = 'uncertain'`,
+        args: [now, String(row.idempotency_key)],
+      });
+      if (ledger.rowsAffected !== 1) throw new Error("stale WorkOS ledger");
+      return true;
+    });
   }
 
   private async recoveredContainmentProjection(
@@ -268,13 +343,14 @@ export class Phase6RecoveryDispatcher {
 
   private async deliverOne(): Promise<boolean> {
     const now = (this.dependencies.clock ?? systemClock).now();
+    const providerId = this.dependencies.provider.providerId ?? "mock-incident";
     const due = await this.dependencies.store.execute({
       sql: `SELECT * FROM provider_deliveries
-        WHERE provider = 'mock-incident' AND status IN ('pending','retry','delivering')
-          AND next_attempt_at <= ?
+        WHERE provider = ? AND status IN ('pending','retry','delivering','uncertain')
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
         ORDER BY CASE operation WHEN 'open-awaiting-approval' THEN 0 ELSE 1 END,
           next_attempt_at, id LIMIT 1`,
-      args: [now],
+      args: [providerId, now],
     });
     const row = due.rows[0];
     if (!row?.projection_json || !row.workflow_run_id || !row.correlation_id) {
@@ -303,7 +379,9 @@ export class Phase6RecoveryDispatcher {
         timeoutMs: this.dependencies.providerTimeoutMs,
       },
     );
-    return delivered.status !== "in_progress";
+    return (
+      delivered.status !== "in_progress" && delivered.status !== "uncertain"
+    );
   }
 }
 

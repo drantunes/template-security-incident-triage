@@ -50,6 +50,47 @@ export const WorkOsEnvelopeSchema = z
   })
   .strict();
 
+// Serialized WorkOS 8.13 webhook shapes put the entity directly in `data`.
+// The entity's `object` is a discriminator string, not a nested record.
+export const WorkOsRealEnvelopeSchema = z
+  .object({
+    id: webhookId,
+    event: z.enum([
+      "organization_membership.updated",
+      "session.created",
+      "session.revoked",
+    ]),
+    created_at: webhookTimestamp,
+    data: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+
+export const WorkOsMembershipObjectSchema = z
+  .object({
+    object: z.literal("organization_membership"),
+    id: webhookId,
+    organization_id: webhookId,
+    user_id: webhookId,
+    role: z.object({ slug: z.string().trim().min(1).max(64) }).strict(),
+    status: z.enum(["active", "inactive", "pending"]),
+    created_at: webhookTimestamp,
+    updated_at: webhookTimestamp,
+  })
+  .passthrough();
+
+export const WorkOsSessionObjectSchema = z
+  .object({
+    object: z.literal("session"),
+    id: webhookId,
+    user_id: webhookId,
+    organization_id: webhookId.optional(),
+    status: z.enum(["active", "revoked", "expired"]),
+    ip_address: z.ipv4().or(z.ipv6()).nullable(),
+    created_at: webhookTimestamp,
+    updated_at: webhookTimestamp,
+  })
+  .passthrough();
+
 const commonWorkOsData = {
   tenant_id: webhookId,
   subject_id: webhookId,

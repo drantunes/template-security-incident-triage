@@ -15,10 +15,15 @@ import {
 import { migrateOperationalStore } from "../../src/db/migrate.js";
 import { fixedClock, type Clock } from "../../src/domain/clock.js";
 import { sequenceIdGenerator } from "../../src/domain/id-generator.js";
-import { ContainmentGateway } from "../../src/containment/gateway.js";
+import {
+  ContainmentGateway,
+  identitySnapshotIntegrityHash,
+} from "../../src/containment/gateway.js";
+import { authorizeGatewayAction } from "../../src/containment/gateway-authorization.js";
 import type { MockContainmentState } from "../../src/containment/mock-state.js";
 import { deliverExternalIncident } from "../../src/db/provider-delivery-operations.js";
 import { MockIncidentProvider } from "../../src/providers/mock-incident-provider.js";
+import { WorkOsIdentityProvider } from "../../src/providers/identity-provider.js";
 import {
   ExternalIncidentProjectionSchema,
   type IncidentProvider,
@@ -262,6 +267,7 @@ function schemaValidPlanTamperings(plan: ReturnType<typeof makePlan>) {
 async function approve(
   store: Awaited<ReturnType<typeof setup>>["store"],
   plan = makePlan(),
+  provenance: "mock" | "dashboard" = "mock",
 ) {
   return decideApprovalAndIssueResumeToken(
     store,
@@ -275,7 +281,10 @@ async function approve(
         planHashVersion: 1,
         planHash: plan.planHash,
         decision: "approved",
-        decidedBy: "studio-soc-manager",
+        decidedBy:
+          provenance === "dashboard"
+            ? "workos:user_dashboard_manager"
+            : "studio-soc-manager",
         decidedByRole: "soc_manager",
         decidedAt: "2026-08-27T12:02:00.000Z",
       },
@@ -283,6 +292,7 @@ async function approve(
       runId: "run-1",
       correlationId: "correlation-1",
       resumeSecret: "resume-secret-".padEnd(40, "x"),
+      decisionProvenance: provenance,
     },
     {
       clock: fixedClock("2026-08-27T12:02:00.000Z"),
@@ -935,6 +945,723 @@ describe("Phase 6 durable approval and containment", () => {
         },
       );
       expect(state.calls.get(plan.actions[0]!.actionId)).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("binds a staged WorkOS revoke to the active F6 action fence and durable ledger", async () => {
+    const action = {
+      ...makePlan().actions[0]!,
+      type: "revoke_session" as const,
+      targetId: "session-1",
+      input: {},
+    };
+    const plan = makePlan({ actions: [action] });
+    const { store } = await setup(plan);
+    try {
+      await approve(store, plan, "dashboard");
+      let revoked = false;
+      const identityProvider = new WorkOsIdentityProvider({
+        client: {
+          userManagement: {
+            getUser: async () => ({ id: "subject-1", status: "active" }),
+            listSessions: async () => ({
+              data: [
+                {
+                  id: "session-1",
+                  userId: "subject-1",
+                  status: revoked ? "revoked" : "active",
+                },
+              ],
+            }),
+            revokeSession: async () => {
+              revoked = true;
+              return {
+                id: "session-1",
+                userId: "subject-1",
+                status: "revoked",
+              };
+            },
+          },
+          organizations: {
+            getMembership: async () => ({}),
+            updateMembership: async () => ({}),
+          },
+        },
+        organizationId: "tenant-1",
+        allowedUserIds: new Set(["subject-1"]),
+        allowedRoleSlugs: new Set(["member"]),
+        authorizeMutation: () => true,
+        store,
+        now: () => Date.parse("2026-08-27T12:03:00.000Z"),
+      });
+      const gateway = new ContainmentGateway({
+        store,
+        state: mockState(),
+        mode: "staging",
+        timeoutMs: 1_000,
+        rateLimit: 8,
+        identityProvider,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+      await expect(
+        gateway.executeApprovedAction({
+          tenantId: "tenant-1",
+          incidentId: "incident-1",
+          workflowRunId: "run-1",
+          approvalId: "approval-1",
+          plan,
+          action,
+        }),
+      ).resolves.toMatchObject({
+        status: "completed",
+        verification: "verified",
+        providerRef: "workos:session-1",
+      });
+      const ledger = await store.execute({
+        sql: `SELECT tenant_id, incident_id, plan_id, action_id, target_id, status
+          FROM provider_effect_ledger WHERE provider = 'workos'`,
+      });
+      expect(ledger.rows).toEqual([
+        {
+          tenant_id: "tenant-1",
+          incident_id: "incident-1",
+          plan_id: "plan-1",
+          action_id: "action-1",
+          target_id: "session-1",
+          status: "succeeded",
+        },
+      ]);
+      expect(revoked).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("restores only the incident-bound approved snapshot when a newer incident has another role transition", async () => {
+    const { store, plan } = await setup();
+    try {
+      await approve(store, plan, "dashboard");
+      await createIncidentFromAlert(
+        store,
+        makeAlert({
+          alertId: "alert-2",
+          sourceEventId: "source-event-2",
+          idempotencyKey: "alert-idempotency-2",
+          rawPayloadRef: "protected://alerts/2",
+          occurredAt: "2026-08-27T12:01:00.000Z",
+          changes: { previousRole: "admin", nextRole: "viewer" },
+        }),
+        {
+          clock: fixedClock("2026-08-27T12:01:00.000Z"),
+          ids: sequenceIdGenerator([
+            "incident-2",
+            "timeline-incident-2",
+            "outbox-incident-2",
+          ]),
+        },
+      );
+      const insertSnapshot = async (
+        incidentId: string,
+        sourceEventId: string,
+        previousRole: "member" | "admin",
+        observedCurrentRole: "admin" | "viewer",
+        capturedAt: string,
+      ) => {
+        const snapshot = {
+          membershipId: "membership-1",
+          previousRole,
+          currentRole: observedCurrentRole,
+          observedCurrentRole,
+        };
+        const snapshotRef = `protected://workos/snapshot/${sourceEventId}`;
+        await store.execute({
+          sql: `INSERT INTO identity_snapshots(
+            id, tenant_id, incident_id, subject_id, source_event_id, snapshot_json,
+            snapshot_ref, integrity_hash, schema_version, captured_at
+          ) VALUES (?, 'tenant-1', ?, 'subject-1', ?, ?, ?, ?, 1, ?)`,
+          args: [
+            `snapshot-${incidentId}`,
+            incidentId,
+            sourceEventId,
+            JSON.stringify(snapshot),
+            snapshotRef,
+            identitySnapshotIntegrityHash({
+              tenantId: "tenant-1",
+              incidentId,
+              subjectId: "subject-1",
+              sourceEventId,
+              snapshot,
+              snapshotRef,
+              schemaVersion: 1,
+            }),
+            capturedAt,
+          ],
+        });
+      };
+      await insertSnapshot(
+        "incident-1",
+        "source-event-1",
+        "member",
+        "admin",
+        "2026-08-27T12:00:00.000Z",
+      );
+      // This is deliberately newer, for the same tenant and subject. It may
+      // never replace Incident 1's approved member restore semantics.
+      await insertSnapshot(
+        "incident-2",
+        "source-event-2",
+        "admin",
+        "viewer",
+        "2026-08-27T12:01:00.000Z",
+      );
+      let role: "admin" | "member" = "admin";
+      let mutations = 0;
+      const identityProvider = new WorkOsIdentityProvider({
+        client: {
+          userManagement: {
+            getUser: async () => ({ id: "subject-1", status: "active" }),
+            listSessions: async () => ({ data: [] }),
+            revokeSession: async () => ({}),
+          },
+          organizations: {
+            getMembership: async () => ({
+              id: "membership-1",
+              userId: "subject-1",
+              organizationId: "tenant-1",
+              roleSlug: role,
+              status: "active",
+            }),
+            updateMembership: async (_id, input) => {
+              mutations += 1;
+              role = input.roleSlug as "member";
+              return {
+                id: "membership-1",
+                userId: "subject-1",
+                organizationId: "tenant-1",
+                roleSlug: role,
+                status: "active",
+              };
+            },
+          },
+        },
+        organizationId: "tenant-1",
+        allowedUserIds: new Set(["subject-1"]),
+        allowedRoleSlugs: new Set(["member", "admin", "viewer"]),
+        authorizeMutation: () => true,
+        store,
+        now: () => Date.parse("2026-08-27T12:03:00.000Z"),
+      });
+      const gateway = new ContainmentGateway({
+        store,
+        state: mockState(),
+        mode: "staging",
+        timeoutMs: 1_000,
+        rateLimit: 8,
+        identityProvider,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+      const gatewayInput = {
+        tenantId: "tenant-1",
+        incidentId: "incident-1",
+        workflowRunId: "run-1",
+        approvalId: "approval-1",
+        plan,
+        action: plan.actions[0]!,
+      };
+      const concurrent = await Promise.allSettled([
+        gateway.executeApprovedAction(gatewayInput),
+        gateway.executeApprovedAction(gatewayInput),
+      ]);
+      expect(
+        concurrent.filter(
+          (result) =>
+            result.status === "fulfilled" &&
+            result.value.status === "completed",
+        ),
+      ).toHaveLength(1);
+      expect(
+        concurrent.some(
+          (result) =>
+            result.status === "rejected" &&
+            result.reason instanceof Error &&
+            "code" in result.reason &&
+            result.reason.code === "CONFLICT",
+        ),
+      ).toBe(true);
+      expect({ role, mutations }).toEqual({ role: "member", mutations: 1 });
+      await expect(
+        store.execute({
+          sql: `SELECT incident_id, source_event_id FROM identity_snapshots
+            WHERE tenant_id = 'tenant-1' ORDER BY captured_at`,
+        }),
+      ).resolves.toMatchObject({
+        rows: [
+          { incident_id: "incident-1", source_event_id: "source-event-1" },
+          { incident_id: "incident-2", source_event_id: "source-event-2" },
+        ],
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("blocks a restore snapshot whose source event is not the approved incident alert", async () => {
+    const { store, plan } = await setup();
+    try {
+      await approve(store, plan, "dashboard");
+      const snapshot = {
+        membershipId: "membership-1",
+        previousRole: "member",
+        currentRole: "admin",
+        observedCurrentRole: "admin",
+      };
+      const snapshotRef = "protected://workos/snapshot/not-the-alert";
+      await store.execute({
+        sql: `INSERT INTO identity_snapshots(
+          id, tenant_id, incident_id, subject_id, source_event_id, snapshot_json,
+          snapshot_ref, integrity_hash, schema_version, captured_at
+        ) VALUES ('snapshot-wrong-source', 'tenant-1', 'incident-1', 'subject-1',
+          'not-the-alert', ?, ?, ?, 1, '2026-08-27T12:00:00.000Z')`,
+        args: [
+          JSON.stringify(snapshot),
+          snapshotRef,
+          identitySnapshotIntegrityHash({
+            tenantId: "tenant-1",
+            incidentId: "incident-1",
+            subjectId: "subject-1",
+            sourceEventId: "not-the-alert",
+            snapshot,
+            snapshotRef,
+            schemaVersion: 1,
+          }),
+        ],
+      });
+      let mutations = 0;
+      const identityProvider = new WorkOsIdentityProvider({
+        client: {
+          userManagement: {
+            getUser: async () => ({ id: "subject-1", status: "active" }),
+            listSessions: async () => ({ data: [] }),
+            revokeSession: async () => ({}),
+          },
+          organizations: {
+            getMembership: async () => ({
+              id: "membership-1",
+              userId: "subject-1",
+              organizationId: "tenant-1",
+              roleSlug: "admin",
+              status: "active",
+            }),
+            updateMembership: async () => {
+              mutations += 1;
+              return {};
+            },
+          },
+        },
+        organizationId: "tenant-1",
+        allowedUserIds: new Set(["subject-1"]),
+        allowedRoleSlugs: new Set(["member", "admin"]),
+        authorizeMutation: () => true,
+        store,
+      });
+      const gateway = new ContainmentGateway({
+        store,
+        state: mockState(),
+        mode: "staging",
+        timeoutMs: 1_000,
+        rateLimit: 8,
+        identityProvider,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+      await expect(
+        gateway.executeApprovedAction({
+          tenantId: "tenant-1",
+          incidentId: "incident-1",
+          workflowRunId: "run-1",
+          approvalId: "approval-1",
+          plan,
+          action: plan.actions[0]!,
+        }),
+      ).resolves.toMatchObject({
+        status: "blocked",
+        errorCode: "PRECONDITION_FAILED",
+      });
+      expect(mutations).toBe(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reconciles a timed-out WorkOS revoke from its bound ledger without a duplicate mutation", async () => {
+    const action = {
+      ...makePlan().actions[0]!,
+      type: "revoke_session" as const,
+      targetId: "session-1",
+      input: {},
+    };
+    const plan = makePlan({ actions: [action] });
+    const { store } = await setup(plan);
+    try {
+      await approve(store, plan, "dashboard");
+      const gatewayInput = {
+        tenantId: "tenant-1",
+        incidentId: "incident-1",
+        workflowRunId: "run-1",
+        approvalId: "approval-1",
+        plan,
+        action,
+      };
+      const authorization = await authorizeGatewayAction(store, gatewayInput, {
+        mode: "staging",
+        timeoutMs: 1_000,
+        rateLimit: 8,
+        identityEffectsEnabled: true,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+      if (authorization.state !== "claimed")
+        throw new Error("expected F6 claim");
+      let state: "active" | "revoked" = "active";
+      let mutations = 0;
+      const provider = new WorkOsIdentityProvider({
+        client: {
+          userManagement: {
+            getUser: async () => ({ id: "subject-1", status: "active" }),
+            listSessions: async () => ({
+              data: [{ id: "session-1", userId: "subject-1", status: state }],
+            }),
+            revokeSession: async () => {
+              mutations += 1;
+              await new Promise<void>((resolve) => setTimeout(resolve, 10));
+              state = "revoked";
+              return { id: "session-1", userId: "subject-1", status: state };
+            },
+          },
+          organizations: {
+            getMembership: async () => ({}),
+            updateMembership: async () => ({}),
+          },
+        },
+        organizationId: "tenant-1",
+        allowedUserIds: new Set(["subject-1"]),
+        allowedRoleSlugs: new Set(["member"]),
+        authorizeMutation: () => true,
+        store,
+        timeoutMs: 1,
+        now: () => Date.parse("2026-08-27T12:03:00.000Z"),
+      });
+      const input = {
+        tenantId: "tenant-1",
+        userId: "subject-1",
+        sessionId: "session-1",
+        approvalContext: {
+          approvalId: "approval-1",
+          fenceToken: authorization.fenceToken,
+          deadline: plan.expiresAt,
+        },
+        effect: {
+          incidentId: "incident-1",
+          planId: "plan-1",
+          actionId: "action-1",
+          targetId: "session-1",
+          idempotencyKey: authorization.idempotencyKey,
+        },
+      };
+      await expect(provider.revokeSession(input)).rejects.toMatchObject({
+        code: "STORAGE_UNAVAILABLE",
+        retryable: true,
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 15));
+      await expect(provider.revokeSession(input)).resolves.toMatchObject({
+        status: "revoked",
+      });
+      expect(mutations).toBe(1);
+      await expect(
+        store.execute({
+          sql: "SELECT status FROM provider_effect_ledger WHERE provider = 'workos'",
+        }),
+      ).resolves.toMatchObject({ rows: [{ status: "succeeded" }] });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("atomically terminalizes the expired sixth WorkOS attempt, action, and ledger", async () => {
+    const { store, plan } = await setup();
+    try {
+      const action = plan.actions[0]!;
+      await store.execute({
+        sql: `UPDATE containment_actions SET status = 'executing'
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND plan_id = ? AND action_id = ?`,
+        args: [plan.planId, action.actionId],
+      });
+      const actionRow = await store.execute({
+        sql: `SELECT idempotency_key FROM containment_actions
+          WHERE tenant_id = 'tenant-1' AND incident_id = 'incident-1'
+            AND plan_id = ? AND action_id = ?`,
+        args: [plan.planId, action.actionId],
+      });
+      const idempotencyKey = String(actionRow.rows[0]!.idempotency_key);
+      for (let attempt = 1; attempt <= 6; attempt += 1) {
+        const executing = attempt === 6;
+        await store.execute({
+          sql: `INSERT INTO containment_action_attempts(
+            id, tenant_id, incident_id, plan_id, approval_id, action_id,
+            idempotency_key, attempt, owner_id, fence_token, status, started_at,
+            finished_at, lease_expires_at, verification, error_code
+          ) VALUES (?, 'tenant-1', 'incident-1', ?, 'approval-1', ?, ?, ?, 'worker', ?, ?,
+            '2026-08-27T12:00:00.000Z', ?, '2026-08-27T12:00:01.000Z', 'not_run', ?)`,
+          args: [
+            `expired-attempt-${attempt}`,
+            plan.planId,
+            action.actionId,
+            idempotencyKey,
+            attempt,
+            `expired-fence-${attempt}`,
+            executing ? "executing" : "timed_out",
+            executing ? null : "2026-08-27T12:00:01.000Z",
+            executing ? null : "PROVIDER_TIMEOUT",
+          ],
+        });
+      }
+      await store.execute({
+        sql: `INSERT INTO provider_effect_ledger(
+          provider, idempotency_key, tenant_id, incident_id, operation, plan_id,
+          action_id, target_id, status, fence_token, claimed_at
+        ) VALUES ('workos', ?, 'tenant-1', 'incident-1', 'revoke_session', ?, ?, ?,
+          'uncertain', 'expired-fence-6', '2026-08-27T12:00:00.000Z')`,
+        args: [idempotencyKey, plan.planId, action.actionId, action.targetId],
+      });
+      let now = "2026-08-27T12:00:00.000Z";
+      const dispatcher = new Phase6RecoveryDispatcher({
+        store,
+        provider: new MockIncidentProvider(),
+        reconcileApprovalRun: async () => "completed",
+        clock: { now: () => now },
+      });
+      await expect(dispatcher.runOnce()).resolves.toMatchObject({
+        containmentRetried: 0,
+      });
+      now = "2026-08-27T12:10:00.000Z";
+      await expect(dispatcher.runOnce()).resolves.toMatchObject({
+        containmentRetried: 1,
+      });
+      const terminal = await store.execute({
+        sql: `SELECT
+          (SELECT status FROM provider_effect_ledger WHERE provider = 'workos') AS ledger,
+          (SELECT status FROM containment_actions WHERE action_id = ?) AS action,
+          (SELECT status FROM containment_action_attempts WHERE attempt = 6) AS attempt`,
+        args: [action.actionId],
+      });
+      expect(terminal.rows[0]).toEqual({
+        ledger: "failed",
+        action: "failed",
+        attempt: "failed",
+      });
+      const restarted = new Phase6RecoveryDispatcher({
+        store,
+        provider: new MockIncidentProvider(),
+        reconcileApprovalRun: async () => "completed",
+        clock: { now: () => now },
+      });
+      await expect(restarted.runOnce()).resolves.toMatchObject({
+        containmentRetried: 0,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reconciles an eventually visible WorkOS effect after three fenced attempts without mutating twice", async () => {
+    const action = {
+      ...makePlan().actions[0]!,
+      type: "revoke_session" as const,
+      targetId: "session-1",
+      input: {},
+    };
+    const plan = makePlan({ actions: [action] });
+    const { store } = await setup(plan);
+    try {
+      await approve(store, plan, "dashboard");
+      let remoteApplied = false;
+      let reads = 0;
+      let mutations = 0;
+      const identityProvider = new WorkOsIdentityProvider({
+        client: {
+          userManagement: {
+            getUser: async () => ({ id: "subject-1" }),
+            // The remote write is accepted at once but is intentionally
+            // invisible through the first six reads (preflight+readback for
+            // each of the three budgeted attempts).
+            listSessions: async () => {
+              reads += 1;
+              const visible = remoteApplied && reads > 6;
+              return {
+                data: [
+                  {
+                    id: "session-1",
+                    userId: "subject-1",
+                    status: visible ? "revoked" : "active",
+                  },
+                ],
+              };
+            },
+            revokeSession: async () => {
+              mutations += 1;
+              remoteApplied = true;
+              return {
+                id: "session-1",
+                userId: "subject-1",
+                status: "revoked",
+              };
+            },
+          },
+          organizations: {
+            getMembership: async () => ({}),
+            updateMembership: async () => ({}),
+          },
+        },
+        organizationId: "tenant-1",
+        allowedUserIds: new Set(["subject-1"]),
+        allowedRoleSlugs: new Set(["member"]),
+        authorizeMutation: () => true,
+        store,
+        now: () => Date.parse("2026-08-27T12:03:00.000Z"),
+        timeoutMs: 1_000,
+      });
+      const gateway = new ContainmentGateway({
+        store,
+        state: mockState(),
+        mode: "staging",
+        timeoutMs: 1_000,
+        rateLimit: 8,
+        identityProvider,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+      const input = {
+        tenantId: "tenant-1",
+        incidentId: "incident-1",
+        workflowRunId: "run-1",
+        approvalId: "approval-1",
+        plan,
+        action,
+      };
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await expect(
+          gateway.executeApprovedAction(input),
+        ).resolves.toMatchObject({ status: "timed_out" });
+      }
+      await expect(gateway.executeApprovedAction(input)).resolves.toMatchObject(
+        { status: "completed", verification: "verified" },
+      );
+      expect(mutations).toBe(1);
+      await expect(
+        store.execute({
+          sql: `SELECT status FROM provider_effect_ledger WHERE provider = 'workos'`,
+        }),
+      ).resolves.toMatchObject({ rows: [{ status: "succeeded" }] });
+      await expect(
+        store.execute({
+          sql: `SELECT attempt, status FROM containment_action_attempts ORDER BY attempt`,
+        }),
+      ).resolves.toMatchObject({
+        rows: [
+          { attempt: 1, status: "timed_out" },
+          { attempt: 2, status: "timed_out" },
+          { attempt: 3, status: "timed_out" },
+          { attempt: 4, status: "completed" },
+        ],
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("terminally bounds invisible WorkOS reconciliation without issuing another mutation", async () => {
+    const action = {
+      ...makePlan().actions[0]!,
+      type: "revoke_session" as const,
+      targetId: "session-1",
+      input: {},
+    };
+    const plan = makePlan({ actions: [action] });
+    const { store } = await setup(plan);
+    try {
+      await approve(store, plan, "dashboard");
+      let mutations = 0;
+      const identityProvider = new WorkOsIdentityProvider({
+        client: {
+          userManagement: {
+            getUser: async () => ({ id: "subject-1" }),
+            // The remote state never becomes observable during the bounded
+            // reconciliation window.
+            listSessions: async () => ({
+              data: [
+                { id: "session-1", userId: "subject-1", status: "active" },
+              ],
+            }),
+            revokeSession: async () => {
+              mutations += 1;
+              return {
+                id: "session-1",
+                userId: "subject-1",
+                status: "revoked",
+              };
+            },
+          },
+          organizations: {
+            getMembership: async () => ({}),
+            updateMembership: async () => ({}),
+          },
+        },
+        organizationId: "tenant-1",
+        allowedUserIds: new Set(["subject-1"]),
+        allowedRoleSlugs: new Set(["member"]),
+        authorizeMutation: () => true,
+        store,
+        now: () => Date.parse("2026-08-27T12:03:00.000Z"),
+        timeoutMs: 1_000,
+      });
+      const gateway = new ContainmentGateway({
+        store,
+        state: mockState(),
+        mode: "staging",
+        timeoutMs: 1_000,
+        rateLimit: 8,
+        identityProvider,
+        clock: fixedClock("2026-08-27T12:03:00.000Z"),
+      });
+      const input = {
+        tenantId: "tenant-1",
+        incidentId: "incident-1",
+        workflowRunId: "run-1",
+        approvalId: "approval-1",
+        plan,
+        action,
+      };
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await expect(
+          gateway.executeApprovedAction(input),
+        ).resolves.toMatchObject({ status: "timed_out" });
+      }
+      await expect(gateway.executeApprovedAction(input)).rejects.toMatchObject({
+        code: "CONFLICT",
+      });
+      expect(mutations).toBe(1);
+      await expect(
+        store.execute({
+          sql: `SELECT status, completed_at IS NOT NULL AS terminal FROM provider_effect_ledger WHERE provider = 'workos'`,
+        }),
+      ).resolves.toMatchObject({ rows: [{ status: "failed", terminal: 1 }] });
+      await expect(
+        store.execute({
+          sql: `SELECT outcome, reason_code FROM containment_gateway_audit ORDER BY occurred_at DESC LIMIT 1`,
+        }),
+      ).resolves.toMatchObject({
+        rows: [{ outcome: "rate_limited", reason_code: "RATE_LIMITED" }],
+      });
     } finally {
       store.close();
     }
@@ -2208,6 +2935,50 @@ describe("Phase 6 durable approval and containment", () => {
         attempt_count: 2,
       });
       expect(provider.calls).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("records the selected Linear provider in the delivery audit", async () => {
+    const { store, plan } = await setup();
+    try {
+      const provider: IncidentProvider = {
+        providerId: "linear",
+        create: async () => ({ externalRef: "linear:issue_1" }),
+        update: async () => ({ externalRef: "linear:issue_1" }),
+      };
+      await expect(
+        deliverExternalIncident(
+          store,
+          provider,
+          {
+            operation: "open-awaiting-approval",
+            projection: ExternalIncidentProjectionSchema.parse({
+              incidentId: "incident-1",
+              tenantId: "tenant-1",
+              kind: "unauthorized_privilege_change",
+              severity: "high",
+              status: "awaiting_approval",
+              occurredAt: "2026-08-27T12:00:00.000Z",
+              summaryCode: "PRIVILEGE_CHANGE_REQUIRES_REVIEW",
+              planHashVersion: 1,
+              planHash: plan.planHash,
+              actionTypes: plan.actions.map((action) => action.type),
+            }),
+            workflowRunId: "run-1",
+            correlationId: "correlation-1",
+          },
+          { ids: sequenceIdGenerator(["linear-audit"]) },
+        ),
+      ).resolves.toMatchObject({ status: "succeeded" });
+      const audit = await store.execute({
+        sql: `SELECT payload_json FROM timeline_events
+          WHERE type = 'provider.incident_delivery' ORDER BY sequence DESC LIMIT 1`,
+      });
+      expect(JSON.parse(String(audit.rows[0]?.payload_json))).toMatchObject({
+        provider: "linear",
+      });
     } finally {
       store.close();
     }

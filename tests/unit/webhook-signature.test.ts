@@ -76,4 +76,27 @@ describe("WorkOS-compatible webhook signature", () => {
       ).toThrowError(expect.objectContaining({ code: "SIGNATURE_EXPIRED" }));
     }
   });
+
+  it("uses all current/previous secrets and the approved WorkOS 180s window", () => {
+    const previous = "previous-workos-secret";
+    const timestamp = String(phase2NowMs - 180_000);
+    expect(() =>
+      verifyWebhookSignature({
+        header: signBody(body, previous, timestamp),
+        secrets: [alertSecret, previous],
+        rawBody: body,
+        nowMs: phase2NowMs,
+        toleranceMs: 180_000,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      verifyWebhookSignature({
+        header: signBody(body, previous, String(phase2NowMs - 180_001)),
+        secrets: [alertSecret, previous],
+        rawBody: body,
+        nowMs: phase2NowMs,
+        toleranceMs: 180_000,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "SIGNATURE_EXPIRED" }));
+  });
 });

@@ -18,6 +18,8 @@ type DecisionInput = Readonly<{
   expectedIncidentVersion: number;
   runId: string;
   correlationId: string;
+  /** Origin is persisted so staging never treats the mock decision path as WorkOS RBAC. */
+  decisionProvenance?: "mock" | "dashboard";
 }>;
 
 export async function decideApproval(
@@ -35,12 +37,13 @@ export async function decideApproval(
   }> = {},
 ): Promise<ApprovalDecision> {
   const decision = parseDomainSchema(ApprovalDecisionSchema, input.decision);
+  const decisionProvenance = input.decisionProvenance ?? "mock";
   const now = (dependencies.clock ?? systemClock).now();
   const ids = dependencies.ids ?? uuidGenerator;
   return store.transaction(async (tx) => {
     const result = await tx.execute({
       sql: `SELECT a.decision, a.decided_by, a.decided_by_role, a.decision_reason,
-        a.decided_at, a.requested_at, a.expires_at, a.plan_hash, a.plan_hash_version,
+        a.decided_at, a.decision_provenance, a.requested_at, a.expires_at, a.plan_hash, a.plan_hash_version,
         p.plan_hash AS containment_plan_hash,
         p.plan_hash_version AS containment_plan_hash_version,
         i.current_plan_id, i.current_run_id, i.updated_at AS incident_updated_at,
@@ -70,6 +73,7 @@ export async function decideApproval(
         current.decision === decision.decision &&
         current.decided_by === decision.decidedBy &&
         current.decided_by_role === decision.decidedByRole &&
+        current.decision_provenance === decisionProvenance &&
         current.decision_reason === (decision.reason ?? null)
       )
         return parseDomainSchema(ApprovalDecisionSchema, {
@@ -93,7 +97,7 @@ export async function decideApproval(
       decisionFingerprint(decision, input.runId);
     const approvalUpdate = await tx.execute({
       sql: `UPDATE approvals SET decision = ?, decided_by = ?, decided_by_role = ?,
-        decision_reason = ?, decided_at = ?, decision_fingerprint = ?
+        decision_reason = ?, decided_at = ?, decision_fingerprint = ?, decision_provenance = ?
         WHERE tenant_id = ? AND incident_id = ? AND plan_id = ? AND id = ?
           AND plan_hash_version = ? AND plan_hash = ? AND decision IS NULL`,
       args: [
@@ -103,6 +107,7 @@ export async function decideApproval(
         decision.reason ?? null,
         decision.decidedAt,
         fingerprint,
+        decisionProvenance,
         decision.tenantId,
         decision.incidentId,
         decision.planId,

@@ -166,6 +166,18 @@ export async function persistOutboxDeadLetter(
   }>,
 ): Promise<"dead_letter" | "workflow_run_exists" | "outbox_missing"> {
   return store.transaction(async (tx) => {
+    const source = await tx.execute({
+      sql: `SELECT id, type, run_id, tenant_id, incident_id, schema_version,
+        correlation_id FROM outbox_events WHERE id = ?`,
+      args: [input.outboxId],
+    });
+    const sourceRow = source.rows[0];
+    if (!sourceRow) return "outbox_missing";
+    const workflowRun = await tx.execute({
+      sql: "SELECT 1 FROM workflow_runs WHERE run_id = ?",
+      args: [input.outboxId],
+    });
+    if (workflowRun.rows.length > 0) return "workflow_run_exists";
     const inserted = await tx.execute({
       sql: `INSERT OR IGNORE INTO dead_letter_events(
         id, source_outbox_id, event_type, event_ref, tenant_id, incident_id,
@@ -184,17 +196,39 @@ export async function persistOutboxDeadLetter(
         input.outboxId,
       ],
     });
-    if (inserted.rowsAffected === 1) return "dead_letter";
+    if (inserted.rowsAffected === 1) {
+      const deadLetterOutboxId = `dlq_${createHash("sha256")
+        .update(input.outboxId)
+        .digest("hex")}`;
+      await tx.execute({
+        sql: `INSERT OR IGNORE INTO outbox_events(
+          id, type, run_id, incident_id, tenant_id, schema_version,
+          correlation_id, causation_id, payload_json, occurred_at, available_at
+        ) VALUES (?, 'security.dead-letter', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          deadLetterOutboxId,
+          String(sourceRow.run_id),
+          String(sourceRow.incident_id),
+          String(sourceRow.tenant_id),
+          Number(sourceRow.schema_version),
+          String(sourceRow.correlation_id),
+          input.outboxId,
+          JSON.stringify({
+            sourceEventId: input.outboxId,
+            errorCode: input.errorCode,
+          }),
+          input.createdAt,
+          input.createdAt,
+        ],
+      });
+      return "dead_letter";
+    }
     const existing = await tx.execute({
       sql: `SELECT 1 FROM dead_letter_events
         WHERE source_outbox_id = ? AND resolved_at IS NULL`,
       args: [input.outboxId],
     });
     if (existing.rows.length > 0) return "dead_letter";
-    const workflowRun = await tx.execute({
-      sql: "SELECT 1 FROM workflow_runs WHERE run_id = ?",
-      args: [input.outboxId],
-    });
     return workflowRun.rows.length > 0
       ? "workflow_run_exists"
       : "outbox_missing";

@@ -23,13 +23,13 @@ describe("Phase 2 configuration", () => {
     expect([...config.alertWebhookSources]).toEqual(["demo", "second-source"]);
   });
 
-  it("rejects real mode and unbounded values", () => {
+  it("accepts staging without enabling providers and rejects unbounded values", () => {
     const base = {
       ALERT_WEBHOOK_SECRET: "a".repeat(16),
       WORKOS_WEBHOOK_SECRET: "b".repeat(16),
     };
-    expect(() => readPhase2Config({ ...base, DEMO_MODE: "staging" })).toThrow(
-      /Invalid/u,
+    expect(readPhase2Config({ ...base, DEMO_MODE: "staging" }).mode).toBe(
+      "staging",
     );
     expect(() =>
       readPhase2Config({ ...base, WEBHOOK_MAX_BODY_BYTES: "999999" }),

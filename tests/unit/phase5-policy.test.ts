@@ -88,6 +88,78 @@ describe("Phase 5 deterministic severity policy", () => {
     ).toMatchObject({ outcome: "manual-review" });
   });
 
+  it("accepts only atomic mock-cloud or identity-geoip origin pairs", () => {
+    const context = phase5Context("disallowed_country_login");
+    const replace = (factType: string, patch: Record<string, unknown>) =>
+      context.evidence.map((item) =>
+        item.fact.factType === factType ? { ...item, ...patch } : item,
+      );
+    const validIpPresent = replace("login.ipPresent", {
+      source: "identity",
+      provider: "identity-geoip",
+    });
+    expect(
+      evaluateSeverityPolicy(context.correlation.context, validIpPresent, 0),
+    ).toMatchObject({ outcome: "classified" });
+    for (const [factType, patch] of [
+      ["login.ipPresent", { source: "identity", provider: "mock-cloud" }],
+      ["login.ipPresent", { source: "cloud", provider: "identity-geoip" }],
+      ["login.country", { source: "identity", provider: "mock-cloud" }],
+      ["login.country", { source: "cloud", provider: "identity-geoip" }],
+    ] as const) {
+      expect(
+        evaluateSeverityPolicy(
+          context.correlation.context,
+          replace(factType, patch),
+          0,
+        ),
+      ).toMatchObject({ outcome: "manual-review" });
+    }
+  });
+
+  it("accepts the approved GeoIP 0.70 capability but rejects forged provenance or confidence", () => {
+    const context = phase5Context("disallowed_country_login");
+    const country = context.evidence.find(
+      (item) => item.fact.factType === "login.country",
+    )!;
+    const geo = (value: string, confidence: number, provenance = "policy-v1") =>
+      context.evidence.map((item) =>
+        item.evidenceId === country.evidenceId
+          ? {
+              ...item,
+              source: "identity" as const,
+              provider: "identity-geoip",
+              confidence,
+              fact: {
+                ...item.fact,
+                value,
+                confidenceProvenance: provenance as "policy-v1",
+              },
+            }
+          : item,
+      );
+    expect(
+      evaluateSeverityPolicy(context.correlation.context, geo("CA", 0.7), 0),
+    ).toMatchObject({ outcome: "classified" });
+    expect(
+      evaluateSeverityPolicy(context.correlation.context, geo("BR", 0.8), 0),
+    ).toMatchObject({ outcome: "manual-review" });
+    expect(
+      evaluateSeverityPolicy(context.correlation.context, geo("CA", 0.8), 0),
+    ).toMatchObject({ outcome: "manual-review" });
+    const forged = geo("CA", 0.7).map((item) =>
+      item.evidenceId === country.evidenceId
+        ? {
+            ...item,
+            fact: { ...item.fact, confidenceProvenance: "provider" as const },
+          }
+        : item,
+    );
+    expect(
+      evaluateSeverityPolicy(context.correlation.context, forged, 0),
+    ).toMatchObject({ outcome: "manual-review" });
+  });
+
   it("fails closed on duplicate required fact labels", () => {
     const context = phase5Context("unknown_device_login");
     const duplicate = {

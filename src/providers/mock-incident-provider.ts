@@ -9,6 +9,7 @@ import {
 } from "./incident-provider.js";
 
 export class MockIncidentProvider implements IncidentProvider {
+  readonly providerId = "mock-incident" as const;
   readonly calls: Array<
     Readonly<{
       operation: "create" | "update";
@@ -26,7 +27,13 @@ export class MockIncidentProvider implements IncidentProvider {
       result: ExternalIncidentResult;
     }>
   >();
+  private readonly inFlight = new Map<
+    string,
+    Promise<ExternalIncidentResult>
+  >();
   private failuresRemaining: number;
+  private readonly rejectUpdateReadback: boolean;
+  private ambiguitiesRemaining: number;
   private readonly store?: OperationalStore;
   private readonly openStore?: () => OperationalStore;
   private readonly beforePersist?: (
@@ -41,6 +48,10 @@ export class MockIncidentProvider implements IncidentProvider {
   constructor(
     options: Readonly<{
       failAttempts?: number;
+      /** Hermetic fake of a remote update that cannot be verified on readback. */
+      rejectUpdateReadback?: boolean;
+      /** Simulates an effect persisted before the provider response is lost. */
+      ambiguousAfterPersistAttempts?: number;
       store?: OperationalStore;
       openStore?: () => OperationalStore;
       beforePersist?: (
@@ -55,6 +66,8 @@ export class MockIncidentProvider implements IncidentProvider {
   ) {
     if (options.store && options.openStore) throw new DomainError("CONFLICT");
     this.failuresRemaining = options.failAttempts ?? 0;
+    this.rejectUpdateReadback = options.rejectUpdateReadback ?? false;
+    this.ambiguitiesRemaining = options.ambiguousAfterPersistAttempts ?? 0;
     this.store = options.store;
     this.openStore = options.openStore;
     this.beforePersist = options.beforePersist;
@@ -65,7 +78,7 @@ export class MockIncidentProvider implements IncidentProvider {
     idempotencyKey: string;
     generation: number;
   }): Promise<ExternalIncidentResult> {
-    return this.deliver("create", input);
+    return this.singleFlight("create", input);
   }
 
   async update(input: {
@@ -77,7 +90,61 @@ export class MockIncidentProvider implements IncidentProvider {
     if (!/^mock-incident-[a-f0-9]{16}$/u.test(input.externalRef)) {
       throw new DomainError("VALIDATION_FAILED");
     }
-    return this.deliver("update", input);
+    return this.singleFlight("update", input);
+  }
+
+  /**
+   * The mock has the same read-only reconciliation seam as Linear.  This is
+   * intentionally a lookup of the persisted/idempotent result, never another
+   * delivery attempt, so contract matrices can observe recovery symmetrically.
+   */
+  async reconcile(input: {
+    operation: "create" | "update";
+    idempotencyKey: string;
+    externalRef?: string;
+    generation?: number;
+    projection?: ExternalIncidentProjection;
+  }): Promise<ExternalIncidentResult | undefined> {
+    if (input.operation === "update" && !input.externalRef) return undefined;
+    if (input.generation === undefined || !input.projection) return undefined;
+    if (this.store || this.openStore) {
+      return this.readPersistedEffect(
+        input.operation,
+        input.idempotencyKey,
+        input.generation,
+        ExternalIncidentProjectionSchema.parse(input.projection),
+        JSON.stringify(input.projection),
+      );
+    }
+    const saved = this.results.get(input.idempotencyKey);
+    if (
+      !saved ||
+      saved.operation !== input.operation ||
+      saved.generation !== input.generation ||
+      saved.projectionJson !== JSON.stringify(input.projection) ||
+      (input.externalRef !== undefined &&
+        saved.result.externalRef !== input.externalRef)
+    )
+      return undefined;
+    return saved.result;
+  }
+
+  private singleFlight(
+    operation: "create" | "update",
+    input: {
+      projection: ExternalIncidentProjection;
+      idempotencyKey: string;
+      generation: number;
+    },
+  ): Promise<ExternalIncidentResult> {
+    const key = `${operation}\u0000${input.idempotencyKey}\u0000${input.generation}`;
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
+    const pending = this.deliver(operation, input).finally(() => {
+      this.inFlight.delete(key);
+    });
+    this.inFlight.set(key, pending);
+    return pending;
   }
 
   private async deliver(
@@ -132,6 +199,15 @@ export class MockIncidentProvider implements IncidentProvider {
       });
       throw new DomainError("STORAGE_UNAVAILABLE", { retryable: true });
     }
+    if (operation === "update" && this.rejectUpdateReadback) {
+      this.calls.push({
+        operation,
+        projection,
+        idempotencyKey: input.idempotencyKey,
+        generation: input.generation,
+      });
+      throw new DomainError("CONFLICT");
+    }
     const ref = `mock-incident-${simpleHash(input.idempotencyKey)}`;
     const result = Object.freeze({ externalRef: ref });
     await this.beforePersist?.({
@@ -172,6 +248,10 @@ export class MockIncidentProvider implements IncidentProvider {
       generation: input.generation,
       result,
     });
+    if (this.ambiguitiesRemaining > 0) {
+      this.ambiguitiesRemaining -= 1;
+      throw new DomainError("STORAGE_UNAVAILABLE", { retryable: true });
+    }
     return result;
   }
 

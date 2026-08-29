@@ -25,6 +25,12 @@ export type GatewayAuditReason =
   | "ALREADY_VERIFIED"
   | "ACTION_IN_PROGRESS";
 
+// Three normal provider attempts are followed by at most three fenced,
+// read-only WorkOS readbacks.  The latter never call a remote mutation (the
+// provider ledger returns `uncertain` to the identity adapter), which keeps
+// eventual consistency recoverable without an unbounded retry loop.
+const MAX_WORKOS_RECONCILIATION_ATTEMPTS = 3;
+
 export async function auditGatewayAttempt(
   store: OperationalStore,
   input: Readonly<{
@@ -118,7 +124,73 @@ export async function claimContainmentAction(
       args: [input.tenantId, input.planId, input.actionId],
     });
     const row = latest.rows[0];
-    if (Number(row?.attempt ?? 0) >= 3) {
+    const uncertainWorkOs = await tx.execute({
+      sql: `SELECT idempotency_key FROM provider_effect_ledger
+        WHERE provider = 'workos' AND idempotency_key = ? AND tenant_id = ?
+          AND incident_id = ? AND plan_id = ? AND action_id = ?
+          AND status = 'uncertain'`,
+      args: [
+        input.idempotencyKey,
+        input.tenantId,
+        input.incidentId,
+        input.planId,
+        input.actionId,
+      ],
+    });
+    if (
+      Number(row?.attempt ?? 0) >= 3 + MAX_WORKOS_RECONCILIATION_ATTEMPTS &&
+      uncertainWorkOs.rows[0] &&
+      !(row?.status === "executing" && String(row.lease_expires_at) > now)
+    ) {
+      // This is a terminal, auditable bound.  It does not use a new fence and
+      // cannot dispatch a second WorkOS mutation; operators can investigate a
+      // failed ledger entry rather than an indefinitely pending effect.
+      if (row?.status === "executing") {
+        const expiredAttempt = await tx.execute({
+          sql: `UPDATE containment_action_attempts
+            SET status = 'failed', finished_at = ?, error_code = 'PROVIDER_FAILED',
+              verification = 'not_run'
+            WHERE id = ? AND status = 'executing' AND fence_token = ?
+              AND lease_expires_at <= ?`,
+          args: [now, String(row.id), String(row.fence_token), now],
+        });
+        if (expiredAttempt.rowsAffected !== 1)
+          throw new DomainError("CONFLICT");
+      }
+      const action = await tx.execute({
+        sql: `UPDATE containment_actions SET status = 'failed'
+          WHERE tenant_id = ? AND incident_id = ? AND plan_id = ? AND action_id = ?
+            AND status ${row?.status === "executing" ? "= 'executing'" : "IN ('timed_out','failed')"}`,
+        args: [input.tenantId, input.incidentId, input.planId, input.actionId],
+      });
+      if (action.rowsAffected !== 1) throw new DomainError("CONFLICT");
+      const ledger = await tx.execute({
+        sql: `UPDATE provider_effect_ledger SET status = 'failed', completed_at = ?
+          WHERE provider = 'workos' AND idempotency_key = ? AND status = 'uncertain'`,
+        args: [now, input.idempotencyKey],
+      });
+      if (ledger.rowsAffected !== 1) throw new DomainError("CONFLICT");
+      await tx.execute({
+        sql: `INSERT INTO containment_gateway_audit(
+          id, claimed_tenant_id, claimed_incident_id, claimed_plan_id,
+          claimed_approval_id, claimed_action_id, outcome, reason_code, occurred_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'rate_limited', 'RATE_LIMITED', ?)`,
+        args: [
+          ids.next(),
+          input.tenantId,
+          input.incidentId,
+          input.planId,
+          input.approvalId,
+          input.actionId,
+          now,
+        ],
+      });
+      return { state: "denied" as const, reason: "RATE_LIMITED" as const };
+    }
+    // Attempt budgets cap mutations. A persisted ambiguous WorkOS effect gets
+    // one or more fenced *read-only* reconciliation entries so eventual
+    // consistency can converge after the normal budget is exhausted.
+    if (Number(row?.attempt ?? 0) >= 3 && !uncertainWorkOs.rows[0]) {
       await tx.execute({
         sql: `INSERT INTO containment_gateway_audit(
           id, claimed_tenant_id, claimed_incident_id, claimed_plan_id,

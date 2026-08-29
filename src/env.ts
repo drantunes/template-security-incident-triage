@@ -4,7 +4,10 @@ const integer = (fallback: number, minimum: number, maximum: number) =>
   z.coerce.number().int().min(minimum).max(maximum).default(fallback);
 
 const environmentSchema = z.object({
-  DEMO_MODE: z.literal("mock").default("mock"),
+  // The Phase 2 HTTP/outbox configuration is also used by the Phase 8
+  // staging runtime. Provider enablement remains validated separately by
+  // readPhase8Config; accepting staging here must not turn any provider on.
+  DEMO_MODE: z.enum(["mock", "staging"]).default("mock"),
   WEBHOOKS_ENABLED: z
     .enum(["true", "false"])
     .default("true")
@@ -25,7 +28,7 @@ const environmentSchema = z.object({
 });
 
 export type Phase2Config = Readonly<{
-  mode: "mock";
+  mode: "mock" | "staging";
   webhooksEnabled: boolean;
   alertWebhookSecret?: string;
   workosWebhookSecret?: string;
@@ -88,6 +91,13 @@ export function readPhase2Config(
     port: value.PORT,
   });
 }
+
+export {
+  assertPhase8ControlPlaneAuth,
+  hasRealPhase8Provider,
+  readPhase8Config,
+  type Phase8Config,
+} from "./config/phase8.js";
 
 const phase4EnvironmentSchema = z.object({
   MASTRA_MODEL: z.string().trim().min(1).default("openai/gpt-4o-mini"),

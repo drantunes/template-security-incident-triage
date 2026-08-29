@@ -104,6 +104,7 @@ export async function decideDashboardApproval(
       runId: row.workflow_run_id,
       correlationId: input.correlationId,
       resumeSecret: input.phase6Config.approvalResumeSecret,
+      decisionProvenance: "dashboard",
     },
     { clock: input.clock },
   );

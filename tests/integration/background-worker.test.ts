@@ -44,6 +44,40 @@ async function setup() {
 }
 
 describe("background workflow start", () => {
+  it("installs the configured four official PubSub subscribers", async () => {
+    const { store } = await setup();
+    class CountingPubSub extends PubSub {
+      subscriptions = 0;
+      unsubscriptions = 0;
+      override async publish(): Promise<void> {}
+      override async subscribe(): Promise<void> {
+        this.subscriptions += 1;
+      }
+      override async unsubscribe(): Promise<void> {
+        this.unsubscriptions += 1;
+      }
+      override async flush(): Promise<void> {}
+    }
+    const pubsub = new CountingPubSub();
+    const unsubscribe = await startWorkflowWorker({
+      pubsub,
+      workflow: {
+        createRun: async () => ({ startAsync: async () => ({ runId: "run" }) }),
+      },
+      store,
+      logger: silentLogger,
+      maxAttempts: 5,
+      concurrency: 4,
+    });
+    try {
+      expect(pubsub.subscriptions).toBe(4);
+    } finally {
+      await unsubscribe();
+      expect(pubsub.unsubscriptions).toBe(4);
+      store.close();
+    }
+  });
+
   it("materializes one logical effect under concurrent starts", async () => {
     const { database, store } = await setup();
     const second = database.createStore();
@@ -138,7 +172,7 @@ describe("background workflow start", () => {
         occurredAt: "2026-08-27T12:00:00.000Z",
         incidentId: "incident-1",
         tenantId: "tenant-1",
-        correlationId: "correlation-1",
+        correlationId: "alert-idempotency-1",
         causationId: "source-event-1",
         payload: { alertId: "alert-1", status: "received" },
       },
@@ -180,6 +214,7 @@ describe("background workflow start", () => {
         data: { schemaVersion: 2 },
       });
       await pubsub.flush();
+      await new Promise((resolve) => setTimeout(resolve, 10));
       const count = await store.execute({
         sql: "SELECT count(*) AS count FROM dead_letter_events",
       });
@@ -188,6 +223,221 @@ describe("background workflow start", () => {
     } finally {
       await unsubscribe();
       await pubsub.close();
+      store.close();
+    }
+  });
+
+  it("atomically records transport poison plus terminal outbox before ACKing a copied envelope", async () => {
+    const { store } = await setup();
+    class CapturingPubSub extends PubSub {
+      callbacks: EventCallback[] = [];
+      override async publish(): Promise<void> {}
+      override async subscribe(
+        _topic: string,
+        callback: EventCallback,
+      ): Promise<void> {
+        this.callbacks.push(callback);
+      }
+      override async unsubscribe(): Promise<void> {}
+      override async flush(): Promise<void> {}
+    }
+    const pubsub = new CapturingPubSub();
+    const unsubscribe = await startWorkflowWorker({
+      pubsub,
+      workflow: {
+        createRun: async () => {
+          throw new Error("must not start");
+        },
+      },
+      store,
+      logger: silentLogger,
+      maxAttempts: 5,
+      concurrency: 4,
+    });
+    const poison = {
+      id: "transport-invalid",
+      createdAt: new Date(),
+      type: "security.alert.received",
+      runId: "incident-1",
+      data: {
+        eventId: "outbox-1",
+        schemaVersion: 1,
+        occurredAt: "2026-08-27T12:00:00.000Z",
+        incidentId: "incident-1",
+        tenantId: "tenant-1",
+        correlationId: "alert-idempotency-1",
+        causationId: "source-event-1",
+        // Valid against the transport schema, but not source-bound: the
+        // authoritative outbox payload contains alert-1. It must never touch
+        // the copied source ledger, but still needs a complete standalone
+        // terminal audit and security.dead-letter outbox transaction.
+        payload: { alertId: "tampered-alert", status: "received" },
+      },
+    } as Event;
+    let acknowledgements = 0;
+    try {
+      await pubsub.callbacks[0]!(poison, async () => {
+        acknowledgements += 1;
+      });
+      await pubsub.callbacks[0]!(poison, async () => {
+        acknowledgements += 1;
+      });
+      expect(acknowledgements).toBe(2);
+      const durable = await store.execute({
+        sql: `SELECT
+          (SELECT count(*) FROM dead_letter_events WHERE source_outbox_id = 'outbox-1') AS source_dlq,
+          (SELECT count(*) FROM dead_letter_events WHERE source_outbox_id IS NULL) AS standalone_dlq,
+          (SELECT count(*) FROM outbox_events WHERE type = 'security.dead-letter') AS outbox,
+          (SELECT status FROM consumer_effect_ledger WHERE consumer_group = 'security-workflow-starters' AND event_id = 'outbox-1') AS effect`,
+      });
+      expect(durable.rows).toEqual([
+        { source_dlq: 0, standalone_dlq: 1, outbox: 1, effect: null },
+      ]);
+    } finally {
+      await unsubscribe();
+      store.close();
+    }
+  });
+
+  it("separates same-size transport poisons and converges exact duplicates before their ACKs", async () => {
+    const { store } = await setup();
+    class CapturingPubSub extends PubSub {
+      callbacks: EventCallback[] = [];
+      override async publish(): Promise<void> {}
+      override async subscribe(
+        _topic: string,
+        callback: EventCallback,
+      ): Promise<void> {
+        this.callbacks.push(callback);
+      }
+      override async unsubscribe(): Promise<void> {}
+      override async flush(): Promise<void> {}
+    }
+    const pubsub = new CapturingPubSub();
+    const unsubscribe = await startWorkflowWorker({
+      pubsub,
+      workflow: {
+        createRun: async () => {
+          throw new Error("must not start");
+        },
+      },
+      store,
+      logger: silentLogger,
+      maxAttempts: 5,
+    });
+    const poisonA = {
+      id: "transport-collision",
+      createdAt: new Date(),
+      type: "security.alert.received",
+      runId: "incident-1",
+      // Each envelope is invalid, but both canonical serializations have the
+      // same size. Their bytes (and thus hashes) are different.
+      data: { payload: { alertId: "same-size-a" } },
+    } as Event;
+    const poisonB = {
+      ...poisonA,
+      data: { payload: { alertId: "same-size-b" } },
+    } as Event;
+    const acknowledgements: Array<{
+      name: string;
+      failures: number;
+      deadLetters: number;
+      outbox: number;
+    }> = [];
+    const acknowledge = async (name: string) => {
+      const durable = await store.execute({
+        sql: `SELECT
+          (SELECT count(*) FROM redis_decode_failures) AS failures,
+          (SELECT count(*) FROM dead_letter_events) AS dead_letters,
+          (SELECT count(*) FROM outbox_events WHERE type = 'security.dead-letter') AS outbox`,
+      });
+      acknowledgements.push({
+        name,
+        failures: Number(durable.rows[0]?.failures),
+        deadLetters: Number(durable.rows[0]?.dead_letters),
+        outbox: Number(durable.rows[0]?.outbox),
+      });
+    };
+    try {
+      await pubsub.callbacks[0]!(poisonA, () => acknowledge("a"));
+      await pubsub.callbacks[0]!(poisonB, () => acknowledge("b"));
+      await pubsub.callbacks[0]!(poisonA, () => acknowledge("a-duplicate"));
+
+      expect(acknowledgements).toEqual([
+        { name: "a", failures: 1, deadLetters: 1, outbox: 1 },
+        { name: "b", failures: 2, deadLetters: 2, outbox: 2 },
+        { name: "a-duplicate", failures: 2, deadLetters: 2, outbox: 2 },
+      ]);
+      const failures = await store.execute({
+        sql: `SELECT stream_id, payload_hash, payload_size
+          FROM redis_decode_failures ORDER BY stream_id`,
+      });
+      expect(failures.rows).toHaveLength(2);
+      expect(failures.rows[0]?.payload_size).toBe(
+        failures.rows[1]?.payload_size,
+      );
+      expect(failures.rows[0]?.payload_hash).not.toBe(
+        failures.rows[1]?.payload_hash,
+      );
+      expect(failures.rows[0]?.stream_id).not.toBe(failures.rows[1]?.stream_id);
+    } finally {
+      await unsubscribe();
+      store.close();
+    }
+  });
+
+  it("keeps transport poison unacknowledged when its terminal transaction fails", async () => {
+    const { store } = await setup();
+    class CapturingPubSub extends PubSub {
+      callback?: EventCallback;
+      override async publish(): Promise<void> {}
+      override async subscribe(
+        _topic: string,
+        callback: EventCallback,
+      ): Promise<void> {
+        this.callback = callback;
+      }
+      override async unsubscribe(): Promise<void> {}
+      override async flush(): Promise<void> {}
+    }
+    const pubsub = new CapturingPubSub();
+    const unavailableStore: OperationalStore = {
+      execute: (statement) => store.execute(statement),
+      transaction: async () => {
+        throw new Error("storage unavailable");
+      },
+      close: () => {},
+    };
+    const unsubscribe = await startWorkflowWorker({
+      pubsub,
+      workflow: {
+        createRun: async () => {
+          throw new Error("must not start");
+        },
+      },
+      store: unavailableStore,
+      logger: silentLogger,
+      maxAttempts: 5,
+    });
+    let acknowledgements = 0;
+    try {
+      await expect(
+        pubsub.callback?.(
+          {
+            id: "transport-persistence-failure",
+            createdAt: new Date(),
+            type: "security.alert.received",
+            runId: "incident-1",
+            data: { schemaVersion: 2 },
+          } as Event,
+          async () => {
+            acknowledgements += 1;
+          },
+        ),
+      ).rejects.toMatchObject({ code: "PHASE8_RETAIN_DELIVERY" });
+      expect(acknowledgements).toBe(0);
+    } finally {
+      await unsubscribe();
       store.close();
     }
   });
@@ -216,6 +466,7 @@ describe("background workflow start", () => {
       }
     }
     const pubsub = new CapturingPubSub();
+    const retryDelays: number[] = [];
     const unsubscribe = await startWorkflowWorker({
       pubsub,
       workflow: {
@@ -226,6 +477,11 @@ describe("background workflow start", () => {
       store,
       logger: silentLogger,
       maxAttempts: 3,
+      retryBackoffMs: [500, 1000, 2000, 4000],
+      random: () => 0.5,
+      schedule: async (delayMs) => {
+        retryDelays.push(delayMs);
+      },
     });
     const baseEvent: Event = {
       id: "transport-1",
@@ -238,8 +494,9 @@ describe("background workflow start", () => {
         occurredAt: "2026-08-27T12:00:00.000Z",
         incidentId: "incident-1",
         tenantId: "tenant-1",
-        correlationId: "correlation-1",
-        payload: { alertId: "alert-1" },
+        correlationId: "alert-idempotency-1",
+        causationId: "source-event-1",
+        payload: { alertId: "alert-1", status: "received" },
       },
     };
     let acknowledgements = 0;
@@ -256,15 +513,42 @@ describe("background workflow start", () => {
         acknowledgements: 0,
         negativeAcknowledgements: 1,
       });
+      expect(retryDelays).toEqual([250]);
+      await pubsub.deliver({ ...baseEvent, deliveryAttempt: 2 }, ack, nack);
+      expect({ acknowledgements, negativeAcknowledgements }).toEqual({
+        acknowledgements: 0,
+        negativeAcknowledgements: 2,
+      });
       await pubsub.deliver({ ...baseEvent, deliveryAttempt: 3 }, ack, nack);
       expect({ acknowledgements, negativeAcknowledgements }).toEqual({
         acknowledgements: 1,
-        negativeAcknowledgements: 1,
+        negativeAcknowledgements: 2,
       });
+      expect(retryDelays).toEqual([250, 500]);
       const dead = await store.execute({
         sql: "SELECT error_code FROM dead_letter_events",
       });
       expect(dead.rows).toEqual([{ error_code: "WORKFLOW_START_FAILED" }]);
+      const deadLetterOutbox = await store.execute({
+        sql: `SELECT type, payload_json FROM outbox_events
+          WHERE type = 'security.dead-letter'`,
+      });
+      expect(deadLetterOutbox.rows).toEqual([
+        {
+          type: "security.dead-letter",
+          payload_json: JSON.stringify({
+            sourceEventId: "outbox-1",
+            errorCode: "WORKFLOW_START_FAILED",
+          }),
+        },
+      ]);
+      const effect = await store.execute({
+        sql: `SELECT status, attempt_count FROM consumer_effect_ledger
+          WHERE consumer_group = 'security-workflow-starters' AND event_id = 'outbox-1'`,
+      });
+      expect(effect.rows).toEqual([
+        { status: "dead_lettered", attempt_count: 3 },
+      ]);
     } finally {
       await unsubscribe();
       store.close();
@@ -347,8 +631,9 @@ describe("background workflow start", () => {
         occurredAt: "2026-08-27T12:00:00.000Z",
         incidentId: "incident-1",
         tenantId: "tenant-1",
-        correlationId: "correlation-1",
-        payload: { alertId: "alert-1" },
+        correlationId: "alert-idempotency-1",
+        causationId: "source-event-1",
+        payload: { alertId: "alert-1", status: "received" },
       },
     };
     let acknowledgements = 0;
@@ -425,7 +710,7 @@ describe("background workflow start", () => {
       incidentId: "incident-1",
       tenantId: "tenant-1",
       alertId: "alert-1",
-      correlationId: "correlation-1",
+      correlationId: "alert-idempotency-1",
     };
     try {
       const materializing = materializeInvestigationStart(delayedStore, input, {
