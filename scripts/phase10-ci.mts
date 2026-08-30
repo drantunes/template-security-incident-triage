@@ -54,4 +54,14 @@ const [left, right] = await Promise.all([
 if (!left.equals(right)) throw new Error("PHASE10_CI_NONDETERMINISTIC");
 if (!createHash("sha256").update(left).digest("hex"))
   throw new Error("PHASE10_CI_REPORT_HASH_INVALID");
+// `npm test` intentionally keeps this process-heavy E2E out of its parallel
+// worker pool. Run it once here, after the deterministic reports, so all 13
+// concrete sinks are inspected without CI resource contention masking a gate.
+const realGates = await exec(
+  "npm",
+  ["test", "--", "--run", "tests/integration/phase10-report.test.ts"],
+  { env: { ...process.env, PHASE10_CI_REAL_GATES: "true" } },
+);
+process.stdout.write(realGates.stdout);
+process.stderr.write(realGates.stderr);
 console.log("phase10-approved=true");

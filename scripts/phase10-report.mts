@@ -441,10 +441,16 @@ async function main(): Promise<void> {
         redactionSurfaces,
         redactionCanaries,
       );
-      if (redactionErrors.length)
+      const requestedFaultSurfaces = [...redactionFaultSurfaces()];
+      const missingFaultSurfaces = requestedFaultSurfaces.filter(
+        (name) => !redactionSurfaces.some((surface) => surface.name === name),
+      );
+      if (redactionErrors.length || missingFaultSurfaces.length)
         independentErrors.push(
           Object.assign(
-            new Error(`PHASE10_REDACTION_LEAK:${redactionErrors.join(",")}`),
+            new Error(
+              `PHASE10_REDACTION_LEAK_SURFACES:${requestedFaultSurfaces.join(",")};PHASE10_REDACTION_LEAK:${redactionErrors.join(",")};PHASE10_REDACTION_SURFACE_MISSING:${missingFaultSurfaces.join(",")}`,
+            ),
             { exitCode: exitCodes.trace },
           ),
         );
