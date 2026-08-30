@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { migrateOperationalStore } from "../../src/db/migrate.js";
+import { exportAnalyticsSince } from "../../src/analytics/exporter.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -129,12 +130,89 @@ describe("SOC migrations", () => {
         { version: 11 },
         { version: 12 },
         { version: 13 },
+        { version: 14 },
       ]);
       await expect(
         store.execute({
           sql: `SELECT decision_provenance FROM approvals WHERE 1 = 0`,
         }),
       ).resolves.toBeDefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("upgrades Phase 8 rows without inventing provider terminal time and preserves pending approvals", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 8 });
+      await store.execute({
+        sql: `INSERT INTO incidents(id,tenant_id,kind,subject_id,status,created_at,updated_at)
+          VALUES ('incident-upgrade','tenant-upgrade','unknown_device_login','subject','received',?,?)`,
+        args: ["2026-08-30T00:00:00.000Z", "2026-08-30T00:00:00.000Z"],
+      });
+      await store.execute({
+        sql: `INSERT INTO workflow_runs(id,incident_id,tenant_id,run_id,workflow_id,status,started_at)
+          VALUES ('workflow-upgrade','incident-upgrade','tenant-upgrade','run-upgrade','workflow','waiting',?)`,
+        args: ["2026-08-30T00:00:00.000Z"],
+      });
+      await store.execute({
+        sql: `INSERT INTO containment_plans(id,incident_id,tenant_id,schema_version,plan_version,plan_hash_version,plan_hash,plan_json,expires_at,created_at)
+          VALUES ('plan-upgrade','incident-upgrade','tenant-upgrade',1,1,1,?, '{}',?,?)`,
+        args: [
+          "a".repeat(64),
+          "2026-08-30T01:00:00.000Z",
+          "2026-08-30T00:00:00.000Z",
+        ],
+      });
+      await store.execute({
+        sql: `INSERT INTO approvals(id,plan_id,incident_id,tenant_id,plan_hash_version,plan_hash,requested_at,expires_at,workflow_run_id)
+          VALUES ('approval-upgrade','plan-upgrade','incident-upgrade','tenant-upgrade',1,?,?,?,'run-upgrade')`,
+        args: [
+          "a".repeat(64),
+          "2026-08-30T00:00:01.000Z",
+          "2026-08-30T01:00:00.000Z",
+        ],
+      });
+      await store.execute({
+        sql: `INSERT INTO provider_deliveries(id,provider,incident_id,tenant_id,operation,idempotency_key,status,attempt_count,next_attempt_at)
+          VALUES ('provider-upgrade','mock-incident','incident-upgrade','tenant-upgrade','open-awaiting-approval','key-upgrade','succeeded',1,NULL)`,
+      });
+
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT observed_at FROM provider_deliveries WHERE id='provider-upgrade'",
+        }),
+      ).resolves.toMatchObject({ rows: [{ observed_at: null }] });
+      const exported = await exportAnalyticsSince(store, 0);
+      expect(exported).toContainEqual(
+        expect.objectContaining({
+          source: "approvals",
+          sourceId: "approval-upgrade",
+          status: "pending",
+          occurredAt: "2026-08-30T00:00:01.000Z",
+        }),
+      );
+      expect(exported).not.toContainEqual(
+        expect.objectContaining({ sourceId: "provider-upgrade" }),
+      );
+
+      await store.execute({
+        sql: `INSERT INTO provider_deliveries(id,provider,incident_id,tenant_id,operation,idempotency_key,status,attempt_count,next_attempt_at,observed_at)
+          VALUES ('provider-live','mock-incident','incident-upgrade','tenant-upgrade','final-contained','key-live','succeeded',1,NULL,?)`,
+        args: ["2026-08-30T00:00:03.000Z"],
+      });
+      const live = await exportAnalyticsSince(store, 0);
+      expect(live).toContainEqual(
+        expect.objectContaining({
+          sourceId: "provider-live",
+          occurredAt: "2026-08-30T00:00:03.000Z",
+          status: "succeeded",
+        }),
+      );
     } finally {
       store.close();
     }

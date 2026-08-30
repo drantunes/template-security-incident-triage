@@ -305,7 +305,7 @@ describe("phase 10 DuckDB read model", () => {
     };
     await expect(
       store.queryMetric({ ...window, metric: "provider_failure_rate" }),
-    ).resolves.toEqual({ sampleCount: 4, value: 0.75 });
+    ).resolves.toEqual({ sampleCount: 5, value: 0.8 });
     await expect(
       store.queryMetric({ ...window, metric: "guardrail_block_rate" }),
     ).resolves.toEqual({ sampleCount: 2, value: 0.5 });

@@ -411,11 +411,11 @@ function metricQuery(metric: AnalyticsMetricId): Readonly<{ sql: string }> {
       };
     case "provider_failure_rate":
       return {
-        // Each delivery is a retryable producer. Its latest exported state is
-        // one denominator unit, never every intermediate retry snapshot. The
-        // durable delivery contract has no failed/error terminal state:
-        // retry, exhausted and uncertain are its real failed outcomes.
-        sql: `SELECT count(*) AS sample_count, AVG(CASE WHEN status IN ('retry','exhausted','uncertain') THEN 1 ELSE 0 END) AS value FROM (SELECT * EXCLUDE (row_number) FROM (SELECT *, row_number() OVER (PARTITION BY source, source_id ORDER BY sequence DESC) AS row_number FROM analytics_facts WHERE ${ranged} AND source='provider_deliveries') WHERE row_number=1)`,
+        // A provider delivery is retried in-place, so a metric sample is the
+        // latest authoritative snapshot for each (delivery, attempt). This
+        // preserves a failed first attempt after a later successful retry;
+        // retry, exhausted and uncertain are all durable failure outcomes.
+        sql: `SELECT count(*) AS sample_count, AVG(CASE WHEN status IN ('retry','exhausted','uncertain') THEN 1 ELSE 0 END) AS value FROM (SELECT * EXCLUDE (row_number, attempt) FROM (SELECT *, try_cast(regexp_extract(source_version, '^([0-9]+):', 1) AS BIGINT) AS attempt, row_number() OVER (PARTITION BY source, source_id, regexp_extract(source_version, '^([0-9]+):', 1) ORDER BY sequence DESC) AS row_number FROM analytics_facts WHERE ${ranged} AND source='provider_deliveries') WHERE row_number=1 AND attempt >= 1)`,
       };
     case "escalation_accuracy":
       return {

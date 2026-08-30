@@ -61,6 +61,14 @@ export async function exportAnalyticsSince(
       throw new Error("PHASE10_ANALYTICS_SNAPSHOT_INVALID");
     if (!row.occurred_at || !row.category)
       throw new Error("PHASE10_ANALYTICS_SOURCE_INVALID");
+    // Version 9 could only reconstruct a provider terminal timestamp as the
+    // explicit 1970 sentinel. Keep that immutable journal row for audit, but
+    // never promote it into an authoritative metric sample.
+    if (
+      event.source === "provider_deliveries" &&
+      row.occurred_at === "1970-01-01T00:00:00.000Z"
+    )
+      continue;
     output.push({
       sequence: event.sequence,
       source: event.source,

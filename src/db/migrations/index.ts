@@ -13,6 +13,7 @@ import { phase10TraceContextStatements } from "./0010-phase10-trace-context.js";
 import { phase10TraceFenceStatements } from "./0011-phase10-trace-fence.js";
 import { phase10EvalAuthorityStatements } from "./0012-phase10-eval-authority.js";
 import { phase10RunbookAuthoritySnapshotStatements } from "./0013-phase10-runbook-authority-snapshot.js";
+import { phase10ProviderObservedAtStatements } from "./0014-phase10-provider-observed-at.js";
 
 export type Migration = Readonly<{
   version: number;
@@ -71,5 +72,10 @@ export const migrations = Object.freeze([
     13,
     "phase10-runbook-authority-snapshot",
     phase10RunbookAuthoritySnapshotStatements,
+  ),
+  defineMigration(
+    14,
+    "phase10-provider-observed-at",
+    phase10ProviderObservedAtStatements,
   ),
 ]);

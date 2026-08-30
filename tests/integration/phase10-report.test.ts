@@ -12,6 +12,90 @@ const exec = promisify(execFile);
 const fixedClock = "2026-08-30T00:00:00.000Z";
 
 describe("Phase 10 approved report pipeline", () => {
+  it("requires ancestry history in CI while retaining fail-closed provenance", async () => {
+    const root = await mkdtemp(join(tmpdir(), "phase10-shallow-history-"));
+    const seed = join(root, "seed");
+    const origin = join(root, "origin.git");
+    const shallow = join(root, "shallow");
+    try {
+      await exec("git", ["init", "-b", "main", seed]);
+      await exec("git", [
+        "-C",
+        seed,
+        "config",
+        "user.email",
+        "phase10@example.test",
+      ]);
+      await exec("git", ["-C", seed, "config", "user.name", "Phase 10"]);
+      await writeFile(join(seed, "provenance"), "origin\n", "utf8");
+      await exec("git", ["-C", seed, "add", "provenance"]);
+      await exec("git", ["-C", seed, "commit", "-m", "origin"]);
+      const originCommit = (
+        await exec("git", ["-C", seed, "rev-parse", "HEAD"])
+      ).stdout.trim();
+      await writeFile(join(seed, "provenance"), "descendant\n", "utf8");
+      await exec("git", ["-C", seed, "commit", "-am", "descendant"]);
+      await exec("git", ["clone", "--bare", seed, origin]);
+      await exec("git", ["clone", "--depth", "1", `file://${origin}`, shallow]);
+      const head = (
+        await exec("git", ["-C", shallow, "rev-parse", "HEAD"])
+      ).stdout.trim();
+      await expect(
+        exec("git", [
+          "-C",
+          shallow,
+          "merge-base",
+          "--is-ancestor",
+          originCommit,
+          head,
+        ]),
+      ).rejects.toBeDefined();
+      await exec("git", [
+        "-C",
+        shallow,
+        "fetch",
+        "--depth",
+        "2",
+        "origin",
+        "main",
+      ]);
+      await expect(
+        exec("git", [
+          "-C",
+          shallow,
+          "merge-base",
+          "--is-ancestor",
+          originCommit,
+          head,
+        ]),
+      ).resolves.toBeDefined();
+      expect(await readFile(".github/workflows/ci.yml", "utf8")).toMatch(
+        /actions\/checkout@v4\s+with:\s+fetch-depth: 0/u,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors the E2E clock and report window to B1 instead of wall time", async () => {
+    const [runtime, report, migration] = await Promise.all([
+      readFile("src/demo/runtime.ts", "utf8"),
+      readFile("scripts/phase10-report.mts", "utf8"),
+      readFile(
+        "src/db/migrations/0014-phase10-provider-observed-at.ts",
+        "utf8",
+      ),
+    ]);
+    expect(runtime).toContain(`fixedNow = "${fixedClock}"`);
+    expect(runtime).not.toContain("Date.now");
+    expect(report).toContain(
+      "exerciseProductE2EWithReproducibleClock(loaded.manifest.clock)",
+    );
+    expect(report).toContain("const window = reportWindow(clock)");
+    expect(report).not.toContain('from: "2026-08-30T00:00:00.000Z"');
+    expect(migration).not.toContain("strftime");
+  });
+
   it("returns structured argument failures before dataset or report work", async () => {
     const invoke = (arguments_: readonly string[]) =>
       exec(

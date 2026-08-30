@@ -17,7 +17,6 @@ import {
   type AnalyticsRecord,
 } from "../src/analytics/analytics-store.js";
 import { runMockDemo } from "../src/demo/runner.js";
-import { fixedNow } from "../src/demo/runtime.js";
 import {
   exportAllAnalytics,
   exportAnalyticsSince,
@@ -332,7 +331,7 @@ async function main(): Promise<void> {
         loaded.expected,
         observed,
       ),
-      exerciseProductE2EWithReproducibleClock(),
+      exerciseProductE2EWithReproducibleClock(loaded.manifest.clock),
     ]);
     const independentErrors = [analyticsResult, e2eResult]
       .filter(
@@ -542,14 +541,14 @@ function reportExitCode(error: Error & { exitCode?: number }): number {
 }
 
 /** Runs the three real Phase 9 mock workflows; no replay row can replace it. */
-async function exerciseProductE2EWithReproducibleClock(): Promise<
-  Awaited<ReturnType<typeof exerciseProductE2E>>
-> {
+async function exerciseProductE2EWithReproducibleClock(
+  clock: string,
+): Promise<Awaited<ReturnType<typeof exerciseProductE2E>>> {
   const previous = process.env.PHASE10_REPRODUCIBLE_TRACE_CLOCK;
   resetPhase10ReplayTraceClock();
-  process.env.PHASE10_REPRODUCIBLE_TRACE_CLOCK = fixedNow;
+  process.env.PHASE10_REPRODUCIBLE_TRACE_CLOCK = clock;
   try {
-    return await exerciseProductE2E();
+    return await exerciseProductE2E(clock);
   } finally {
     if (previous === undefined)
       delete process.env.PHASE10_REPRODUCIBLE_TRACE_CLOCK;
@@ -558,7 +557,7 @@ async function exerciseProductE2EWithReproducibleClock(): Promise<
   }
 }
 
-async function exerciseProductE2E(): Promise<
+async function exerciseProductE2E(clock: string): Promise<
   readonly Readonly<{
     scenario: string;
     disposition: string;
@@ -676,7 +675,7 @@ async function exerciseProductE2E(): Promise<
           tenantId: String(row.rows[0]?.tenant_id),
           incidentId: String(row.rows[0]?.incident_id),
           workflowRunId: run.journal.workflowRunId ?? "",
-          asOf: "2026-08-30T00:00:00.000Z",
+          asOf: clock,
         });
         if (
           !authority.evidence.size ||
@@ -830,12 +829,12 @@ async function exerciseProductE2E(): Promise<
           (typeof analyticsMetricIds)[number],
           AnalyticsMetricResult
         >;
+        const window = reportWindow(clock);
         for (const metric of analyticsMetricIds)
           metrics[metric] = await analytics.queryMetric({
             metric,
             tenantId: exported[0]!.tenantId,
-            from: "2026-08-30T00:00:00.000Z",
-            to: "2026-08-31T00:00:00.000Z",
+            ...window,
             scenario,
           });
         for (const metric of [
@@ -989,6 +988,23 @@ function metricBreakdowns(
         {},
       ),
     );
+  // Keep one durable export per delivery attempt. A later retry must not
+  // erase the failed first attempt from the B1 provider denominator or its
+  // status/type breakdown.
+  const providerAttempts = (() => {
+    const current = new Map<string, AnalyticsRecord>();
+    for (const record of records) {
+      if (record.source !== "provider_deliveries") continue;
+      const match = /^(\d+):/.exec(record.sourceVersion);
+      const attempt = Number(match?.[1]);
+      if (!Number.isSafeInteger(attempt) || attempt < 1) continue;
+      const key = `${record.sourceId}\u0000${attempt}`;
+      const previous = current.get(key);
+      if (!previous || record.sequence > previous.sequence)
+        current.set(key, record);
+    }
+    return [...current.values()];
+  })();
   const attempts = latest("timeline_events", "containment.attempt");
   const byAttempt = new Map<string, AnalyticsRecord[]>();
   for (const record of records)
@@ -1013,17 +1029,11 @@ function metricBreakdowns(
   const attemptToVerification = distribution(durations);
   return Object.freeze({
     provider: Object.freeze({
-      status: counts(latest("provider_deliveries")),
-      operation: countsBy(latest("provider_deliveries"), (row) => row.category),
-      retries: latest("provider_deliveries").reduce(
-        (total, row) =>
-          total +
-          Math.max(
-            0,
-            Number(row.sourceVersion.split(":")[0]?.split("@")[0]) - 1 || 0,
-          ),
-        0,
-      ),
+      status: counts(providerAttempts),
+      operation: countsBy(providerAttempts, (row) => row.category),
+      retries: providerAttempts.filter(
+        (row) => Number(/^(\d+):/.exec(row.sourceVersion)?.[1]) > 1,
+      ).length,
     }),
     guardrail: Object.freeze({
       status: counts(latest("timeline_events", "guardrail.plan_attempt")),
@@ -1059,6 +1069,17 @@ function metricBreakdowns(
           record.category === "trace.boundary" && record.status === "present",
       ).length,
     }),
+  });
+}
+
+/** The B1 report always evaluates the declared UTC day [clock, clock + 24h). */
+function reportWindow(clock: string): Readonly<{ from: string; to: string }> {
+  const fromMs = Date.parse(clock);
+  if (!Number.isFinite(fromMs))
+    fail(exitCodes.integrity, "PHASE10_MANIFEST_CLOCK_INVALID");
+  return Object.freeze({
+    from: new Date(fromMs).toISOString(),
+    to: new Date(fromMs + 24 * 60 * 60 * 1_000).toISOString(),
   });
 }
 

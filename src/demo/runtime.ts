@@ -28,10 +28,10 @@ import { phase10MastraScorers } from "../mastra/evals/mastra-scorers.js";
 export const webhookSecret = "phase9-demo-webhook-secret-not-for-production";
 export const decisionSecret = "phase9-demo-decision-secret-not-for-production";
 export const resumeSecret = "phase9-demo-resume-secret-not-for-production";
-// The webhook owns its received timestamp. Keep the deterministic workflow
-// clock just ahead of that write so the operational monotonicity trigger is
-// preserved even when this harness is run years after its fixture was added.
-export const fixedNow = new Date(Date.now() + 120_000).toISOString();
+// B1's declared manifest clock is the sole clock for this deterministic demo.
+// Fixture timestamps and operational writes are intentionally anchored here;
+// no report or evaluation outcome may depend on wall time.
+export const fixedNow = "2026-08-30T00:00:00.000Z";
 
 export function phase2Config(): Phase2Config {
   return {

@@ -12,7 +12,11 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
+      # The Phase 10 report validates that the immutable dataset origin commit
+      # is an ancestor of HEAD. A shallow checkout cannot prove that relation.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22.13.0
