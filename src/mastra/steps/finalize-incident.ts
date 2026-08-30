@@ -40,6 +40,25 @@ export function createFinalizeIncidentStep(
         };
       }
       if (inputData.status === "expired") {
+        const store = (
+          dependencies.openStore ?? createLibSqlOperationalStore
+        )();
+        try {
+          // Expiry resumes the same durable workflow through the Phase 6
+          // receipt. Keep its operational marker aligned with the completed
+          // Mastra run just as approved/rejected terminal paths do.
+          await store.execute({
+            sql: `UPDATE workflow_runs SET status = 'completed', finished_at = ?
+              WHERE run_id = ? AND incident_id = ? AND status = 'running'`,
+            args: [
+              dependencies.clock?.now() ?? new Date().toISOString(),
+              inputData.workflowRunId,
+              inputData.plan.incidentId,
+            ],
+          });
+        } finally {
+          store.close();
+        }
         return {
           status: "expired" as const,
           incidentId: inputData.plan.incidentId,
@@ -60,6 +79,19 @@ export function createFinalizeIncidentStep(
             ...(dependencies.ids ? { ids: dependencies.ids } : {}),
           },
         );
+        // LibSQL is the operational source queried by the dashboard and the
+        // demo verifier.  A completed Mastra run must not leave its durable
+        // workflow marker at `running`, otherwise a restart can misclassify a
+        // terminal incident as recoverable work.
+        await store.execute({
+          sql: `UPDATE workflow_runs SET status = 'completed', finished_at = ?
+            WHERE run_id = ? AND incident_id = ? AND status = 'running'`,
+          args: [
+            dependencies.clock?.now() ?? new Date().toISOString(),
+            inputData.workflowRunId,
+            inputData.plan.incidentId,
+          ],
+        });
         return finalResult(inputData);
       } finally {
         store.close();

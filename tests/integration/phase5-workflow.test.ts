@@ -172,7 +172,7 @@ describe("Phase 5 workflow", () => {
             : new MockCloudEvidenceProvider(),
         endpointProvider:
           kind === "unknown_device_login"
-            ? overrideFact(new MockEndpointEvidenceProvider(), factType, value)
+            ? overrideFact(mockEndpointWithFixtureAuthority(), factType, value)
             : new MockEndpointEvidenceProvider(),
       };
       const workflow = createPhase5Workflow(database, planner, providers);
@@ -582,7 +582,7 @@ function createPhase5Workflow(
       identityProvider:
         providers.identityProvider ?? new MockIdentityEvidenceProvider(),
       endpointProvider:
-        providers.endpointProvider ?? new MockEndpointEvidenceProvider(),
+        providers.endpointProvider ?? mockEndpointWithFixtureAuthority(),
       cloudProvider: providers.cloudProvider ?? new MockCloudEvidenceProvider(),
       clock: fixedClock("2026-08-28T10:00:30.000Z"),
       supervisor: async () => ({
@@ -596,6 +596,12 @@ function createPhase5Workflow(
     },
     { planner, runbookRoot },
   );
+}
+
+function mockEndpointWithFixtureAuthority() {
+  return new MockEndpointEvidenceProvider({
+    verifyDeviceSignature: (input) => input.deviceId === "device-new-1",
+  });
 }
 
 function overrideFact<Source extends EvidenceSourceV1>(

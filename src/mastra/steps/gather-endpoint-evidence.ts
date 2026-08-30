@@ -17,7 +17,14 @@ export function createGatherEndpointEvidenceStep(
     investigator?: GatherDependencies<"endpoint">["investigator"];
   } = {},
 ) {
-  const provider = dependencies.provider ?? new MockEndpointEvidenceProvider();
+  const provider =
+    dependencies.provider ??
+    new MockEndpointEvidenceProvider({
+      // The default in-process workflow is a fixture harness, not a device
+      // verifier. Making this authority explicit keeps direct provider use
+      // fail-closed while preserving the established mock workflow contract.
+      verifyDeviceSignature: (input) => input.deviceId === "device-new-1",
+    });
   return createGatherEvidenceStep("endpoint", {
     ...dependencies,
     tool:

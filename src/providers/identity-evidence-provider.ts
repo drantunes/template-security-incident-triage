@@ -15,17 +15,37 @@ import {
   type MockProviderOptions,
 } from "./mock-evidence.js";
 import type { IdentityProvider } from "./identity-provider.js";
+import { readDemoEvidenceBaseline } from "../demo/evidence-baseline.js";
+import type { OperationalStore } from "../db/operational-store.js";
 
 export class MockIdentityEvidenceProvider implements IdentityEvidenceProvider {
   readonly source = "identity" as const;
   readonly providerId = "mock-identity";
   readonly calls: SafeProviderCall[] = [];
-  constructor(private readonly options: MockProviderOptions = {}) {}
+  constructor(
+    private readonly options: MockProviderOptions & {
+      openBaselineStore?: () => OperationalStore;
+      /** F9 owns a persisted baseline; corruption must not activate legacy facts. */
+      requireDemoBaseline?: boolean;
+    } = {},
+  ) {}
 
-  inspect(
+  async inspect(
     input: Parameters<IdentityEvidenceProvider["inspect"]>[0],
     options: Parameters<IdentityEvidenceProvider["inspect"]>[1],
   ) {
+    const baseline = await readDemoEvidenceBaseline(
+      this.options.openBaselineStore,
+      input,
+    );
+    if (this.options.requireDemoBaseline && !baseline)
+      return failure(
+        this.providerId,
+        "invalid_response",
+        "INVALID_RESPONSE",
+        false,
+        options.attempt,
+      );
     return executeMockInspection({
       provider: "mock-identity",
       providerRef: "identity",
@@ -36,7 +56,7 @@ export class MockIdentityEvidenceProvider implements IdentityEvidenceProvider {
       ...(this.options.release ? { release: this.options.release } : {}),
       ...(this.options.onStart ? { onStart: this.options.onStart } : {}),
       callLog: this.calls,
-      facts: identityFacts,
+      facts: async (request) => identityFacts(request, baseline),
     });
   }
 }
@@ -255,17 +275,33 @@ function failure(
 
 function identityFacts(
   input: Parameters<IdentityEvidenceProvider["inspect"]>[0],
+  baseline?: Awaited<ReturnType<typeof readDemoEvidenceBaseline>>,
 ): readonly EvidenceFact[] {
   if (input.incidentKind === "unauthorized_privilege_change") {
     return [
-      fact(input.occurredAt, "previous-role", "role.previous", "member"),
-      fact(input.occurredAt, "current-role", "role.current", "admin"),
-      fact(input.occurredAt, "actor", "actor.id", "synthetic-admin-1"),
+      fact(
+        input.occurredAt,
+        "previous-role",
+        "role.previous",
+        baseline?.identity?.previousRole ?? "member",
+      ),
+      fact(
+        input.occurredAt,
+        "current-role",
+        "role.current",
+        baseline?.identity?.currentRole ?? "admin",
+      ),
+      fact(
+        input.occurredAt,
+        "actor",
+        "actor.id",
+        baseline?.identity?.actorId ?? "synthetic-admin-1",
+      ),
       booleanFact(
         input.occurredAt,
         "approved-change",
         "change.approved",
-        false,
+        baseline?.identity?.approved ?? false,
       ),
       ...(input.sessionId
         ? [

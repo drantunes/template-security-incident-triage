@@ -1,4 +1,9 @@
-import type { EvidenceFact } from "../evidence/contracts.js";
+import {
+  EvidenceProviderResultSchema,
+  type EvidenceFact,
+} from "../evidence/contracts.js";
+import { readDemoEvidenceBaseline } from "../demo/evidence-baseline.js";
+import type { OperationalStore } from "../db/operational-store.js";
 import type {
   CloudEvidenceProvider,
   SafeProviderCall,
@@ -12,11 +17,34 @@ export class MockCloudEvidenceProvider implements CloudEvidenceProvider {
   readonly source = "cloud" as const;
   readonly providerId = "mock-cloud";
   readonly calls: SafeProviderCall[] = [];
-  constructor(private readonly options: MockProviderOptions = {}) {}
-  inspect(
+  constructor(
+    private readonly options: MockProviderOptions & {
+      countryByIp?: Readonly<Record<string, "US" | "CA">>;
+      allowedCountry?: "US" | "CA";
+      openBaselineStore?: () => OperationalStore;
+      /** F9 owns a persisted baseline; corruption must not activate legacy facts. */
+      requireDemoBaseline?: boolean;
+    } = {},
+  ) {}
+  async inspect(
     input: Parameters<CloudEvidenceProvider["inspect"]>[0],
     options: Parameters<CloudEvidenceProvider["inspect"]>[1],
   ) {
+    const baseline = await readDemoEvidenceBaseline(
+      this.options.openBaselineStore,
+      input,
+    );
+    if (this.options.requireDemoBaseline && !baseline)
+      return EvidenceProviderResultSchema.parse({
+        status: "invalid_response",
+        provider: this.providerId,
+        error: {
+          code: "INVALID_RESPONSE",
+          retryable: false,
+          safeRef: `provider:cloud:attempt-${options.attempt}`,
+          attempt: options.attempt,
+        },
+      });
     return executeMockInspection({
       provider: "mock-cloud",
       providerRef: "cloud",
@@ -27,11 +55,13 @@ export class MockCloudEvidenceProvider implements CloudEvidenceProvider {
       ...(this.options.release ? { release: this.options.release } : {}),
       ...(this.options.onStart ? { onStart: this.options.onStart } : {}),
       callLog: this.calls,
-      facts: (request) =>
+      facts: async (request) =>
         cloudFacts(
           request.occurredAt,
           request.incidentKind,
-          request.ip !== undefined,
+          request.ip,
+          baseline,
+          this.options,
         ),
     });
   }
@@ -40,14 +70,35 @@ export class MockCloudEvidenceProvider implements CloudEvidenceProvider {
 function cloudFacts(
   observedAt: string,
   kind: string,
-  ipPresent: boolean,
+  ip: string | undefined,
+  baseline: Awaited<ReturnType<typeof readDemoEvidenceBaseline>>,
+  options: Readonly<{
+    countryByIp?: Readonly<Record<string, "US" | "CA">>;
+    allowedCountry?: "US" | "CA";
+  }>,
 ): readonly EvidenceFact[] {
-  const country = kind === "disallowed_country_login" ? "CA" : "US";
+  const country = baseline?.cloud
+    ? ip
+      ? baseline.cloud.countryByIp[ip]
+      : undefined
+    : options.countryByIp
+      ? ip
+        ? options.countryByIp[ip]
+        : undefined
+      : kind === "disallowed_country_login"
+        ? "CA"
+        : "US";
+  const ipPresent = ip !== undefined;
   return [
-    ...(ipPresent
+    ...(ipPresent && country
       ? [fact(observedAt, "observed-country", "login.country", country)]
       : []),
-    fact(observedAt, "allowed-country", "policy.allowedCountry", "US"),
+    fact(
+      observedAt,
+      "allowed-country",
+      "policy.allowedCountry",
+      baseline?.cloud?.allowedCountry ?? options.allowedCountry ?? "US",
+    ),
     ...(kind === "disallowed_country_login"
       ? [
           booleanFact(
@@ -64,7 +115,7 @@ function cloudFacts(
             observedAt,
             "abnormal-session-history",
             "session.abnormalHistory",
-            false,
+            baseline?.cloud?.abnormalHistory ?? false,
           ),
         ]
       : []),
