@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import type { ToolObserve } from "@mastra/core/tools";
 import { Mastra } from "@mastra/core/mastra";
 import {
@@ -43,7 +51,6 @@ import {
   opaqueTraceValue,
   Phase4TraceRedactionProcessor,
 } from "../../src/mastra/observability.js";
-import { mastra as registeredMastra } from "../../src/mastra/index.js";
 import { DeterministicRunbookEmbedder } from "../../src/runbooks/embeddings.js";
 import type { RunbookVectorStore } from "../../src/runbooks/vector-store.js";
 import { makeAlert } from "../fixtures/domain.js";
@@ -53,10 +60,36 @@ import {
 } from "../helpers/temp-libsql.js";
 
 const databases: TempDatabase[] = [];
+let registeredMastra: Mastra;
+let registeredStorage: Readonly<{ close(): Promise<void> }> | undefined;
+let registeredDatabase: TempDatabase | undefined;
+let previousStorageUrl: string | undefined;
 const exportedSpanId = (span: object & { id: string }) =>
   getPhase4ExportSpanId(span) ?? span.id;
+
+beforeAll(async () => {
+  // This integration assertion imports the application singleton only to
+  // inspect its wiring. Configure the singleton before loading it so a test
+  // worker never falls back to file:./mastra.db in the shared workspace.
+  registeredDatabase = await createTempDatabase();
+  previousStorageUrl = process.env.MASTRA_STORAGE_URL;
+  process.env.MASTRA_STORAGE_URL = registeredDatabase.url;
+  ({ mastra: registeredMastra, storage: registeredStorage } =
+    await import("../../src/mastra/index.js"));
+});
+
 afterEach(async () => {
   await Promise.all(databases.splice(0).map((database) => database.cleanup()));
+});
+
+afterAll(async () => {
+  try {
+    await registeredStorage?.close();
+  } finally {
+    await registeredDatabase?.cleanup();
+    if (previousStorageUrl === undefined) delete process.env.MASTRA_STORAGE_URL;
+    else process.env.MASTRA_STORAGE_URL = previousStorageUrl;
+  }
 });
 
 describe("Phase 4 workflow", () => {

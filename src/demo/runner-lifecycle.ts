@@ -136,6 +136,21 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
   let store: ReturnType<typeof createLibSqlOperationalStore> | undefined;
   let vector: LibSqlRunbookVectorStore | undefined;
   let runtime: Mastra | undefined;
+  const closeStore = () => {
+    const current = store;
+    store = undefined;
+    current?.close();
+  };
+  const closeVector = async () => {
+    const current = vector;
+    vector = undefined;
+    await current?.close();
+  };
+  const closeRuntime = async () => {
+    const current = runtime;
+    runtime = undefined;
+    if (current) await shutdownDemoMastra(current);
+  };
   try {
     // Claim the exact database path before any schema or seed write.  An
     // interruption during migration can now be cleaned safely without
@@ -210,8 +225,7 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
     journal = await refreshDatabaseHash(root, journal);
     records.push(record(journal, "seed"));
 
-    await vector.close();
-    vector = undefined;
+    await closeVector();
     const state = mockState(options.scenario, demoRunId);
     const workflow = createDemoWorkflow(databaseUrl, state);
     runtime = new Mastra({
@@ -249,10 +263,7 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
     const webhook = (await response.json()) as { incidentId?: string };
     if (!webhook.incidentId) throw new Error("DEMO_INCIDENT_MISSING");
     await persistScenarioEvidenceBaseline(store, fixture, webhook.incidentId);
-    store.close();
-    // libSQL releases a closed connection on the next turn; without this
-    // boundary its writer can overlap the workflow's first durable marker.
-    await new Promise<void>((done) => setImmediate(done));
+    closeStore();
     const pubsub = new EventEmitterPubSub();
     const workerStore = createLibSqlOperationalStore({ url: databaseUrl });
     const unsubscribe = await startWorkflowWorker({
@@ -282,59 +293,64 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
         options.signal,
       );
     } finally {
+      // Do not reopen the database until the subscriber is gone, its pubsub
+      // queue has drained, its store is closed, and Mastra has released its
+      // own LibSQL storage.  The approval row above is the durable marker for
+      // that async boundary; a scheduling turn or retry would not be one.
       await unsubscribe();
       await pubsub.close();
       workerStore.close();
+      await closeRuntime();
     }
+    // The runtime that executed the workflow is fully stopped before this
+    // fresh reader observes approval/outbox state or snapshots the journal.
     const approvalStore = createLibSqlOperationalStore({ url: databaseUrl });
-    const approval = await waitForApproval(
-      approvalStore,
-      webhook.incidentId,
-      options.timeoutMs,
-      options.signal,
-    );
-    const row = approval;
-    if (
-      !row ||
-      typeof row.id !== "string" ||
-      typeof row.plan_id !== "string" ||
-      typeof row.workflow_run_id !== "string"
-    ) {
+    try {
+      const approval = await waitForApproval(
+        approvalStore,
+        webhook.incidentId,
+        options.timeoutMs,
+        options.signal,
+      );
+      const row = approval;
+      if (
+        !row ||
+        typeof row.id !== "string" ||
+        typeof row.plan_id !== "string" ||
+        typeof row.workflow_run_id !== "string"
+      )
+        throw new Error("DEMO_APPROVAL_MISSING");
+      const outbox = await approvalStore.execute({
+        sql: "SELECT published_at, attempt_count FROM outbox_events WHERE incident_id = ? AND type = 'security.alert.received'",
+        args: [webhook.incidentId],
+      });
+      if (outbox.rows.length !== 1 || !outbox.rows[0]?.published_at)
+        throw new Error("DEMO_OUTBOX_NOT_CONVERGED");
+      journal = await transition(
+        root,
+        journal,
+        "awaiting_approval",
+        journal.resources,
+        {
+          incidentId: webhook.incidentId,
+          workflowRunId: row.workflow_run_id,
+          approvalId: row.id,
+          planId: row.plan_id,
+        },
+      );
+      records.push(
+        record(journal, "trigger"),
+        record(journal, "state"),
+        record(journal, "approval_required"),
+      );
+    } finally {
       approvalStore.close();
-      throw new Error("DEMO_APPROVAL_MISSING");
     }
-    const workflowRunId = row.workflow_run_id;
-    const outbox = await approvalStore.execute({
-      sql: "SELECT published_at, attempt_count FROM outbox_events WHERE incident_id = ? AND type = 'security.alert.received'",
-      args: [webhook.incidentId],
-    });
-    if (outbox.rows.length !== 1 || !outbox.rows[0]?.published_at) {
-      approvalStore.close();
-      throw new Error("DEMO_OUTBOX_NOT_CONVERGED");
-    }
-    journal = await transition(
-      root,
-      journal,
-      "awaiting_approval",
-      journal.resources,
-      {
-        incidentId: webhook.incidentId,
-        workflowRunId,
-        approvalId: row.id,
-        planId: row.plan_id,
-      },
-    );
-    records.push(
-      record(journal, "trigger"),
-      record(journal, "state"),
-      record(journal, "approval_required"),
-    );
-    if (!options.decision) {
-      approvalStore.close();
-      journal = await refreshDatabaseHash(root, journal);
-      return { exitCode: DEMO_EXIT.ok, records, journal };
-    }
-    approvalStore.close();
+    // Hashing and the public result only happen after the last writer is
+    // closed. This preserves a WAL-safe semantic snapshot without relying on
+    // physical SQLite bytes or a timing retry.
+    journal = await refreshDatabaseHash(root, journal);
+    if (!options.decision) return { exitCode: DEMO_EXIT.ok, records, journal };
     return decideMockDemo(
       root,
       journal,
@@ -350,15 +366,18 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
     // Any worker/dispatcher scope above has completed before this catch. Close
     // our remaining setup handles before taking the owned partial snapshot so
     // a normal WAL checkpoint cannot invalidate our own cleanup precondition.
+    const hadStore = store !== undefined;
     try {
-      store?.close();
+      closeStore();
     } catch {
       /* closed by the webhook path */
     }
+    await closeVector();
+    await closeRuntime();
     // Once the exclusive reservation succeeded, snapshot the exact owned DB
-    // before recording a partial state.  If reservation itself failed `store`
-    // is absent and the pending claim remains intentionally uncleanable.
-    if (store) {
+    // only after every writer/runtime has stopped. If reservation itself
+    // failed, the pending claim remains intentionally uncleanable.
+    if (hadStore) {
       try {
         journal = await refreshDatabaseHash(root, journal);
       } catch {
@@ -366,9 +385,6 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
         // available; cleanup will then fail closed rather than guess.
       }
     }
-    await vector?.close();
-    vector = undefined;
-    if (runtime) await shutdownDemoMastra(runtime);
     journal = await transition(
       root,
       journal,
@@ -386,11 +402,11 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
     };
   } finally {
     try {
-      store?.close();
+      closeStore();
     } catch {
       /* the webhook store may already be closed */
     }
-    await vector?.close();
-    if (runtime) await shutdownDemoMastra(runtime);
+    await closeVector();
+    await closeRuntime();
   }
 }
