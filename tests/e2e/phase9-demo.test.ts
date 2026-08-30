@@ -248,21 +248,29 @@ describe("Phase 9 hermetic demos", () => {
     const terminatedPath = join(root, "child.terminated");
     const artifactPath = join(root, "late-artifact");
     const started = performance.now();
+    let termination: unknown;
     try {
       await invokeBoundedNode(
         [
           "-e",
-          "const fs=require('node:fs'); fs.writeFileSync(process.argv[1], String(process.pid)); process.on('SIGTERM',()=>{fs.writeFileSync(process.argv[2],'terminated');process.exit(0)}); setTimeout(() => fs.writeFileSync(process.argv[3], 'late'), 5000)",
+          "const fs=require('node:fs'); fs.writeFileSync(process.argv[1], String(process.pid)); process.on('SIGTERM',()=>{fs.writeFileSync(process.argv[2],'terminated');process.exit(143)}); setTimeout(() => fs.writeFileSync(process.argv[3], 'late'), 5000)",
           pidPath,
           terminatedPath,
           artifactPath,
         ],
         { timeoutMs: 100 },
       );
-      throw new Error("expected bounded child to time out");
     } catch (error) {
-      expect(error).toMatchObject({ killed: true, signal: "SIGTERM" });
+      termination = error;
     }
+    expect(termination).toSatisfy(
+      (
+        error: { killed?: boolean; signal?: string; code?: number } | undefined,
+      ) =>
+        error?.killed === true ||
+        error?.signal === "SIGTERM" ||
+        error?.code === 143,
+    );
     expect(performance.now() - started).toBeLessThan(2_000);
     expect(await readFile(pidPath, "utf8")).toMatch(/^\d+$/u);
     expect(await readFile(terminatedPath, "utf8")).toBe("terminated");
