@@ -32,13 +32,17 @@ jobs:
       # dataset fails closed. Neither branch is treated as a skipped replay.
       - name: Verify Phase 10 gate and deterministic approved report
         id: phase10
+        shell: bash
         run: |
-          npm run phase10:ci | tee phase10-ci.log
-          echo "approved=$(sed -n 's/^phase10-approved=//p' phase10-ci.log)" >> "$GITHUB_OUTPUT"
+          set -o pipefail
+          phase10_log="$RUNNER_TEMP/phase10-ci.log"
+          npm run phase10:ci 2>&1 | tee "$phase10_log"
+          grep -Fx "phase10-approved=true" "$phase10_log"
+          echo "approved=true" >> "$GITHUB_OUTPUT"
       - name: DuckDB Node 22 smoke
         run: npm test -- tests/integration/phase10-analytics.test.ts
       - name: Upload approved Phase 10 report
-        if: steps.phase10.outputs.approved == 'true'
+        if: ${{ success() && steps.phase10.outputs.approved == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: phase10-sanitized-report
