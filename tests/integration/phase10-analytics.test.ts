@@ -218,7 +218,7 @@ describe("phase 10 DuckDB read model", () => {
     await store.close();
   });
 
-  it("uses latest provider state and records blocked guardrail reasons", async () => {
+  it("uses every authoritative provider failure state and records blocked guardrail reasons", async () => {
     root = await mkdtemp(join(tmpdir(), "phase10-analytics-"));
     const store = new DuckDbAnalyticsStore(join(root, "analytics.duckdb"));
     const record = (
@@ -246,8 +246,8 @@ describe("phase 10 DuckDB read model", () => {
         "provider_deliveries",
         "delivery-a",
         "ticket",
-        "failed",
-        "1:failed",
+        "retry",
+        "1:retry",
       ),
       record(
         2,
@@ -262,11 +262,27 @@ describe("phase 10 DuckDB read model", () => {
         "provider_deliveries",
         "delivery-b",
         "chat",
-        "failed",
-        "1:failed",
+        "retry",
+        "1:retry",
       ),
       record(
         4,
+        "provider_deliveries",
+        "delivery-c",
+        "chat",
+        "exhausted",
+        "1:exhausted",
+      ),
+      record(
+        5,
+        "provider_deliveries",
+        "delivery-d",
+        "chat",
+        "uncertain",
+        "1:uncertain",
+      ),
+      record(
+        6,
         "timeline_events",
         "guardrail-a",
         "guardrail.plan_attempt",
@@ -274,7 +290,7 @@ describe("phase 10 DuckDB read model", () => {
         "1",
       ),
       record(
-        5,
+        7,
         "timeline_events",
         "guardrail-b",
         "guardrail.plan_attempt",
@@ -289,11 +305,122 @@ describe("phase 10 DuckDB read model", () => {
     };
     await expect(
       store.queryMetric({ ...window, metric: "provider_failure_rate" }),
-    ).resolves.toEqual({ sampleCount: 2, value: 0.5 });
+    ).resolves.toEqual({ sampleCount: 4, value: 0.75 });
     await expect(
       store.queryMetric({ ...window, metric: "guardrail_block_rate" }),
     ).resolves.toEqual({ sampleCount: 2, value: 0.5 });
     await store.close();
+  });
+
+  it("pairs every approval request with its own authoritative terminal decision", async () => {
+    root = await mkdtemp(join(tmpdir(), "phase10-analytics-"));
+    const store = new DuckDbAnalyticsStore(join(root, "analytics.duckdb"));
+    const approval = (
+      sequence: number,
+      sourceId: string,
+      status: "pending" | "approved" | "rejected" | "expired",
+      occurredAt: string,
+    ) => ({
+      sequence,
+      source: "approvals" as const,
+      sourceId,
+      sourceVersion: `${sequence}:${status}`,
+      tenantId: "tenant-a",
+      incidentId: "incident-a",
+      occurredAt,
+      category: "approval",
+      status,
+      checksum: String(sequence).padStart(64, "0"),
+    });
+    const window = {
+      tenantId: "tenant-a",
+      from: "2026-08-30T00:00:00.000Z",
+      to: "2026-08-31T00:00:00.000Z",
+    };
+    await store.ingestBatch([
+      approval(1, "approval-1", "pending", "2026-08-30T00:00:00.000Z"),
+      approval(2, "approval-1", "approved", "2026-08-30T00:00:01.000Z"),
+      approval(3, "approval-2", "pending", "2026-08-30T00:00:00.000Z"),
+      approval(4, "approval-2", "rejected", "2026-08-30T00:00:03.000Z"),
+    ]);
+    await expect(
+      store.queryMetric({ ...window, metric: "approval_latency" }),
+    ).resolves.toEqual({
+      sampleCount: 2,
+      value: 2000,
+      distribution: { p50: 2000, p95: 2900, max: 3000 },
+    });
+
+    await store.ingestBatch([
+      approval(5, "approval-3", "pending", "2026-08-30T00:00:00.000Z"),
+      approval(6, "approval-3", "expired", "2026-08-30T00:00:05.000Z"),
+    ]);
+    await expect(
+      store.queryMetric({ ...window, metric: "approval_latency" }),
+    ).resolves.toEqual({
+      sampleCount: 3,
+      value: 3000,
+      distribution: { p50: 3000, p95: 4800, max: 5000 },
+    });
+    await store.close();
+  });
+
+  it("validates tenant and canonical UTC ranges before querying either an empty or populated store", async () => {
+    root = await mkdtemp(join(tmpdir(), "phase10-analytics-"));
+    const empty = new DuckDbAnalyticsStore(join(root, "empty.duckdb"));
+    const populated = new DuckDbAnalyticsStore(join(root, "populated.duckdb"));
+    await populated.ingestBatch([
+      {
+        sequence: 1,
+        source: "timeline_events" as const,
+        sourceId: "at-from",
+        sourceVersion: "1",
+        tenantId: "tenant-a",
+        incidentId: "incident-a",
+        occurredAt: "2026-08-30T00:00:00.000Z",
+        category: "trace.boundary",
+        status: "present",
+        checksum: "a".repeat(64),
+      },
+      {
+        sequence: 2,
+        source: "timeline_events" as const,
+        sourceId: "at-to",
+        sourceVersion: "2",
+        tenantId: "tenant-a",
+        incidentId: "incident-a",
+        occurredAt: "2026-08-31T00:00:00.000Z",
+        category: "trace.boundary",
+        status: "present",
+        checksum: "b".repeat(64),
+      },
+    ]);
+    const valid = {
+      metric: "audit_trace_completeness" as const,
+      tenantId: "tenant-a",
+      from: "2026-08-30T00:00:00.000Z",
+      to: "2026-08-31T00:00:00.000Z",
+    };
+    await expect(populated.queryMetric(valid)).resolves.toEqual({
+      sampleCount: 1,
+      value: 1,
+    });
+    const invalid = [
+      [{ ...valid, tenantId: "" }, "PHASE10_ANALYTICS_TENANT_INVALID"],
+      [{ ...valid, tenantId: "  " }, "PHASE10_ANALYTICS_TENANT_INVALID"],
+      [{ ...valid, from: "not-a-date" }, "PHASE10_ANALYTICS_TIMESTAMP_INVALID"],
+      [
+        { ...valid, to: "2026-08-31T00:00:00.000+00:00" },
+        "PHASE10_ANALYTICS_TIMESTAMP_INVALID",
+      ],
+      [{ ...valid, to: valid.from }, "PHASE10_ANALYTICS_RANGE_INVALID"],
+      [{ ...valid, from: valid.to }, "PHASE10_ANALYTICS_RANGE_INVALID"],
+    ] as const;
+    for (const [query, code] of invalid)
+      for (const store of [empty, populated])
+        await expect(store.queryMetric(query)).rejects.toThrow(code);
+    await empty.close();
+    await populated.close();
   });
 
   it("rejects a missing domain receive clock and counts every required trace boundary", async () => {

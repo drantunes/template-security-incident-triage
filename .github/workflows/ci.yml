@@ -24,9 +24,8 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm run audit
-      # The dataset remains pending until Diego accepts the independently
-      # reviewed hashes.  CI proves the fail-closed boundary without turning it
-      # into a skip or accidentally observing a replay.
+      # An approved dataset produces the deterministic report twice; a pending
+      # dataset fails closed. Neither branch is treated as a skipped replay.
       - name: Verify Phase 10 gate and deterministic approved report
         id: phase10
         run: |

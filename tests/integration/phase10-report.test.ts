@@ -199,8 +199,8 @@ describe("Phase 10 approved report pipeline", () => {
       );
       expect(report.envelope).toMatchObject({
         provenance: {
-          commitSha: "20c508e7159f8a2b49d6dc41591445dd7487e90d",
-          worktree: { dirty: true, statusSha256: expect.any(String) },
+          commitSha: (await exec("git", ["rev-parse", "HEAD"])).stdout.trim(),
+          worktree: { dirty: false, statusSha256: expect.any(String) },
         },
         runtime: {
           node: expect.stringMatching(/^v\d+/u),
@@ -470,6 +470,67 @@ describe("Phase 10 approved report pipeline", () => {
       expect((combined as { stderr: string }).stderr).toContain(
         "PHASE10_THRESHOLD_FAILED",
       );
+
+      // Dataset provenance remains the immutable authoring snapshot, while
+      // the report records the actual checked-out descendant. An unrelated
+      // origin and a dirty checkout must both fail before replay/output.
+      const approvedManifest = await readFile(manifestPath, "utf8");
+      const unrelated = JSON.parse(approvedManifest);
+      unrelated.provenance.originCommit = "f".repeat(40);
+      unrelated.hashes.manifest = sha256Canonical({
+        ...unrelated,
+        hashes: {
+          inputs: unrelated.hashes.inputs,
+          expected: unrelated.hashes.expected,
+        },
+      });
+      await writeFile(manifestPath, `${JSON.stringify(unrelated)}\n`, "utf8");
+      await expect(
+        exec(
+          process.execPath,
+          [
+            "--import",
+            "tsx",
+            "scripts/phase10-report.mts",
+            "--dataset-root",
+            copiedDataset,
+            "--output",
+            join(root, "unrelated-origin"),
+          ],
+          { timeout: 60_000 },
+        ),
+      ).rejects.toMatchObject({
+        code: 3,
+        stderr: expect.stringContaining("PHASE10_WORKTREE_COMMIT_MISMATCH"),
+      });
+      await writeFile(manifestPath, approvedManifest, "utf8");
+
+      const dirtyWorktree = await mkdtemp(
+        join(process.cwd(), "phase10-report-dirty-"),
+      );
+      try {
+        await writeFile(join(dirtyWorktree, "marker"), "test\n", "utf8");
+        await expect(
+          exec(
+            process.execPath,
+            [
+              "--import",
+              "tsx",
+              "scripts/phase10-report.mts",
+              "--dataset-root",
+              copiedDataset,
+              "--output",
+              join(root, "dirty-worktree"),
+            ],
+            { timeout: 60_000 },
+          ),
+        ).rejects.toMatchObject({
+          code: 3,
+          stderr: expect.stringContaining("PHASE10_WORKTREE_DIRTY"),
+        });
+      } finally {
+        await rm(dirtyWorktree, { recursive: true, force: true });
+      }
 
       // A schema-valid JSON document with incomplete approval fields is a
       // manifest integrity failure, never report infrastructure.

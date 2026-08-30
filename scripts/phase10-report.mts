@@ -116,7 +116,11 @@ function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-/** Reads the checked-out provenance rather than stamping fixture constants. */
+/**
+ * Captures the immutable evaluated snapshot rather than stamping fixture
+ * constants. `originCommit` identifies the dataset's source snapshot; the
+ * envelope identifies the exact descendant commit that was actually run.
+ */
 async function reportEnvelope(manifest: Phase10Manifest) {
   const [packageJsonBytes, lockfileBytes, git] = await Promise.all([
     readFile(resolve(process.cwd(), "package.json")),
@@ -149,8 +153,23 @@ async function reportEnvelope(manifest: Phase10Manifest) {
     cwd: process.cwd(),
   });
   const commitSha = head.stdout.trim();
-  if (commitSha !== manifest.provenance.originCommit)
+  if (git.stdout.length) fail(exitCodes.integrity, "PHASE10_WORKTREE_DIRTY");
+  try {
+    await exec(
+      "git",
+      [
+        "merge-base",
+        "--is-ancestor",
+        manifest.provenance.originCommit,
+        commitSha,
+      ],
+      { cwd: process.cwd() },
+    );
+  } catch {
+    // The dataset can only be replayed from its recorded origin or a later
+    // reachable commit. A sibling/unrelated ref must never inherit approval.
     fail(exitCodes.integrity, "PHASE10_WORKTREE_COMMIT_MISMATCH");
+  }
   return {
     schema: { id: "phase10-report", version: 2 },
     provenance: {
@@ -190,6 +209,15 @@ async function reportEnvelope(manifest: Phase10Manifest) {
       clock: manifest.clock,
     },
   };
+}
+
+async function assertReportEnvelopeStillCurrent(
+  manifest: Phase10Manifest,
+  captured: Awaited<ReturnType<typeof reportEnvelope>>,
+): Promise<void> {
+  const current = await reportEnvelope(manifest);
+  if (canonicalJson(current) !== canonicalJson(captured))
+    fail(exitCodes.integrity, "PHASE10_WORKTREE_PROVENANCE_CHANGED");
 }
 
 /** Markdown is a deterministic rendering of the canonical JSON payload only. */
@@ -291,6 +319,10 @@ async function main(): Promise<void> {
     );
     // Do not even read observed output until Diego has accepted this reconstructed manifest.
     assertApprovedForObservedRun(loaded.manifest);
+    // Validate the checkout before doing any replay. This makes a dirty or
+    // unrelated ref an integrity failure rather than a report that happens to
+    // carry a misleading worktree status.
+    const envelope = await reportEnvelope(loaded.manifest);
     const observed = testObservedMutation(replayPhase10Offline(loaded.inputs));
     const [analyticsResult, e2eResult] = await Promise.allSettled([
       exerciseOfflineReadModel(
@@ -323,7 +355,7 @@ async function main(): Promise<void> {
       format: "phase10-report-v2",
       mode: "offline-replay",
       generatedFromFixedClock: loaded.manifest.clock,
-      envelope: await reportEnvelope(loaded.manifest),
+      envelope,
       dataset: {
         version: loaded.manifest.datasetVersion,
         hashes: loaded.manifest.hashes,
@@ -371,6 +403,7 @@ async function main(): Promise<void> {
     };
     // Generate and reopen the exact output bytes in a private staging area.
     // A scan failure never publishes those bytes to the requested report path.
+    await assertReportEnvelopeStillCurrent(loaded.manifest, envelope);
     const stage = await mkdtemp(join(tmpdir(), "phase10-report-stage-"));
     // This is deliberately an output-writer fault, not a scanner fixture: it
     // proves the terminal gate reopens and rejects the bytes it would publish.

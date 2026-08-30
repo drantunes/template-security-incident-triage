@@ -214,8 +214,7 @@ export class DuckDbAnalyticsStore implements AnalyticsStore {
       scenario?: string;
     }>,
   ): Promise<AnalyticsMetricResult> {
-    if (input.from >= input.to)
-      throw new Error("PHASE10_ANALYTICS_RANGE_INVALID");
+    validateMetricQueryInput(input);
     await this.migrate();
     const metric = metricQuery(input.metric);
     // Scenario is projected from the immutable journal snapshot.  It is never
@@ -367,6 +366,37 @@ function combineChecksum(previous: string, next: string): string {
   return createHash("sha256").update(`${previous}:${next}`).digest("hex");
 }
 
+/**
+ * Query boundaries are an API contract, not an incidental DuckDB cast. Validate
+ * them before opening the derived database so an invalid request has the same
+ * fail-closed result whether the read model is empty, populated, or unavailable.
+ */
+function validateMetricQueryInput(
+  input: Readonly<{
+    tenantId: string;
+    from: string;
+    to: string;
+  }>,
+): void {
+  if (typeof input.tenantId !== "string" || !input.tenantId.trim())
+    throw new Error("PHASE10_ANALYTICS_TENANT_INVALID");
+  const from = parseCanonicalUtcTimestamp(input.from);
+  const to = parseCanonicalUtcTimestamp(input.to);
+  if (from >= to) throw new Error("PHASE10_ANALYTICS_RANGE_INVALID");
+}
+
+function parseCanonicalUtcTimestamp(value: string): number {
+  if (
+    typeof value !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value)
+  )
+    throw new Error("PHASE10_ANALYTICS_TIMESTAMP_INVALID");
+  const instant = Date.parse(value);
+  if (!Number.isFinite(instant) || new Date(instant).toISOString() !== value)
+    throw new Error("PHASE10_ANALYTICS_TIMESTAMP_INVALID");
+  return instant;
+}
+
 function metricQuery(metric: AnalyticsMetricId): Readonly<{ sql: string }> {
   const ranged =
     "tenant_id = $1 AND occurred_at >= $2::TIMESTAMPTZ AND occurred_at < $3::TIMESTAMPTZ AND ($4 IS NULL OR scenario = $4)";
@@ -382,8 +412,10 @@ function metricQuery(metric: AnalyticsMetricId): Readonly<{ sql: string }> {
     case "provider_failure_rate":
       return {
         // Each delivery is a retryable producer. Its latest exported state is
-        // one denominator unit, never every intermediate retry snapshot.
-        sql: `SELECT count(*) AS sample_count, AVG(CASE WHEN status IN ('failed','error') THEN 1 ELSE 0 END) AS value FROM (SELECT * EXCLUDE (row_number) FROM (SELECT *, row_number() OVER (PARTITION BY source, source_id ORDER BY sequence DESC) AS row_number FROM analytics_facts WHERE ${ranged} AND source='provider_deliveries') WHERE row_number=1)`,
+        // one denominator unit, never every intermediate retry snapshot. The
+        // durable delivery contract has no failed/error terminal state:
+        // retry, exhausted and uncertain are its real failed outcomes.
+        sql: `SELECT count(*) AS sample_count, AVG(CASE WHEN status IN ('retry','exhausted','uncertain') THEN 1 ELSE 0 END) AS value FROM (SELECT * EXCLUDE (row_number) FROM (SELECT *, row_number() OVER (PARTITION BY source, source_id ORDER BY sequence DESC) AS row_number FROM analytics_facts WHERE ${ranged} AND source='provider_deliveries') WHERE row_number=1)`,
       };
     case "escalation_accuracy":
       return {
@@ -391,7 +423,10 @@ function metricQuery(metric: AnalyticsMetricId): Readonly<{ sql: string }> {
       };
     case "approval_latency":
       return {
-        sql: `SELECT count(*) AS sample_count, AVG(latency_ms) AS value, quantile_cont(latency_ms, .5) AS p50, quantile_cont(latency_ms, .95) AS p95, max(latency_ms) AS max FROM (SELECT incident_id, date_diff('millisecond', MIN(CASE WHEN status='pending' THEN occurred_at END), MIN(CASE WHEN status IN ('approved','rejected','expired') THEN occurred_at END)) AS latency_ms FROM analytics_facts WHERE ${ranged} AND source='approvals' GROUP BY incident_id HAVING latency_ms IS NOT NULL)`,
+        // approval source IDs are durable request IDs. An incident can have
+        // more than one approval lifecycle, so grouping by incident would
+        // silently discard requests and pair unrelated decisions.
+        sql: `SELECT count(*) AS sample_count, AVG(latency_ms) AS value, quantile_cont(latency_ms, .5) AS p50, quantile_cont(latency_ms, .95) AS p95, max(latency_ms) AS max FROM (SELECT source_id, date_diff('millisecond', MIN(CASE WHEN status='pending' THEN occurred_at END), MIN(CASE WHEN status IN ('approved','rejected','expired') THEN occurred_at END)) AS latency_ms FROM analytics_facts WHERE ${ranged} AND source='approvals' GROUP BY source_id HAVING latency_ms IS NOT NULL)`,
       };
     case "guardrail_block_rate":
       return {
