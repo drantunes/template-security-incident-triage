@@ -405,7 +405,10 @@ describe("phase 10 DuckDB read model", () => {
       sampleCount: 1,
       value: 1,
     });
+    const missingTenant = { ...valid } as Partial<typeof valid>;
+    delete missingTenant.tenantId;
     const invalid = [
+      [missingTenant as typeof valid, "PHASE10_ANALYTICS_TENANT_INVALID"],
       [{ ...valid, tenantId: "" }, "PHASE10_ANALYTICS_TENANT_INVALID"],
       [{ ...valid, tenantId: "  " }, "PHASE10_ANALYTICS_TENANT_INVALID"],
       [{ ...valid, from: "not-a-date" }, "PHASE10_ANALYTICS_TIMESTAMP_INVALID"],
