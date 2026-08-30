@@ -15,6 +15,11 @@ export type AnalyticsRecord = Readonly<{
   scenario?: "privilege" | "country" | "device";
   /** Digest of the immutable, sanitised journal snapshot. */
   checksum: string;
+  /**
+   * An authenticated journal entry that deliberately advances the global
+   * cursor without becoming a metric fact. Its source timestamp is unknown.
+   */
+  withheld?: Readonly<{ reason: "PROVIDER_OBSERVED_AT_UNKNOWN" }>;
 }>;
 
 export const analyticsMetricIds = [

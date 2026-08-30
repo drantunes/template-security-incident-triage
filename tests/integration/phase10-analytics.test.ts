@@ -104,6 +104,61 @@ describe("phase 10 DuckDB read model", () => {
     await store.close();
   });
 
+  it("advances the global cursor through audited withheld journal entries", async () => {
+    root = await mkdtemp(join(tmpdir(), "phase10-analytics-"));
+    const store = new DuckDbAnalyticsStore(join(root, "analytics.duckdb"));
+    const withheld = {
+      sequence: 1,
+      source: "provider_deliveries" as const,
+      sourceId: "legacy-provider",
+      sourceVersion: "1:retry@1",
+      tenantId: "tenant-a",
+      incidentId: "incident-a",
+      occurredAt: "1970-01-01T00:00:00.000Z",
+      category: "ticket",
+      status: "retry",
+      checksum: "1".repeat(64),
+      withheld: { reason: "PROVIDER_OBSERVED_AT_UNKNOWN" as const },
+    };
+    const approval = {
+      sequence: 2,
+      source: "approvals" as const,
+      sourceId: "approval-a",
+      sourceVersion: "pending@2",
+      tenantId: "tenant-a",
+      incidentId: "incident-a",
+      occurredAt: "2026-08-30T00:00:00.000Z",
+      category: "approval",
+      status: "pending",
+      checksum: "2".repeat(64),
+    };
+    await store.ingestBatch([withheld, approval]);
+    expect(await store.readCursor("provider_deliveries")).toBe(1);
+    expect(await store.readCursor("approvals")).toBe(2);
+    expect(await store.readWithheldRows()).toEqual([
+      expect.objectContaining({
+        sequence: 1n,
+        reason: "PROVIDER_OBSERVED_AT_UNKNOWN",
+      }),
+    ]);
+    expect(await store.readFactRows()).toHaveLength(1);
+    await store.rebuild([withheld, approval]);
+    await expect(
+      store.queryMetric({
+        metric: "provider_failure_rate",
+        tenantId: "tenant-a",
+        from: "2026-08-30T00:00:00.000Z",
+        to: "2026-08-31T00:00:00.000Z",
+      }),
+    ).resolves.toEqual({ sampleCount: 0, value: null, reason: "NO_DATA" });
+    const gap = new DuckDbAnalyticsStore(join(root, "gap.duckdb"));
+    await expect(
+      gap.ingestBatch([{ ...approval, sequence: 3 }]),
+    ).rejects.toThrow("CURSOR_GAP");
+    await gap.close();
+    await store.close();
+  });
+
   it("exports the immutable journal snapshot rather than a mutable source", async () => {
     const database = await createTempDatabase();
     databases.push(database);
@@ -584,12 +639,12 @@ describe("phase 10 DuckDB read model", () => {
             break;
           case "cursor":
             await connection.run(
-              "UPDATE ingest_cursors SET schema_version=2 WHERE source='approvals'",
+              "UPDATE ingest_cursors SET schema_version=1 WHERE source='approvals'",
             );
             break;
           case "state":
             await connection.run(
-              "UPDATE analytics_ingest_state SET schema_version=2 WHERE id=1",
+              "UPDATE analytics_ingest_state SET schema_version=1 WHERE id=1",
             );
             break;
         }
@@ -612,8 +667,8 @@ describe("phase 10 DuckDB read model", () => {
           case "version":
             await repairConnection.run("DELETE FROM analytics_schema_versions");
             await repairConnection.run(
-              "INSERT INTO analytics_schema_versions VALUES (1, $1, '2026-08-30T00:00:00.000Z')",
-              [analyticsSchemaChecksum],
+              "INSERT INTO analytics_schema_versions VALUES ($1, $2, '2026-08-30T00:00:00.000Z')",
+              [analyticsSchemaVersion, analyticsSchemaChecksum],
             );
             break;
           case "checksum":

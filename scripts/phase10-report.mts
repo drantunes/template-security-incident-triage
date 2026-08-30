@@ -40,6 +40,7 @@ import {
 } from "../src/mastra/evals/scorers.js";
 import { runPhase10MastraScorersDetailed } from "../src/mastra/evals/mastra-scorers.js";
 import { replayPhase10Offline } from "../src/mastra/evals/offline-replay.js";
+import { phase10ReportWindow } from "../src/mastra/evals/report-window.js";
 import { readPhase10Authority } from "../src/mastra/evals/authority-store.js";
 import { seedPhase10AuthorityFromInputs } from "../src/mastra/evals/authority-seed.js";
 import {
@@ -95,12 +96,19 @@ function captureRedactionSurface(
   name: string,
   value: unknown,
 ): RedactionSurface {
-  if (process.env.PHASE10_TEST_REDACTION_LEAK_SURFACE !== name)
-    return { name, value };
+  if (!redactionFaultSurfaces().has(name)) return { name, value };
   return {
     name,
     value: { captured: value, testFault: redactionCanaries[0] },
   };
+}
+
+function redactionFaultSurfaces(): ReadonlySet<string> {
+  return new Set(
+    (process.env.PHASE10_TEST_REDACTION_LEAK_SURFACE ?? "")
+      .split(",")
+      .filter(Boolean),
+  );
 }
 
 const reportDependencies = [
@@ -406,14 +414,12 @@ async function main(): Promise<void> {
     const stage = await mkdtemp(join(tmpdir(), "phase10-report-stage-"));
     // This is deliberately an output-writer fault, not a scanner fixture: it
     // proves the terminal gate reopens and rejects the bytes it would publish.
-    const reportJsonFault =
-      process.env.PHASE10_TEST_REDACTION_LEAK_SURFACE === "report.json"
-        ? { redactionFault: redactionCanaries[0] }
-        : {};
-    const reportMarkdownFault =
-      process.env.PHASE10_TEST_REDACTION_LEAK_SURFACE === "report.md"
-        ? `\n${redactionCanaries[0]}\n`
-        : "";
+    const reportJsonFault = redactionFaultSurfaces().has("report.json")
+      ? { redactionFault: redactionCanaries[0] }
+      : {};
+    const reportMarkdownFault = redactionFaultSurfaces().has("report.md")
+      ? `\n${redactionCanaries[0]}\n`
+      : "";
     const stagedJson = `${canonicalJson({ ...draft, ...reportJsonFault })}\n`;
     const stagedMarkdown = `${markdownFromCanonicalJson(stagedJson)}${reportMarkdownFault}`;
     try {
@@ -1074,13 +1080,11 @@ function metricBreakdowns(
 
 /** The B1 report always evaluates the declared UTC day [clock, clock + 24h). */
 function reportWindow(clock: string): Readonly<{ from: string; to: string }> {
-  const fromMs = Date.parse(clock);
-  if (!Number.isFinite(fromMs))
+  try {
+    return phase10ReportWindow(clock);
+  } catch {
     fail(exitCodes.integrity, "PHASE10_MANIFEST_CLOCK_INVALID");
-  return Object.freeze({
-    from: new Date(fromMs).toISOString(),
-    to: new Date(fromMs + 24 * 60 * 60 * 1_000).toISOString(),
-  });
+  }
 }
 
 function countsBy(
@@ -1551,6 +1555,7 @@ async function exerciseOfflineReadModel(
     const full = await exportAllAnalytics(store);
     await analytics.rebuild(full);
     const metrics = [];
+    const window = reportWindow(recordedAt);
     // DuckDB intentionally permits one writer/connection only.  Keep metric
     // reads serialized as well so a freshly rebuilt local store never races
     // its own lazy-open lock.
@@ -1559,8 +1564,7 @@ async function exerciseOfflineReadModel(
         await analytics.queryMetric({
           metric,
           tenantId: inputs[0]!.fixture.tenantAlias,
-          from: recordedAt,
-          to: "2026-08-31T00:00:00.000Z",
+          ...window,
         }),
       );
     const evalRows = await store.execute({

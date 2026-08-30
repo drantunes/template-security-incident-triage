@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { sha256Canonical } from "../../src/mastra/evals/dataset-contract.js";
+import { phase10ReportWindow } from "../../src/mastra/evals/report-window.js";
 
 const exec = promisify(execFile);
 const fixedClock = "2026-08-30T00:00:00.000Z";
@@ -93,7 +94,12 @@ describe("Phase 10 approved report pipeline", () => {
     );
     expect(report).toContain("const window = reportWindow(clock)");
     expect(report).not.toContain('from: "2026-08-30T00:00:00.000Z"');
+    expect(report).not.toContain('to: "2026-08-31T00:00:00.000Z"');
     expect(migration).not.toContain("strftime");
+    expect(phase10ReportWindow("2031-12-31T12:34:56.789Z")).toEqual({
+      from: "2031-12-31T12:34:56.789Z",
+      to: "2032-01-01T12:34:56.789Z",
+    });
   });
 
   it("returns structured argument failures before dataset or report work", async () => {
@@ -422,9 +428,10 @@ describe("Phase 10 approved report pipeline", () => {
         ),
         code: 6,
       });
-      // Each fault is injected by the corresponding concrete capture path;
-      // no assertion passes a hand-built scanner surface.
-      for (const surface of [
+      // All concrete capture paths are injected in one real report execution.
+      // The scanner receives each sink; this avoids repeating 13 full E2Es in
+      // one test while retaining every production capture boundary.
+      const redactionSurfaces = [
         "captured-logs:privilege",
         "trace-public-api:privilege",
         "timeline-rows:privilege",
@@ -438,31 +445,31 @@ describe("Phase 10 approved report pipeline", () => {
         "official-score-ledger",
         "report.json",
         "report.md",
-      ])
-        await expect(
-          exec(
-            process.execPath,
-            [
-              "--import",
-              "tsx",
-              "scripts/phase10-report.mts",
-              "--dataset-root",
-              copiedDataset,
-              "--output",
-              join(root, `leaked-${surface.replaceAll(":", "-")}`),
-            ],
-            {
-              timeout: 60_000,
-              env: {
-                ...process.env,
-                PHASE10_TEST_REDACTION_LEAK_SURFACE: surface,
-              },
+      ];
+      await expect(
+        exec(
+          process.execPath,
+          [
+            "--import",
+            "tsx",
+            "scripts/phase10-report.mts",
+            "--dataset-root",
+            copiedDataset,
+            "--output",
+            join(root, "leaked-all-surfaces"),
+          ],
+          {
+            timeout: 60_000,
+            env: {
+              ...process.env,
+              PHASE10_TEST_REDACTION_LEAK_SURFACE: redactionSurfaces.join(","),
             },
-          ),
-        ).rejects.toMatchObject({
-          stderr: expect.stringContaining("PHASE10_REDACTION_LEAK"),
-          code: 6,
-        });
+          },
+        ),
+      ).rejects.toMatchObject({
+        stderr: expect.stringContaining("PHASE10_REDACTION_LEAK"),
+        code: 6,
+      });
 
       // Train/dev observations remain ledger evidence but cannot influence the
       // frozen test-only macro-F1 gate.

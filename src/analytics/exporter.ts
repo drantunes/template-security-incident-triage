@@ -68,14 +68,15 @@ export async function exportAnalyticsSince(
         throw new Error("PHASE10_ANALYTICS_SNAPSHOT_INVALID");
       if (!row.occurred_at || !row.category)
         throw new Error("PHASE10_ANALYTICS_SOURCE_INVALID");
-      // Version 9 could only reconstruct a provider terminal timestamp as the
-      // explicit 1970 sentinel. Keep that immutable journal row for audit, but
-      // never promote it into an authoritative metric sample.
-      if (
+      // Provider journal entries predating migration 0014 have no observed
+      // timestamp authority: 0009 used either a scheduler time or a sentinel.
+      // Preserve their signed sequence as a tombstone so consumers advance the
+      // global cursor without turning either value into a metric sample.
+      const withheld =
         event.source === "provider_deliveries" &&
-        row.occurred_at === "1970-01-01T00:00:00.000Z"
-      )
-        continue;
+        !event.source_version.endsWith(":observed-v2")
+          ? { reason: "PROVIDER_OBSERVED_AT_UNKNOWN" as const }
+          : undefined;
       output.push({
         sequence: event.sequence,
         source: event.source,
@@ -94,6 +95,7 @@ export async function exportAnalyticsSince(
         checksum: createHash("sha256")
           .update(event.snapshot_json, "utf8")
           .digest("hex"),
+        ...(withheld ? { withheld } : {}),
       });
       if (output.length === limit) return Object.freeze(output);
     }

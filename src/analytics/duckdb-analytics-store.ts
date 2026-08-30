@@ -136,6 +136,54 @@ export class DuckDbAnalyticsStore implements AnalyticsStore {
           !Number.isFinite(Date.parse(row.occurredAt))
         )
           throw new Error("PHASE10_ANALYTICS_RECORD_INVALID");
+        if (row.withheld) {
+          const existing = await connection.run(
+            `SELECT source,source_id,source_version,reason,checksum
+             FROM analytics_withheld_events WHERE sequence=$1`,
+            [row.sequence],
+          );
+          const existingRows = await existing.getRowObjectsJS();
+          if (existingRows.length) {
+            const current = existingRows[0]!;
+            if (
+              current.source !== row.source ||
+              current.source_id !== row.sourceId ||
+              current.source_version !== row.sourceVersion ||
+              current.reason !== row.withheld.reason ||
+              current.checksum !== row.checksum
+            )
+              throw new Error("PHASE10_ANALYTICS_IDEMPOTENCY_CONFLICT");
+          } else {
+            const factAtSequence = await connection.run(
+              "SELECT 1 FROM analytics_facts WHERE sequence=$1",
+              [row.sequence],
+            );
+            if ((await factAtSequence.getRowObjectsJS()).length)
+              throw new Error("PHASE10_ANALYTICS_IDEMPOTENCY_CONFLICT");
+            if (row.sequence !== lastSequence + 1)
+              throw new Error("PHASE10_ANALYTICS_CURSOR_GAP");
+            await connection.run(
+              `INSERT INTO analytics_withheld_events
+               VALUES ($1,$2,$3,$4,$5,$6)`,
+              [
+                row.sequence,
+                row.source,
+                row.sourceId,
+                row.sourceVersion,
+                row.withheld.reason,
+                row.checksum,
+              ],
+            );
+            lastSequence = row.sequence;
+            recordCount++;
+            digest = combineChecksum(digest, row.checksum);
+          }
+          await connection.run(
+            `UPDATE ingest_cursors SET last_sequence = GREATEST(last_sequence, $1), last_source_id = CASE WHEN last_sequence <= $1 THEN $2 ELSE last_source_id END WHERE source = $3`,
+            [row.sequence, row.sourceId, row.source],
+          );
+          continue;
+        }
         const existing = await connection.run(
           `SELECT sequence,tenant_id,incident_id,occurred_at,category,status,scenario,checksum FROM analytics_facts WHERE source=$1 AND source_id=$2 AND source_version=$3`,
           [row.source, row.sourceId, row.sourceVersion],
@@ -156,6 +204,12 @@ export class DuckDbAnalyticsStore implements AnalyticsStore {
           )
             throw new Error("PHASE10_ANALYTICS_IDEMPOTENCY_CONFLICT");
         } else {
+          const withheldAtSequence = await connection.run(
+            "SELECT 1 FROM analytics_withheld_events WHERE sequence=$1",
+            [row.sequence],
+          );
+          if ((await withheldAtSequence.getRowObjectsJS()).length)
+            throw new Error("PHASE10_ANALYTICS_IDEMPOTENCY_CONFLICT");
           if (row.sequence !== lastSequence + 1)
             throw new Error("PHASE10_ANALYTICS_CURSOR_GAP");
           await connection.run(
@@ -300,6 +354,19 @@ export class DuckDbAnalyticsStore implements AnalyticsStore {
         `SELECT source,source_id,source_version,sequence,tenant_id,incident_id,
                 occurred_at,category,status,scenario,checksum
          FROM analytics_facts ORDER BY sequence,source,source_id`,
+      )
+    ).getRowObjectsJS();
+  }
+
+  /** Audit-only journal tombstones; they are intentionally absent from metrics. */
+  async readWithheldRows(): Promise<readonly Record<string, unknown>[]> {
+    await this.migrate();
+    return (
+      await (
+        await this.open()
+      ).run(
+        `SELECT sequence,source,source_id,source_version,reason,checksum
+         FROM analytics_withheld_events ORDER BY sequence`,
       )
     ).getRowObjectsJS();
   }
