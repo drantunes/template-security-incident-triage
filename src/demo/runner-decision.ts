@@ -64,14 +64,25 @@ export async function decideMockDemo(
     databaseUrl,
     mockState(initial.scenario, initial.demoRunId),
   );
-  const mastra = new Mastra({
+  let mastra: Mastra | undefined = new Mastra({
     storage: new LibSQLStore({
       id: demoId("mastra", initial.demoRunId),
       url: databaseUrl,
     }),
     workflows: { incidentIngestionWorkflow: workflow },
   });
-  const store = createLibSqlOperationalStore({ url: databaseUrl });
+  let store: ReturnType<typeof createLibSqlOperationalStore> | undefined =
+    createLibSqlOperationalStore({ url: databaseUrl });
+  const closeStore = () => {
+    const current = store;
+    store = undefined;
+    current?.close();
+  };
+  const closeMastra = async () => {
+    const current = mastra;
+    mastra = undefined;
+    if (current) await shutdownDemoMastra(current);
+  };
   let journal = initial;
   const app = new Hono<AppEnv>();
   app.use(
@@ -106,7 +117,6 @@ export async function decideMockDemo(
     )
       throw new Error("DEMO_DECISION_REJECTED");
     throwIfAborted(signal);
-    journal = await transition(root, journal, "decided");
     const verification = await verifyTerminal(
       store,
       journal,
@@ -115,6 +125,12 @@ export async function decideMockDemo(
       signal,
     );
     if (!verification.ok) throw new Error(verification.code);
+    // `verifyTerminal` is the durable terminal marker. Close both the route
+    // store and the runtime that resumed it before a fresh semantic snapshot
+    // is opened by transition/refreshDatabaseHash.
+    closeStore();
+    await closeMastra();
+    journal = await transition(root, journal, "decided");
     journal = await transition(root, journal, "terminal");
     journal = await refreshDatabaseHash(root, journal);
     const records = [
@@ -141,10 +157,11 @@ export async function decideMockDemo(
     // Release the setup connection before snapshotting a partial database for
     // cleanup; otherwise a WAL writer can make our own precondition stale.
     try {
-      store.close();
+      closeStore();
     } catch {
       /* closed by an earlier path */
     }
+    await closeMastra();
     journal = await transition(
       root,
       journal,
@@ -161,8 +178,8 @@ export async function decideMockDemo(
       ],
     };
   } finally {
-    store.close();
-    await shutdownDemoMastra(mastra);
+    closeStore();
+    await closeMastra();
   }
 }
 
@@ -191,14 +208,25 @@ async function expireMockDemo(
     mockState(initial.scenario, initial.demoRunId),
     expiryProvider,
   );
-  const mastra = new Mastra({
+  let mastra: Mastra | undefined = new Mastra({
     storage: new LibSQLStore({
       id: demoId("mastra", initial.demoRunId),
       url: databaseUrl,
     }),
     workflows: { incidentIngestionWorkflow: workflow },
   });
-  const store = createLibSqlOperationalStore({ url: databaseUrl });
+  let store: ReturnType<typeof createLibSqlOperationalStore> | undefined =
+    createLibSqlOperationalStore({ url: databaseUrl });
+  const closeStore = () => {
+    const current = store;
+    store = undefined;
+    current?.close();
+  };
+  const closeMastra = async () => {
+    const current = mastra;
+    mastra = undefined;
+    if (current) await shutdownDemoMastra(current);
+  };
   let journal = initial;
   try {
     throwIfAborted(signal);
@@ -224,6 +252,10 @@ async function expireMockDemo(
     throwIfAborted(signal);
     const verification = await verifyExpiredTerminal(store, journal);
     if (!verification.ok) throw new Error(verification.code);
+    // The expiry dispatcher has committed its terminal receipt; no runtime or
+    // writer may remain when the journal opens a semantic snapshot.
+    closeStore();
+    await closeMastra();
     journal = await transition(root, journal, "terminal");
     journal = await refreshDatabaseHash(root, journal);
     return {
@@ -240,6 +272,8 @@ async function expireMockDemo(
     };
   } catch (error) {
     const code = error instanceof Error ? error.message : "DEMO_FAILED";
+    closeStore();
+    await closeMastra();
     journal = await transition(root, journal, "failed");
     return {
       exitCode: exitForDemoError(code),
@@ -247,8 +281,8 @@ async function expireMockDemo(
       records: [...prefix, record(journal, "error", { code })],
     };
   } finally {
-    store.close();
-    await shutdownDemoMastra(mastra);
+    closeStore();
+    await closeMastra();
   }
 }
 

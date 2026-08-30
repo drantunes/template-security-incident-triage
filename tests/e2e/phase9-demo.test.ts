@@ -1,4 +1,11 @@
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -10,6 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DEMO_EXIT } from "../../src/demo/contracts.js";
 import { demoId } from "../../src/demo/fixtures.js";
+import { semanticDatabaseHash } from "../../src/demo/journal.js";
 import { readDemoEvidenceBaseline } from "../../src/demo/evidence-baseline.js";
 import {
   createLibSqlOperationalStore,
@@ -1352,7 +1360,19 @@ describe("Phase 9 hermetic demos", () => {
       "device",
       "phase9-surfaces-journal-key",
     );
-    const databaseBefore = await readFile(journalRun.journal.databasePath);
+    const databaseBefore = await semanticDatabaseHash(
+      journalRun.journal.databasePath,
+    );
+    const stateStore = createReadOnlyLibSqlOperationalStore({
+      url: pathToFileURL(journalRun.journal.databasePath).href,
+    });
+    const stateBefore = await stateStore.execute({
+      sql: `SELECT
+        (SELECT status FROM incidents WHERE id = ?) AS incident_status,
+        (SELECT status FROM workflow_runs WHERE run_id = ?) AS workflow_status`,
+      args: [journalRun.journal.incidentId!, journalRun.journal.workflowRunId!],
+    });
+    stateStore.close();
     const journalPath = join(
       journalRoot,
       `${journalRun.journal.demoRunId}.json`,
@@ -1366,21 +1386,85 @@ describe("Phase 9 hermetic demos", () => {
       `${JSON.stringify({ ...journal, checksum: "0".repeat(64) })}\n`,
       "utf8",
     );
-    const badJournal = await expectObserverError(
-      journalRoot,
-      journalRun.journal.demoRunId,
-      DEMO_EXIT.cleanup,
-    );
+    // Withhold the DB entirely: the observer must reject the invalid journal
+    // before constructing any storage client, rather than turning this into a
+    // missing-database error. Restore it before semantic/state assertions.
+    const withheldDatabase = `${journalRun.journal.databasePath}.withheld`;
+    await rename(journalRun.journal.databasePath, withheldDatabase);
+    let badJournal: Record<string, unknown>;
+    try {
+      badJournal = await expectObserverError(
+        journalRoot,
+        journalRun.journal.demoRunId,
+        DEMO_EXIT.cleanup,
+      );
+    } finally {
+      await rename(withheldDatabase, journalRun.journal.databasePath);
+    }
     expect(badJournal).toMatchObject({
       demoRunId: journalRun.journal.demoRunId,
       scenario: null,
       mode: null,
       code: "DEMO_JOURNAL_TAMPERED",
     });
-    expect(await readFile(journalRun.journal.databasePath)).toEqual(
+    expect(await semanticDatabaseHash(journalRun.journal.databasePath)).toBe(
       databaseBefore,
     );
+    const stateAfterStore = createReadOnlyLibSqlOperationalStore({
+      url: pathToFileURL(journalRun.journal.databasePath).href,
+    });
+    const stateAfter = await stateAfterStore.execute({
+      sql: `SELECT
+        (SELECT status FROM incidents WHERE id = ?) AS incident_status,
+        (SELECT status FROM workflow_runs WHERE run_id = ?) AS workflow_status`,
+      args: [journalRun.journal.incidentId!, journalRun.journal.workflowRunId!],
+    });
+    stateAfterStore.close();
+    expect(stateAfter.rows).toEqual(stateBefore.rows);
   }, 30_000);
+
+  it.each([
+    ["privilege", "approve"],
+    ["country", "reject"],
+    ["device", "approve"],
+  ] as const)(
+    "releases runtime and SQLite lifetime before reopening %s (%s)",
+    async (scenario, decision) => {
+      const root = await mkdtemp(join(tmpdir(), "phase9-lifetime-"));
+      roots.push(root);
+      const result = await runMockDemo({
+        scenario,
+        decision,
+        runKey: `phase9-lifetime-${scenario}-${decision}`,
+        root,
+      });
+      expect(result).toMatchObject({ exitCode: DEMO_EXIT.ok });
+      expect(result.journal.state).toBe("terminal");
+      const expectedHash = result.journal.resources.find(
+        (resource) => resource.kind === "local_database",
+      )?.expectedHash;
+      expect(expectedHash).toMatch(/^[a-f0-9]{64}$/u);
+      expect(await semanticDatabaseHash(result.journal.databasePath)).toBe(
+        expectedHash,
+      );
+      const reopened = createLibSqlOperationalStore({
+        url: pathToFileURL(result.journal.databasePath).href,
+      });
+      const marker = await reopened.execute({
+        sql: `SELECT
+          (SELECT status FROM incidents WHERE id = ?) AS incident_status,
+          (SELECT status FROM workflow_runs WHERE run_id = ?) AS workflow_status`,
+        args: [result.journal.incidentId!, result.journal.workflowRunId!],
+      });
+      reopened.close();
+      expect(marker.rows[0]?.workflow_status).toBe("completed");
+      expect(marker.rows[0]?.incident_status).toBe("closed");
+      expect((await cleanupDemo(root, result.journal.demoRunId)).state).toBe(
+        "cleaned",
+      );
+    },
+    30_000,
+  );
 
   it.each(["privilege", "country", "device"] as const)(
     "runs %s through the signed webhook and shared ingestion workflow",

@@ -16,6 +16,7 @@ import {
 import { createPhase8IncidentProvider } from "../../src/providers/runtime-factory.js";
 import { identitySnapshotIntegrityHash } from "../../src/containment/gateway.js";
 import { phase8ApprovalContext, phase8PublicIps } from "../fixtures/phase8.js";
+import { createTempDatabase } from "../helpers/temp-libsql.js";
 
 const base = { DEMO_MODE: "mock" };
 const statusStateIds = {
@@ -50,6 +51,7 @@ afterEach(() => {
   vi.resetModules();
   vi.doUnmock("@mastra/core/mastra");
   vi.doUnmock("@mastra/redis-streams");
+  vi.doUnmock("@mastra/libsql");
 });
 
 describe("WorkOS identity evidence boundary", () => {
@@ -954,6 +956,8 @@ describe("Linear and Upstash boundaries", () => {
   it("passes one configured Redis Streams adapter directly to Mastra in staging", async () => {
     let mastraOptions: Record<string, unknown> | undefined;
     let redisOptions: Record<string, unknown> | undefined;
+    const storageDatabase = await createTempDatabase();
+    let storage: Readonly<{ close(): Promise<void> }> | undefined;
     vi.doMock("@mastra/core/mastra", () => ({
       Mastra: class {
         constructor(options: Record<string, unknown>) {
@@ -981,12 +985,18 @@ describe("Linear and Upstash boundaries", () => {
       "https://dashboard.example.test/callback",
     );
     vi.stubEnv("WORKOS_COOKIE_PASSWORD", "x".repeat(32));
-    await import("../../src/mastra/index.js");
-    expect(redisOptions).toMatchObject({
-      url: "rediss://token@upstash.example.test:6379",
-      keyPrefix: "mastra:security:v1",
-      maxDeliveryAttempts: 5,
-    });
-    expect(mastraOptions?.pubsub).toBeDefined();
+    vi.stubEnv("MASTRA_STORAGE_URL", storageDatabase.url);
+    try {
+      ({ storage } = await import("../../src/mastra/index.js"));
+      expect(redisOptions).toMatchObject({
+        url: "rediss://token@upstash.example.test:6379",
+        keyPrefix: "mastra:security:v1",
+        maxDeliveryAttempts: 5,
+      });
+      expect(mastraOptions?.pubsub).toBeDefined();
+    } finally {
+      await storage?.close();
+      await storageDatabase.cleanup();
+    }
   });
 });
