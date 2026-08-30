@@ -13,6 +13,7 @@ import {
   Observability,
   SensitiveDataFilter,
 } from "@mastra/observability";
+import { z } from "zod";
 
 const categoricalAttributeValues = {
   toolType: new Set(["function"]),
@@ -25,6 +26,38 @@ const categoricalAttributeValues = {
     "failed",
     "error",
     "suspended",
+  ]),
+  boundary: new Set([
+    "http.webhook",
+    "webhook.normalize",
+    "incident.persist",
+    "outbox.publish",
+    "pubsub.consume",
+    "workflow.start",
+    "workflow.context",
+    "gather.identity",
+    "gather.endpoint",
+    "gather.cloud",
+    "agent.identity",
+    "agent.endpoint",
+    "agent.cloud",
+    "retrieval.runbook",
+    "severity.policy",
+    "agent.response-planner",
+    "containment.plan",
+    "guardrail.plan",
+    "approval.request",
+    "provider.linear",
+    "approval.await",
+    "approval.decision",
+    "approval.resume",
+    "approval.expiry",
+    "provider.containment",
+    "containment.verify",
+    "provider.linear.final",
+    "incident.finalize",
+    "workflow.cleanup",
+    "triage.completed",
   ]),
 } as const;
 const opaqueAttributeKeys = [
@@ -39,13 +72,21 @@ const opaqueAttributeKeys = [
   "stepId",
   "toolId",
   "toolCallId",
+  "requestId",
 ] as const;
-const scopeKeys = ["tenantId", "incidentId", "runId", "correlationId"] as const;
+const scopeKeys = [
+  "tenantId",
+  "incidentId",
+  "runId",
+  "correlationId",
+  "requestId",
+] as const;
 const traceMetadataKeys = {
   traceTenantId: "tenantId",
   traceIncidentId: "incidentId",
   traceRunId: "runId",
   traceCorrelationId: "correlationId",
+  traceRequestId: "requestId",
 } as const;
 
 type ScopeKey = (typeof scopeKeys)[number];
@@ -144,6 +185,7 @@ export function createPhase4TraceCarrier(input: {
   incidentId: string;
   runId: string;
   correlationId: string;
+  requestId?: string;
 }): {
   requestContext: RequestContext<unknown>;
   tracingOptions: TracingOptions;
@@ -153,6 +195,7 @@ export function createPhase4TraceCarrier(input: {
     traceIncidentId: protectTraceValue(input.incidentId),
     traceRunId: protectTraceValue(input.runId),
     traceCorrelationId: protectTraceValue(input.correlationId),
+    traceRequestId: protectTraceValue(input.requestId ?? input.correlationId),
   };
   const requestContext = new RequestContext<unknown>();
   for (const [key, value] of Object.entries(metadata))
@@ -214,6 +257,7 @@ function rawScopeFromInput(input: unknown): SafeScope | undefined {
   const tenantId = read(candidate, "tenantId");
   const incidentId = read(candidate, "incidentId");
   const correlationId = read(candidate, "correlationId");
+  const requestId = read(candidate, "requestId") ?? correlationId;
   const runId =
     read(candidate, "workflowRunId") ??
     read(candidate, "runId") ??
@@ -222,7 +266,8 @@ function rawScopeFromInput(input: unknown): SafeScope | undefined {
     typeof tenantId !== "string" ||
     typeof incidentId !== "string" ||
     typeof runId !== "string" ||
-    typeof correlationId !== "string"
+    typeof correlationId !== "string" ||
+    typeof requestId !== "string"
   )
     return undefined;
   return {
@@ -230,6 +275,7 @@ function rawScopeFromInput(input: unknown): SafeScope | undefined {
     incidentId: opaqueTraceValue(incidentId),
     runId: opaqueTraceValue(runId),
     correlationId: opaqueTraceValue(correlationId),
+    requestId: opaqueTraceValue(requestId),
   };
 }
 
@@ -455,7 +501,6 @@ export class Phase4TraceRedactionProcessor implements SpanOutputProcessor {
         (parentSpanId !== undefined && typeof parentSpanId !== "string")
       )
         return this.reject(span);
-      const isChild = parent !== undefined || typeof parentSpanId === "string";
       const parentState =
         parent && !this.rejectedSpans.has(parent)
           ? this.safeSpans.get(parent)
@@ -473,9 +518,15 @@ export class Phase4TraceRedactionProcessor implements SpanOutputProcessor {
         return this.reject(span);
       if (parentState && traceId !== parentState.traceId)
         return this.reject(span);
+      // A span resumed from an outbox, PubSub message, or approval token has a
+      // `parentSpanId` but not an in-memory parent object.  It is still safe
+      // to accept it only when it carries a complete independently-redacted
+      // scope.  The previous implementation rejected those real async hops,
+      // silently making the exported trace look like it ended at the process
+      // boundary.
       const scope =
         previous?.scope ??
-        (isChild
+        (parent !== undefined
           ? parentState?.scope
           : (protectedScopeFromMetadata(snapshot.metadata) ??
             rawScopeFromInput(snapshot.input)));
@@ -560,8 +611,18 @@ export class Phase4TraceRedactionProcessor implements SpanOutputProcessor {
         previous?.exportTraceId ??
         parentState?.exportTraceId ??
         scopedExportTraceId(traceId, scope);
+      // Phase 10 persists parentage across process boundaries. Mastra's own
+      // span ids are random opaque 16-hex capabilities and are the ids its
+      // documented resume API accepts; retaining them for these explicit
+      // boundary spans lets a later runtime link a child to the durable
+      // parent. Other spans keep the Phase 4 exporter-generated identifier.
+      const phase10Boundary = safeCategoricalValue(
+        "boundary",
+        read(rawAttributes, "boundary"),
+      );
       const exportSpanId =
-        previous?.exportSpanId ?? this.allocateExportSpanId(span);
+        previous?.exportSpanId ??
+        (phase10Boundary ? id : this.allocateExportSpanId(span));
       if (!exportSpanId) return this.reject(span);
 
       this.safeSpans.set(span, {
@@ -582,7 +643,11 @@ export class Phase4TraceRedactionProcessor implements SpanOutputProcessor {
       return createSafeSpanEnvelope({
         id: exportSpanId,
         traceId: exportTraceId,
-        ...(parentState ? { parentSpanId: parentState.exportSpanId } : {}),
+        ...(parentState
+          ? { parentSpanId: parentState.exportSpanId }
+          : typeof parentSpanId === "string"
+            ? { parentSpanId }
+            : {}),
         name,
         type: type as SpanType,
         ...(entityId ? { entityId } : {}),
@@ -629,4 +694,209 @@ export function createPhase4Observability(
   });
 }
 
-export const observability = createPhase4Observability();
+/**
+ * The production singleton is the default boundary sink.  Local demo runs
+ * temporarily install a run-owned instance so that the same product
+ * boundaries write to their isolated observability database instead of the
+ * process-wide default.  The restore callback is deliberately compare-and-set
+ * so a stale runtime cannot clobber a later installation.
+ */
+export let observability = createPhase4Observability();
+
+export function installPhase4Observability(next: Observability): () => void {
+  const previous = observability;
+  observability = next;
+  return () => {
+    if (observability === next) observability = previous;
+  };
+}
+
+export type Phase10TraceContext = Readonly<{
+  traceId: string;
+  /**
+   * This is the already-sanitized exported parent span id. It is safe to put
+   * in a durable envelope and lets a later process retain exported parentage
+   * without reconstructing an in-memory Mastra span.
+   */
+  parentSpanId?: string;
+  /**
+   * Immutable trace scope. Operational run ids may legitimately be rebound at
+   * an outbox boundary; this preserves the redacted trace identity across
+   * that transport hop without carrying payload content.
+   */
+  scope?: Readonly<{
+    tenantId: string;
+    incidentId: string;
+    runId: string;
+    correlationId: string;
+    requestId: string;
+  }>;
+}>;
+
+/**
+ * The only trace context permitted in a durable outbox/PubSub envelope.
+ * Trace/span IDs are opaque transport capabilities, while run/request remain
+ * bounded identifiers which are subsequently bound to the source envelope.
+ */
+const opaqueCarrierIdSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine(
+    (value) => ![...value].some((character) => character.charCodeAt(0) < 32),
+    "PHASE10_TRACE_CARRIER_CONTROL_CHARACTER",
+  );
+
+export const Phase10TraceCarrierSchema = z
+  .object({
+    traceId: opaqueCarrierIdSchema,
+    parentSpanId: opaqueCarrierIdSchema.optional(),
+    runId: opaqueCarrierIdSchema,
+    requestId: opaqueCarrierIdSchema,
+    scope: z
+      .object({
+        tenantId: opaqueCarrierIdSchema,
+        incidentId: opaqueCarrierIdSchema,
+        runId: opaqueCarrierIdSchema,
+        correlationId: opaqueCarrierIdSchema,
+        requestId: opaqueCarrierIdSchema,
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type Phase10TraceCarrier = z.infer<typeof Phase10TraceCarrierSchema>;
+
+/**
+ * Starts an official Mastra span and returns only random opaque identifiers
+ * suitable for durable outbox/PubSub propagation. No payload or secret is put
+ * in the transport context.
+ */
+export function startPhase10Boundary(input: {
+  boundary: typeof categoricalAttributeValues.boundary extends Set<infer T>
+    ? T
+    : never;
+  tenantId: string;
+  incidentId: string;
+  runId: string;
+  correlationId: string;
+  requestId: string;
+  /** Safe identifiers are HMACed by the existing exporter before persistence. */
+  identifiers?: Readonly<{
+    stepId?: string;
+    toolCallId?: string;
+    provider?: string;
+  }>;
+  context?: Phase10TraceContext;
+  /** Used by isolated runtime tests; production uses the registered runtime. */
+  observabilityInstance?: Observability;
+}) {
+  const activeObservability = input.observabilityInstance ?? observability;
+  const instance = activeObservability.getDefaultInstance();
+  if (!instance) throw new Error("PHASE10_OBSERVABILITY_UNAVAILABLE");
+  const scope =
+    input.context?.scope ??
+    Object.freeze({
+      tenantId: input.tenantId,
+      incidentId: input.incidentId,
+      runId: input.runId,
+      correlationId: input.correlationId,
+      requestId: input.requestId,
+    });
+  const replayStart = nextPhase10ReplayTraceTime();
+  const span = instance.startSpan({
+    name: input.boundary,
+    type: SpanType.GENERIC,
+    ...(input.context?.traceId ? { traceId: input.context.traceId } : {}),
+    ...(input.context?.parentSpanId
+      ? { parentSpanId: input.context.parentSpanId }
+      : {}),
+    attributes: { boundary: input.boundary, ...input.identifiers } as never,
+    input: {
+      tenantId: scope.tenantId,
+      incidentId: scope.incidentId,
+      workflowRunId: scope.runId,
+      correlationId: scope.correlationId,
+      requestId: scope.requestId,
+    },
+    ...(replayStart ? { startTime: replayStart } : {}),
+  } as never);
+  if (replayStart) {
+    // B1's hermetic report sets this only before it executes the real E2E.
+    // The official span therefore *produces* replay-clock measurements at its
+    // lifecycle boundary; no report consumer is permitted to rewrite them.
+    const emitter = instance as unknown as {
+      emitSpanEnded(span: object): void;
+    };
+    span.end = (options) => {
+      const replayEnd = nextPhase10ReplayTraceTime();
+      if (!replayEnd) return;
+      if (span.endTime) return;
+      span.endTime = replayEnd;
+      if (options?.attributes)
+        span.attributes = { ...span.attributes, ...options.attributes };
+      if (options?.output !== undefined) span.output = options.output;
+      // `emitSpanEnded` is the documented runtime's own lifecycle sink; this
+      // preserves the official processor/exporter path while the replay clock
+      // supplies the measurement at production time.
+      emitter.emitSpanEnded(span);
+    };
+  }
+  // Output processors are invoked by Mastra as the span is started.  Carry
+  // their opaque id across durable boundaries, never the raw internal id.
+  // The carrier uses the native Mastra id, not an exporter-only alias.  This
+  // is required by Mastra's documented suspended-span parent API and remains
+  // opaque/random rather than payload-derived.
+  const exportedSpanId = span.id;
+  return Object.freeze({
+    span,
+    context: Object.freeze({
+      traceId: span.traceId,
+      ...(exportedSpanId ? { parentSpanId: exportedSpanId } : {}),
+      scope,
+    }),
+  });
+}
+
+let phase10ReplayTraceClock: { anchor: string; nextMs: number } | undefined;
+
+/** Starts an independent hermetic replay without sharing its prior clock tick. */
+export function resetPhase10ReplayTraceClock(): void {
+  phase10ReplayTraceClock = undefined;
+}
+
+/**
+ * Source clock for the report's offline replay. It is intentionally opt-in:
+ * product telemetry continues to use the system clock unless the report sets
+ * this process-local B1 fixture anchor before executing the actual workflow.
+ */
+function nextPhase10ReplayTraceTime(): Date | undefined {
+  const anchor = process.env.PHASE10_REPRODUCIBLE_TRACE_CLOCK;
+  if (!anchor) return undefined;
+  if (phase10ReplayTraceClock?.anchor !== anchor) {
+    const start = Date.parse(anchor);
+    if (!Number.isFinite(start))
+      throw new Error("PHASE10_REPLAY_TRACE_CLOCK_INVALID");
+    phase10ReplayTraceClock = { anchor, nextMs: start };
+  }
+  const value = new Date(phase10ReplayTraceClock.nextMs);
+  phase10ReplayTraceClock.nextMs += 1;
+  return value;
+}
+
+/** The public storage API is keyed by the sanitized trace id, not the raw id. */
+export function phase10RecordedTraceId(input: {
+  traceId: string;
+  tenantId: string;
+  incidentId: string;
+  runId: string;
+  correlationId: string;
+}): string {
+  return scopedExportTraceId(input.traceId, {
+    tenantId: opaqueTraceValue(input.tenantId),
+    incidentId: opaqueTraceValue(input.incidentId),
+    runId: opaqueTraceValue(input.runId),
+    correlationId: opaqueTraceValue(input.correlationId),
+    requestId: opaqueTraceValue(input.correlationId),
+  });
+}

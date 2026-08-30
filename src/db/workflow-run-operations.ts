@@ -3,6 +3,7 @@ import { DomainError } from "../domain/errors.js";
 import { uuidGenerator, type IdGenerator } from "../domain/id-generator.js";
 import { insertTimelineAndOutbox } from "./incident-operations.js";
 import type { OperationalStore } from "./operational-store.js";
+import { Phase10TraceCarrierSchema } from "../mastra/observability.js";
 
 export const INCIDENT_INGESTION_WORKFLOW_ID = "incident-ingestion-workflow";
 
@@ -51,10 +52,38 @@ export async function materializeInvestigationStart(
       if (incident.status !== "received") {
         throw new DomainError("CONFLICT");
       }
+      const source = await tx.execute({
+        sql: "SELECT payload_json FROM outbox_events WHERE id = ?",
+        args: [input.eventId],
+      });
+      let phase10TraceJson: string | null = null;
+      try {
+        const payload = JSON.parse(
+          String(source.rows[0]?.payload_json ?? "{}"),
+        ) as Record<string, unknown>;
+        if (typeof payload.__phase10Trace === "string") {
+          const parsed = Phase10TraceCarrierSchema.safeParse(
+            JSON.parse(payload.__phase10Trace),
+          );
+          if (!parsed.success)
+            throw new Error(
+              `PHASE10_TRACE_CONTEXT_INVALID:${parsed.error.issues.map((issue) => issue.path.join(".")).join(",")}`,
+            );
+          phase10TraceJson = JSON.stringify(parsed.data);
+        }
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.startsWith("PHASE10_TRACE_CONTEXT_INVALID")
+        )
+          throw error;
+        throw new DomainError("CONFLICT");
+      }
       await tx.execute({
         sql: `INSERT INTO workflow_runs(
-          id, incident_id, tenant_id, run_id, workflow_id, status, started_at
-        ) VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+          id, incident_id, tenant_id, run_id, workflow_id, status, started_at,
+          phase10_trace_json
+        ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)`,
         args: [
           input.eventId,
           input.incidentId,
@@ -62,6 +91,7 @@ export async function materializeInvestigationStart(
           input.eventId,
           INCIDENT_INGESTION_WORKFLOW_ID,
           now,
+          phase10TraceJson,
         ],
       });
       const updated = await tx.execute({

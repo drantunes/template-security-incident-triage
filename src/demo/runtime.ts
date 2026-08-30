@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 
 import { Mastra } from "@mastra/core/mastra";
+import { MastraCompositeStore } from "@mastra/core/storage";
 import { LibSQLStore } from "@mastra/libsql";
 
 import { createLibSqlOperationalStore } from "../db/libsql-operational-store.js";
@@ -18,6 +19,11 @@ import type { MockContainmentState } from "../containment/mock-state.js";
 import type { Phase2Config, Phase6Config } from "../env.js";
 import { demoId, fixtureForScenario } from "./fixtures.js";
 import type { DemoScenario } from "./contracts.js";
+import {
+  createPhase4Observability,
+  installPhase4Observability,
+} from "../mastra/observability.js";
+import { phase10MastraScorers } from "../mastra/evals/mastra-scorers.js";
 
 export const webhookSecret = "phase9-demo-webhook-secret-not-for-production";
 export const decisionSecret = "phase9-demo-decision-secret-not-for-production";
@@ -81,6 +87,7 @@ export function createDemoWorkflow(
   incidentProvider = new MockIncidentProvider({
     openStore: () => createLibSqlOperationalStore({ url: databaseUrl }),
   }),
+  runbookRoot = resolve(process.cwd(), "src/mastra/runbooks"),
 ) {
   return createIncidentIngestionWorkflow(
     () => createLibSqlOperationalStore({ url: databaseUrl }),
@@ -134,7 +141,7 @@ export function createDemoWorkflow(
     },
     {
       planner: deterministicResponsePlanner,
-      runbookRoot: resolve(process.cwd(), "src/mastra/runbooks"),
+      runbookRoot,
     },
     {
       enabled: true,
@@ -166,6 +173,77 @@ export function createDemoMastra(
     }),
     workflows: { incidentIngestionWorkflow: workflow },
   });
+}
+
+/**
+ * Builds a demo runtime with operational state and trace state physically
+ * separated.  MastraCompositeStore retains the real operational store for
+ * workflow snapshots, approvals and scores while routing only the official
+ * `observability` domain to the run-owned trace store.
+ *
+ * The caller must close the returned owner.  Its lifecycle is intentionally
+ * ordered: flush the exporter, let Mastra shut down observability, restore the
+ * process default, then release the two parent LibSQL clients.
+ */
+export async function createTracedDemoMastra(
+  input: Readonly<{
+    databaseUrl: string;
+    traceDatabaseUrl: string;
+    demoRunId: string;
+    workflow: ReturnType<typeof createDemoWorkflow>;
+  }>,
+) {
+  const operationalStore = new LibSQLStore({
+    id: demoId("mastra", input.demoRunId),
+    url: input.databaseUrl,
+  });
+  const traceStore = new LibSQLStore({
+    id: demoId("mastra-trace", input.demoRunId),
+    url: input.traceDatabaseUrl,
+  });
+  const storage = new MastraCompositeStore({
+    id: demoId("mastra-composite", input.demoRunId),
+    default: operationalStore,
+    domains: { observability: traceStore.stores.observability },
+  });
+  // The composite retains parent stores specifically so their adapter-level
+  // initialization is serialized.  Complete it before the operational worker
+  // opens another client: MastraStorageExporter otherwise first touches the
+  // composite while the worker is writing workflow state.
+  await operationalStore.init();
+  await traceStore.init();
+  await storage.init();
+  const runtimeObservability = createPhase4Observability();
+  const restoreObservability = installPhase4Observability(runtimeObservability);
+  const mastra = new Mastra({
+    storage,
+    observability: runtimeObservability,
+    // Register the official function scorers with the same runtime that owns
+    // demo traces. Registration is not execution: pending-HITL runs emit no
+    // observed score and no score row.
+    scorers: phase10MastraScorers,
+    workflows: { incidentIngestionWorkflow: input.workflow },
+  });
+  let closed = false;
+
+  return {
+    mastra,
+    observability: runtimeObservability,
+    operationalStore,
+    traceStore,
+    async close(): Promise<void> {
+      if (closed) return;
+      closed = true;
+      try {
+        await runtimeObservability.flush();
+        await shutdownDemoMastra(mastra);
+      } finally {
+        restoreObservability();
+        await traceStore.close();
+        await operationalStore.close();
+      }
+    },
+  };
 }
 
 export async function shutdownDemoMastra(mastra: Mastra): Promise<void> {

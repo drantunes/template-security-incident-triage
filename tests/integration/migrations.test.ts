@@ -34,10 +34,10 @@ describe("SOC migrations", () => {
             'approval_decision_audit','mock_incident_provider_effects',
             'mock_containment_effects','geoip_cache_entries','geoip_cache_leases','provider_effect_ledger',
             'consumer_effect_ledger','workos_observed_memberships','workos_observed_sessions',
-            'workos_observed_positions'
+            'workos_observed_positions','eval_results','analytics_export_events'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(35);
+      expect(tables.rows).toHaveLength(37);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
       );
@@ -54,7 +54,7 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(45);
+      expect(Number(indexes.rows[0]?.count)).toBe(47);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -124,6 +124,11 @@ describe("SOC migrations", () => {
         { version: 6 },
         { version: 7 },
         { version: 8 },
+        { version: 9 },
+        { version: 10 },
+        { version: 11 },
+        { version: 12 },
+        { version: 13 },
       ]);
       await expect(
         store.execute({

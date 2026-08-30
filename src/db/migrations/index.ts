@@ -8,6 +8,11 @@ import { evidenceIntegrityVersionStatements } from "./0005-evidence-integrity-ve
 import { phase6ApprovalContainmentStatements } from "./0006-phase6-approval-containment.js";
 import { phase8ProviderDurabilityStatements } from "./0007-phase8-provider-durability.js";
 import { phase8AlertSourceDedupeStatements } from "./0008-phase8-alert-source-dedupe.js";
+import { phase10AnalyticsExportStatements } from "./0009-phase10-analytics-export.js";
+import { phase10TraceContextStatements } from "./0010-phase10-trace-context.js";
+import { phase10TraceFenceStatements } from "./0011-phase10-trace-fence.js";
+import { phase10EvalAuthorityStatements } from "./0012-phase10-eval-authority.js";
+import { phase10RunbookAuthoritySnapshotStatements } from "./0013-phase10-runbook-authority-snapshot.js";
 
 export type Migration = Readonly<{
   version: number;
@@ -53,5 +58,18 @@ export const migrations = Object.freeze([
     8,
     "phase8-alert-source-dedupe",
     phase8AlertSourceDedupeStatements,
+  ),
+  defineMigration(
+    9,
+    "phase10-analytics-export",
+    phase10AnalyticsExportStatements,
+  ),
+  defineMigration(10, "phase10-trace-context", phase10TraceContextStatements),
+  defineMigration(11, "phase10-trace-fence", phase10TraceFenceStatements),
+  defineMigration(12, "phase10-eval-authority", phase10EvalAuthorityStatements),
+  defineMigration(
+    13,
+    "phase10-runbook-authority-snapshot",
+    phase10RunbookAuthoritySnapshotStatements,
   ),
 ]);

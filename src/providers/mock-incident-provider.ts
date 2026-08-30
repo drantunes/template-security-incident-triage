@@ -44,6 +44,8 @@ export class MockIncidentProvider implements IncidentProvider {
       generation: number;
     }>,
   ) => Promise<void> | void;
+  private readonly responseMarker?: string;
+  private readonly onResponseMarkerConsumed?: () => void;
 
   constructor(
     options: Readonly<{
@@ -62,6 +64,9 @@ export class MockIncidentProvider implements IncidentProvider {
           generation: number;
         }>,
       ) => Promise<void> | void;
+      /** Test-only response entropy; it is hashed before a provider result. */
+      responseMarker?: string;
+      onResponseMarkerConsumed?: () => void;
     }> = {},
   ) {
     if (options.store && options.openStore) throw new DomainError("CONFLICT");
@@ -71,6 +76,8 @@ export class MockIncidentProvider implements IncidentProvider {
     this.store = options.store;
     this.openStore = options.openStore;
     this.beforePersist = options.beforePersist;
+    this.responseMarker = options.responseMarker;
+    this.onResponseMarkerConsumed = options.onResponseMarkerConsumed;
   }
 
   async create(input: {
@@ -208,7 +215,10 @@ export class MockIncidentProvider implements IncidentProvider {
       });
       throw new DomainError("CONFLICT");
     }
-    const ref = `mock-incident-${simpleHash(input.idempotencyKey)}`;
+    if (this.responseMarker) this.onResponseMarkerConsumed?.();
+    const ref = `mock-incident-${simpleHash(
+      `${input.idempotencyKey}\0${this.responseMarker ?? ""}`,
+    )}`;
     const result = Object.freeze({ externalRef: ref });
     await this.beforePersist?.({
       operation,

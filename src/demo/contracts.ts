@@ -129,6 +129,8 @@ export type DemoJournal = Readonly<{
   createdAt: string;
   updatedAt: string;
   databasePath: string;
+  /** Isolated Mastra observability domain for this local run. */
+  traceDatabasePath: string;
   incidentId?: string;
   workflowRunId?: string;
   approvalId?: string;
@@ -136,6 +138,7 @@ export type DemoJournal = Readonly<{
   resources: readonly Readonly<{
     kind:
       | "local_database"
+      | "local_trace_database"
       | "mock_role"
       | "mock_session"
       | "mock_device"

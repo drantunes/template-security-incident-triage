@@ -15,7 +15,8 @@ const RETRIEVAL_LEASE_MS = 60_000;
 export const selectionQuery = `SELECT r.*, g.index_name AS current_index_name,
   g.chunk_count AS current_chunk_count, g.aggregate_hash AS current_aggregate_hash,
   g.incident_kind AS current_incident_kind, v.source_hash AS current_source_hash,
-  v.allowed_actions_json AS current_allowed_actions_json
+  v.allowed_actions_json AS current_allowed_actions_json,
+  v.mandatory_rules_json AS current_mandatory_rules_json
   FROM runbook_retrievals r
   LEFT JOIN runbook_generations g ON g.generation_id = r.generation_id
     AND g.runbook_id = r.runbook_id AND g.version = r.version
@@ -35,6 +36,7 @@ export function validateSelectionRow(
     typeof row.source_hash !== "string" ||
     typeof row.generation_aggregate_hash !== "string" ||
     typeof row.allowed_actions_json !== "string" ||
+    typeof row.mandatory_rules_json !== "string" ||
     typeof row.citation !== "string" ||
     typeof row.selected_at !== "string" ||
     typeof row.selection_integrity_hash !== "string" ||
@@ -51,6 +53,7 @@ export function validateSelectionRow(
     row.source_hash !== row.current_source_hash ||
     row.generation_aggregate_hash !== row.current_aggregate_hash ||
     row.allowed_actions_json !== row.current_allowed_actions_json ||
+    row.mandatory_rules_json !== row.current_mandatory_rules_json ||
     row.incident_kind !== row.current_incident_kind ||
     row.citation !== canonicalCitation(row.runbook_id, row.version)
   ) {
@@ -66,6 +69,7 @@ export function validateSelectionRow(
     chunkCount: Number(row.current_chunk_count),
     aggregateHash: row.generation_aggregate_hash,
     allowedActionsJson: row.allowed_actions_json,
+    mandatoryRulesJson: row.mandatory_rules_json,
     sourceHash: row.source_hash,
   };
   const expectedHash = selectionIntegrityHash(
@@ -135,6 +139,7 @@ export function selectionIntegrityHash(
       sourceHash: generation.sourceHash,
       generationAggregateHash: generation.aggregateHash,
       allowedActionsJson: generation.allowedActionsJson,
+      mandatoryRulesJson: generation.mandatoryRulesJson,
       citation,
       queryHash: input.queryHash,
       threshold: input.threshold.toString(),
@@ -223,7 +228,7 @@ export async function assertCurrentSelection(
 ): Promise<void> {
   const current = await tx.execute({
     sql: `SELECT a.generation_id, a.revision, g.index_name, g.chunk_count,
-      g.aggregate_hash, g.state, v.source_hash, v.allowed_actions_json,
+      g.aggregate_hash, g.state, v.source_hash, v.allowed_actions_json, v.mandatory_rules_json,
       v.declared_status FROM runbook_activations a
       JOIN runbook_generations g ON g.generation_id = a.generation_id
       JOIN runbook_versions v ON v.runbook_id = g.runbook_id AND v.version = g.version
@@ -240,6 +245,7 @@ export async function assertCurrentSelection(
     row.aggregate_hash !== generation.aggregateHash ||
     row.source_hash !== generation.sourceHash ||
     row.allowed_actions_json !== generation.allowedActionsJson ||
+    row.mandatory_rules_json !== generation.mandatoryRulesJson ||
     row.state !== "active" ||
     row.declared_status !== "active"
   ) {

@@ -227,6 +227,84 @@ describe("background workflow start", () => {
     }
   });
 
+  it("rejects a candidate-only or parent-tampered Phase 10 trace carrier", async () => {
+    const { store } = await setup();
+    const carrier = JSON.stringify({
+      traceId: "a".repeat(32),
+      parentSpanId: "b".repeat(16),
+      runId: "outbox-1",
+      requestId: "request-1",
+    });
+    await store.execute({
+      sql: "UPDATE outbox_events SET payload_json = ? WHERE id = 'outbox-1'",
+      args: [
+        JSON.stringify({
+          alertId: "alert-1",
+          status: "received",
+          __phase10Trace: carrier,
+        }),
+      ],
+    });
+    class CapturingPubSub extends PubSub {
+      callback?: EventCallback;
+      override async publish(): Promise<void> {}
+      override async subscribe(
+        _topic: string,
+        callback: EventCallback,
+      ): Promise<void> {
+        this.callback = callback;
+      }
+      override async unsubscribe(): Promise<void> {
+        this.callback = undefined;
+      }
+      override async flush(): Promise<void> {}
+      async deliver(event: Event) {
+        await this.callback?.(event, async () => {});
+      }
+    }
+    const pubsub = new CapturingPubSub();
+    let starts = 0;
+    const unsubscribe = await startWorkflowWorker({
+      pubsub,
+      workflow: {
+        createRun: async () => {
+          starts++;
+          return { startAsync: async () => ({ runId: "outbox-1" }) };
+        },
+      },
+      store,
+      logger: silentLogger,
+      maxAttempts: 1,
+    });
+    const envelope = {
+      id: "transport-trace-tamper",
+      createdAt: new Date(),
+      type: "security.alert.received" as const,
+      runId: "incident-1",
+      data: {
+        eventId: "outbox-1",
+        schemaVersion: 1,
+        occurredAt: "2026-08-27T12:00:00.000Z",
+        incidentId: "incident-1",
+        tenantId: "tenant-1",
+        correlationId: "alert-idempotency-1",
+        causationId: "source-event-1",
+        payload: { alertId: "alert-1", status: "received" },
+      },
+    };
+    try {
+      await pubsub.deliver(envelope);
+      expect(starts).toBe(0);
+      const dead = await store.execute({
+        sql: "SELECT count(*) AS count FROM dead_letter_events",
+      });
+      expect(Number(dead.rows[0]?.count)).toBe(1);
+    } finally {
+      await unsubscribe();
+      store.close();
+    }
+  });
+
   it("atomically records transport poison plus terminal outbox before ACKing a copied envelope", async () => {
     const { store } = await setup();
     class CapturingPubSub extends PubSub {

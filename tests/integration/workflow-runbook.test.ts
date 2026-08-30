@@ -20,7 +20,7 @@ afterEach(async () => {
 });
 
 describe("Phase 3 workflow integration", () => {
-  it("runs retrieve-runbook before Phase 5 and blocks a non-persisted retrieval double", async () => {
+  it("permits a non-persisted retrieval double without fabricating Phase 10 authority", async () => {
     const database = await createTempDatabase();
     databases.push(database);
     const setupStore = database.createStore();
@@ -85,9 +85,17 @@ describe("Phase 3 workflow integration", () => {
     const verification = database.createStore();
     try {
       const row = await verification.execute({
-        sql: "SELECT status FROM incidents WHERE id = 'incident-1'",
+        sql: `SELECT i.status,
+          (SELECT count(*) FROM phase10_runbook_authority) AS authority_rows
+          FROM incidents i WHERE i.id = 'incident-1'`,
       });
-      expect(row.rows[0]?.status).toBe("investigating");
+      // The test double has no durable retrieval/catalog record. It may not
+      // manufacture an eval snapshot, and the later Phase 5 boundary retains
+      // its own fail-closed result without turning the workflow into an error.
+      expect(row.rows[0]).toEqual({
+        status: "investigating",
+        authority_rows: 0,
+      });
     } finally {
       verification.close();
     }

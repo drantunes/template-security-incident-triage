@@ -70,8 +70,8 @@ export async function persistEvidenceItems(
           sql: `INSERT INTO evidence_items(
           id, incident_id, tenant_id, source, provider, observed_at, collected_at,
           fact_json, confidence, raw_payload_ref, integrity_hash, sensitivity,
-          incomplete, error_code, hash_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          incomplete, error_code, hash_version, workflow_run_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             evidence.evidenceId,
             evidence.incidentId,
@@ -88,6 +88,7 @@ export async function persistEvidenceItems(
             evidence.incomplete ? 1 : 0,
             evidence.error ?? null,
             evidence.hashVersion,
+            input.context.workflowRunId,
           ],
         });
         const updated = await tx.execute({

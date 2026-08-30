@@ -24,6 +24,7 @@ import { appendPhase5Timeline } from "../../triage/decision-timeline.js";
 import { assertSeverityDecision } from "../../triage/decision-validation.js";
 import type { Phase5StepDependencies } from "./classify-severity.js";
 import { RunbookRetrievedSchema } from "./retrieve-runbook.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export function createValidateContainmentStep(
   dependencies: Phase5StepDependencies = {},
@@ -62,64 +63,83 @@ export function createValidateContainmentStep(
             reasonCodes: ["INTEGRITY_CHECK_FAILED"],
           });
         }
-        try {
-          validateSummaryReferences(
-            inputData.summary,
-            context,
-            inputData.decision,
-          );
-          if (
-            canonicalJson(
-              normalizeContainmentCandidate(inputData.candidate),
-            ) !==
-            canonicalJson(
-              normalizeContainmentCandidate(
-                createContainmentCandidate(context, inputData.decision),
-              ),
-            )
-          )
-            throw new DomainError("VALIDATION_FAILED");
-          const actions = resolveContainmentActions(
-            context,
-            inputData.decision,
-            inputData.candidate,
-          );
-          const plan = buildValidatedContainmentPlan(context, actions);
-          await appendPhase5Timeline(
-            store,
-            context,
-            "validation",
-            "completed",
-            {
-              result: "ready-for-approval",
-              actionCount: plan.actions.length,
-            },
-          );
-          const result = Phase5ResultSchema.parse({
-            status: "ready-for-approval",
-            decision: inputData.decision,
-            summary: inputData.summary,
-            plan,
-          });
-          await persistAuthoritativePhase5Result(store, {
+        return await withinWorkflowPhase10Boundary(
+          store,
+          {
             tenantId: context.correlation.context.tenantId,
             incidentId: context.correlation.context.incidentId,
             workflowRunId: context.correlation.context.workflowRunId,
-            result,
-          });
-          return result;
-        } catch {
-          const stopped = {
-            status: "blocked" as const,
-            incidentId: inputData.decision.incidentId,
-            reasonCodes: ["PLAN_INVALID" as const],
-          };
-          await appendPhase5Timeline(store, context, "validation", "blocked", {
-            result: stopped.status,
-            reasonCodes: stopped.reasonCodes.join(","),
-          });
-          return stopped;
-        }
+            correlationId: context.correlation.context.correlationId,
+            boundary: "guardrail.plan",
+            stepId: "validate-containment",
+          },
+          async () => {
+            try {
+              validateSummaryReferences(
+                inputData.summary,
+                context,
+                inputData.decision,
+              );
+              if (
+                canonicalJson(
+                  normalizeContainmentCandidate(inputData.candidate),
+                ) !==
+                canonicalJson(
+                  normalizeContainmentCandidate(
+                    createContainmentCandidate(context, inputData.decision),
+                  ),
+                )
+              )
+                throw new DomainError("VALIDATION_FAILED");
+              const actions = resolveContainmentActions(
+                context,
+                inputData.decision,
+                inputData.candidate,
+              );
+              const plan = buildValidatedContainmentPlan(context, actions);
+              await appendPhase5Timeline(
+                store,
+                context,
+                "validation",
+                "completed",
+                {
+                  result: "ready-for-approval",
+                  actionCount: plan.actions.length,
+                },
+              );
+              const result = Phase5ResultSchema.parse({
+                status: "ready-for-approval",
+                decision: inputData.decision,
+                summary: inputData.summary,
+                plan,
+              });
+              await persistAuthoritativePhase5Result(store, {
+                tenantId: context.correlation.context.tenantId,
+                incidentId: context.correlation.context.incidentId,
+                workflowRunId: context.correlation.context.workflowRunId,
+                result,
+              });
+              return result;
+            } catch {
+              const stopped = {
+                status: "blocked" as const,
+                incidentId: inputData.decision.incidentId,
+                reasonCodes: ["PLAN_INVALID" as const],
+              };
+              await appendPhase5Timeline(
+                store,
+                context,
+                "validation",
+                "blocked",
+                {
+                  result: stopped.status,
+                  reasonCodes: stopped.reasonCodes.join(","),
+                },
+              );
+              return stopped;
+            }
+          },
+        );
       } finally {
         store.close();
       }

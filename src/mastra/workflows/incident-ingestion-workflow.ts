@@ -274,7 +274,7 @@ export function createIncidentIngestionWorkflow(
           : {}),
       }),
     )
-    .then(createVerifyContainmentStep())
+    .then(createVerifyContainmentStep(phase6Shared))
     .then(
       createUpdateExternalIncidentStep({
         ...phase6Shared,

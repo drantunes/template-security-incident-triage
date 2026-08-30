@@ -17,6 +17,8 @@ export type DeviceSignatureBaseline = Readonly<{
 
 export type DemoEvidenceBaseline = Readonly<{
   version: 1;
+  /** Test fixture source, read by real providers but never emitted as a fact. */
+  redactionSource?: string;
   identity?: Readonly<{
     actorId: string;
     previousRole: string;
@@ -44,6 +46,7 @@ const DeviceBaselineSchema = z
 const DemoEvidenceBaselineSchema = z
   .object({
     version: z.literal(1),
+    redactionSource: z.string().min(1).max(512).optional(),
     identity: z
       .object({
         actorId: z.string().min(1),

@@ -5,6 +5,9 @@ incidentKinds:
   - unknown_device_login
 owner: security
 status: active
+mandatoryRules:
+  - Invalid signatures or missing required evidence require manual review rather than automatic conclusions.
+  - A `soc_manager` must approve the exact structured plan, session, device ID, subject, impact, rollback, expiration, and plan hash before either allowed action.
 ---
 
 ## Purpose and Preconditions

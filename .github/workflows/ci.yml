@@ -24,3 +24,20 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm run audit
+      # The dataset remains pending until Diego accepts the independently
+      # reviewed hashes.  CI proves the fail-closed boundary without turning it
+      # into a skip or accidentally observing a replay.
+      - name: Verify Phase 10 gate and deterministic approved report
+        id: phase10
+        run: |
+          npm run phase10:ci | tee phase10-ci.log
+          echo "approved=$(sed -n 's/^phase10-approved=//p' phase10-ci.log)" >> "$GITHUB_OUTPUT"
+      - name: DuckDB Node 22 smoke
+        run: npm test -- tests/integration/phase10-analytics.test.ts
+      - name: Upload approved Phase 10 report
+        if: steps.phase10.outputs.approved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase10-sanitized-report
+          path: .mastra/ci-phase10-a/
+          retention-days: 7

@@ -17,6 +17,8 @@ import {
 import { errorResponse } from "../http-errors.js";
 import type { AppEnv } from "../http-context.js";
 import type { StructuredLogger } from "../logging.js";
+import type { Clock } from "../domain/clock.js";
+import { startPhase10Boundary } from "../mastra/observability.js";
 import {
   normalizeDemoAlert,
   normalizeWorkOsMock,
@@ -34,6 +36,8 @@ type WebhookRouteDependencies = Readonly<{
   store: OperationalStore;
   logger: StructuredLogger;
   nowMs?: () => number;
+  /** Replay/demo clock for durable incident.received; production omits it. */
+  clock?: Clock;
 }>;
 
 class PayloadDecodeError extends Error {}
@@ -155,20 +159,74 @@ async function handleWebhook(
       );
     }
     outOfOrderEventRef = normalized.alert.rawPayloadRef;
-    const result = await createIncidentFromAlertResult(
-      dependencies.store,
-      normalized.alert,
-      {
+    const requestContextId =
+      context.get("requestId") ?? context.get("correlationId");
+    // Test and recovery entrypoints can legitimately bypass HTTP middleware.
+    // Bind those events to the signed alert id rather than serializing an
+    // incomplete carrier that a later worker could not authenticate.
+    const requestId =
+      typeof requestContextId === "string" && requestContextId.length > 0
+        ? requestContextId
+        : normalized.alert.idempotencyKey;
+    const trace = startPhase10Boundary({
+      boundary: "http.webhook",
+      tenantId: normalized.alert.tenantId,
+      incidentId: normalized.alert.alertId,
+      runId: normalized.alert.alertId,
+      correlationId: context.get("correlationId"),
+      requestId,
+    });
+    const normalizationTrace = startPhase10Boundary({
+      boundary: "webhook.normalize",
+      tenantId: normalized.alert.tenantId,
+      incidentId: normalized.alert.alertId,
+      runId: normalized.alert.alertId,
+      correlationId: context.get("correlationId"),
+      requestId,
+      context: trace.context,
+      identifiers: { stepId: "webhook-normalize" },
+    });
+    normalizationTrace.span.end({ attributes: { success: true } as never });
+    let result;
+    let persistenceTrace: ReturnType<typeof startPhase10Boundary> | undefined;
+    try {
+      persistenceTrace = startPhase10Boundary({
+        boundary: "incident.persist",
+        tenantId: normalized.alert.tenantId,
+        incidentId: normalized.alert.alertId,
+        runId: normalized.alert.alertId,
         correlationId: context.get("correlationId"),
-        enforceAlertOrdering: true,
-        ...(route.preflightAlert
-          ? { preflightAlert: route.preflightAlert }
-          : {}),
-        ...(route.beforeIncidentWrite
-          ? { beforeIncidentWrite: route.beforeIncidentWrite }
-          : {}),
-      },
-    );
+        requestId,
+        context: normalizationTrace.context,
+        identifiers: { stepId: "webhook-persist" },
+      });
+      result = await createIncidentFromAlertResult(
+        dependencies.store,
+        normalized.alert,
+        {
+          correlationId: context.get("correlationId"),
+          phase10Trace: {
+            ...persistenceTrace.context,
+            runId: normalized.alert.alertId,
+            requestId,
+          },
+          ...(dependencies.clock ? { clock: dependencies.clock } : {}),
+          enforceAlertOrdering: true,
+          ...(route.preflightAlert
+            ? { preflightAlert: route.preflightAlert }
+            : {}),
+          ...(route.beforeIncidentWrite
+            ? { beforeIncidentWrite: route.beforeIncidentWrite }
+            : {}),
+        },
+      );
+      persistenceTrace.span.end({ attributes: { success: true } as never });
+      trace.span.end({ attributes: { success: true } as never });
+    } catch (error) {
+      persistenceTrace?.span.error({ error: error as Error, endSpan: true });
+      trace.span.error({ error: error as Error, endSpan: true });
+      throw error;
+    }
     context.set("incidentId", result.incident.incidentId);
     dependencies.logger.write({
       event: result.duplicate

@@ -10,6 +10,7 @@ import type { IdGenerator } from "../../domain/id-generator.js";
 import { ApprovalRequestSchema } from "../../schemas/approval.js";
 import { ApprovalRequestedResultSchema } from "../../approval/phase6-contracts.js";
 import { Phase5ResultSchema } from "../../triage/decision-contracts.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export function createRequestApprovalStep(
   dependencies: Readonly<{
@@ -85,16 +86,32 @@ export function createRequestApprovalStep(
             reasonCodes: ["SCOPE_CHECK_FAILED" as const],
           };
         }
-        await requestApproval(
+        const expectedIncidentVersion = Number(incident.rows[0].version);
+        await withinWorkflowPhase10Boundary(
           store,
           {
-            plan: inputData.plan,
-            approval,
-            expectedIncidentVersion: Number(incident.rows[0].version),
-            runId: init.eventId,
+            tenantId: init.tenantId,
+            incidentId: init.incidentId,
+            workflowRunId: init.eventId,
             correlationId: init.correlationId,
+            boundary: "approval.request",
+            stepId: "request-approval",
           },
-          { clock, ...(dependencies.ids ? { ids: dependencies.ids } : {}) },
+          () =>
+            requestApproval(
+              store,
+              {
+                plan: inputData.plan,
+                approval,
+                expectedIncidentVersion,
+                runId: init.eventId,
+                correlationId: init.correlationId,
+              },
+              {
+                clock,
+                ...(dependencies.ids ? { ids: dependencies.ids } : {}),
+              },
+            ),
         );
         return ApprovalRequestedResultSchema.parse({
           status: "approval-requested",

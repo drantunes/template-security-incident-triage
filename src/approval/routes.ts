@@ -15,6 +15,11 @@ import type { Phase6Config } from "../env.js";
 import type { AppEnv } from "../http-context.js";
 import type { StructuredLogger } from "../logging.js";
 import { ApprovalDecisionRequestSchema } from "../schemas/approval.js";
+import { startPhase10Boundary } from "../mastra/observability.js";
+import {
+  advanceWorkflowPhase10Trace,
+  readWorkflowPhase10Trace,
+} from "../mastra/phase10-trace-context.js";
 import {
   DecisionAuthenticationError,
   type DecisionAuthenticator,
@@ -36,6 +41,7 @@ export function registerApprovalRoutes(
     "/api/incidents/:incidentId/approvals/:approvalId/decision",
     async (context) => {
       const rawBody = new Uint8Array(await context.req.arrayBuffer());
+      let decisionTrace: ReturnType<typeof startPhase10Boundary> | undefined;
       try {
         const auth = await dependencies.authenticator.authenticate({
           method: context.req.method,
@@ -79,19 +85,73 @@ export function registerApprovalRoutes(
         ) {
           throw new DomainError("NOT_FOUND");
         }
+        const traceCorrelationId =
+          typeof context.get("correlationId") === "string"
+            ? context.get("correlationId")
+            : row.workflow_run_id;
+        const traceRequestId =
+          typeof context.get("requestId") === "string"
+            ? context.get("requestId")
+            : row.workflow_run_id;
+        const workflowTrace = await readWorkflowPhase10Trace(
+          dependencies.store,
+          {
+            tenantId: auth.tenantId,
+            incidentId,
+            workflowRunId: row.workflow_run_id,
+          },
+        );
+        decisionTrace = startPhase10Boundary({
+          boundary: "approval.decision",
+          tenantId: auth.tenantId,
+          incidentId,
+          runId: row.workflow_run_id,
+          correlationId: traceCorrelationId,
+          requestId: traceRequestId,
+          ...(workflowTrace ? { context: workflowTrace } : {}),
+          identifiers: { stepId: "approval-decision", provider: "linear" },
+        });
         const now = (dependencies.clock ?? systemClock).now();
         if (String(row.expires_at) <= now) {
-          await expirePendingApproval(
-            dependencies.store,
-            {
-              tenantId: auth.tenantId,
-              incidentId,
-              approvalId,
-              workflowRunId: row.workflow_run_id,
-              correlationId: context.get("correlationId"),
-            },
-            { clock: dependencies.clock },
-          );
+          const expiryTrace = startPhase10Boundary({
+            boundary: "approval.expiry",
+            tenantId: auth.tenantId,
+            incidentId,
+            runId: row.workflow_run_id,
+            correlationId: traceCorrelationId,
+            requestId: traceRequestId,
+            context: decisionTrace.context,
+            identifiers: { stepId: "approval-expiry", provider: "linear" },
+          });
+          try {
+            await expirePendingApproval(
+              dependencies.store,
+              {
+                tenantId: auth.tenantId,
+                incidentId,
+                approvalId,
+                workflowRunId: row.workflow_run_id,
+                correlationId: context.get("correlationId"),
+              },
+              { clock: dependencies.clock },
+            );
+            expiryTrace.span.end({ attributes: { success: true } as never });
+            if (workflowTrace)
+              await advanceWorkflowPhase10Trace(dependencies.store, {
+                tenantId: auth.tenantId,
+                incidentId,
+                workflowRunId: row.workflow_run_id,
+                previous: workflowTrace,
+                next: {
+                  ...expiryTrace.context,
+                  runId: row.workflow_run_id,
+                  requestId: workflowTrace.requestId,
+                },
+              });
+          } catch (error) {
+            expiryTrace.span.error({ error: error as Error, endSpan: true });
+            throw error;
+          }
           throw new DomainError("CONFLICT");
         }
         const decision =
@@ -124,6 +184,10 @@ export function registerApprovalRoutes(
                 decidedAt: now,
                 reason: body.data.reason!,
               };
+        // Source-only request annotations are validated/authenticated with the
+        // decision body, then intentionally discarded before persistence.
+        void body.data.comment;
+        void body.data.actorHint;
         const issued = await decideApprovalAndIssueResumeToken(
           dependencies.store,
           {
@@ -135,6 +199,21 @@ export function registerApprovalRoutes(
           },
           { clock: dependencies.clock },
         );
+        // Persist decision parentage before the reconciler can resume the
+        // suspended workflow in this same request.
+        decisionTrace.span.end({ attributes: { success: true } as never });
+        if (workflowTrace)
+          await advanceWorkflowPhase10Trace(dependencies.store, {
+            tenantId: auth.tenantId,
+            incidentId,
+            workflowRunId: row.workflow_run_id,
+            previous: workflowTrace,
+            next: {
+              ...decisionTrace.context,
+              runId: row.workflow_run_id,
+              requestId: workflowTrace.requestId,
+            },
+          });
         const authorized = await authorizeResumeToken(
           dependencies.store,
           {
@@ -175,6 +254,8 @@ export function registerApprovalRoutes(
           resumed: resumeCompleted,
         });
       } catch (error) {
+        if (decisionTrace)
+          decisionTrace.span.error({ error: error as Error, endSpan: true });
         const authError = error instanceof DecisionAuthenticationError;
         const domain = error instanceof DomainError ? error : undefined;
         const status = authError

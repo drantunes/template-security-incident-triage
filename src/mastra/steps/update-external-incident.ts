@@ -11,6 +11,7 @@ import {
   type IncidentProvider,
 } from "../../providers/incident-provider.js";
 import { MockIncidentProvider } from "../../providers/mock-incident-provider.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export function createUpdateExternalIncidentStep(
   dependencies: Readonly<{
@@ -76,22 +77,35 @@ export function createUpdateExternalIncidentStep(
           planHash: inputData.plan.planHash,
           actionTypes: inputData.plan.actions.map((action) => action.type),
         });
-        await deliverExternalIncident(
+        await withinWorkflowPhase10Boundary(
           store,
-          provider,
           {
-            operation,
-            projection,
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
             workflowRunId: inputData.workflowRunId,
             correlationId: inputData.correlationId,
-            ...(open.rows[0]?.external_ref
-              ? { existingExternalRef: String(open.rows[0].external_ref) }
-              : {}),
+            boundary: "provider.linear.final",
+            stepId: "update-external-incident",
+            provider: "mock-incident",
           },
-          {
-            ...(dependencies.clock ? { clock: dependencies.clock } : {}),
-            ...(dependencies.ids ? { ids: dependencies.ids } : {}),
-          },
+          () =>
+            deliverExternalIncident(
+              store,
+              provider,
+              {
+                operation,
+                projection,
+                workflowRunId: inputData.workflowRunId,
+                correlationId: inputData.correlationId,
+                ...(open.rows[0]?.external_ref
+                  ? { existingExternalRef: String(open.rows[0].external_ref) }
+                  : {}),
+              },
+              {
+                ...(dependencies.clock ? { clock: dependencies.clock } : {}),
+                ...(dependencies.ids ? { ids: dependencies.ids } : {}),
+              },
+            ),
         );
         return inputData;
       } finally {

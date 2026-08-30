@@ -8,6 +8,9 @@ export type LogRecord = Readonly<{
   correlationId?: string;
   incidentId?: string;
   workflowRunId?: string;
+  stepId?: string;
+  toolCallId?: string;
+  provider?: string;
   errorCode?: string;
   status?: number;
   durationMs?: number;

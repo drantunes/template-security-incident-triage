@@ -9,6 +9,7 @@ import {
 } from "../../evidence/contracts.js";
 import { AlertSchema } from "../../schemas/alert.js";
 import { InvestigationStartedSchema } from "./retrieve-runbook.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export async function loadInvestigationContext(
   store: OperationalStore,
@@ -106,7 +107,18 @@ export function createLoadInvestigationContextStep(
     execute: async ({ inputData }) => {
       const store = openStore();
       try {
-        return await loadInvestigationContext(store, inputData);
+        return await withinWorkflowPhase10Boundary(
+          store,
+          {
+            tenantId: inputData.tenantId,
+            incidentId: inputData.incidentId,
+            workflowRunId: inputData.eventId,
+            correlationId: inputData.correlationId,
+            boundary: "workflow.context",
+            stepId: "load-investigation-context",
+          },
+          () => loadInvestigationContext(store, inputData),
+        );
       } finally {
         store.close();
       }

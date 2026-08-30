@@ -2,8 +2,6 @@ import { createHmac, randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import { Hono } from "hono";
-import { Mastra } from "@mastra/core/mastra";
-import { LibSQLStore } from "@mastra/libsql";
 
 import { createLibSqlOperationalStore } from "../db/libsql-operational-store.js";
 import { registerApprovalRoutes } from "../approval/routes.js";
@@ -29,17 +27,18 @@ import {
 } from "./lifecycle-state.js";
 import {
   createDemoWorkflow,
+  createTracedDemoMastra,
   decisionSecret,
   fixedNow,
   mockState,
   phase6Config,
-  shutdownDemoMastra,
 } from "./runtime.js";
 import {
   verifyExpiredTerminal,
   verifyTerminal,
 } from "./runner-verification.js";
-import type { DemoRunResult } from "./runner-types.js";
+import type { DemoRunResult, RunOptions } from "./runner-types.js";
+import type { StructuredLogger } from "../logging.js";
 
 export async function decideMockDemo(
   root: string,
@@ -48,6 +47,9 @@ export async function decideMockDemo(
   timeoutMs?: number,
   prefix: DemoRecord[] = [],
   signal?: AbortSignal,
+  logger: StructuredLogger = { write: () => {} },
+  redactionSources?: RunOptions["redactionSources"],
+  redactionSourceObserved?: RunOptions["redactionSourceObserved"],
 ): Promise<DemoRunResult> {
   if (
     initial.state !== "awaiting_approval" ||
@@ -59,18 +61,19 @@ export async function decideMockDemo(
   if (decision === "expire")
     return expireMockDemo(root, initial, prefix, signal);
   const databaseUrl = pathToFileURL(initial.databasePath).href;
+  const traceDatabaseUrl = pathToFileURL(initial.traceDatabasePath).href;
   const fixture = fixtureForScenario(initial.scenario, initial.demoRunId);
   const workflow = createDemoWorkflow(
     databaseUrl,
     mockState(initial.scenario, initial.demoRunId),
   );
-  let mastra: Mastra | undefined = new Mastra({
-    storage: new LibSQLStore({
-      id: demoId("mastra", initial.demoRunId),
-      url: databaseUrl,
-    }),
-    workflows: { incidentIngestionWorkflow: workflow },
-  });
+  let runtime: Awaited<ReturnType<typeof createTracedDemoMastra>> | undefined =
+    await createTracedDemoMastra({
+      databaseUrl,
+      traceDatabaseUrl,
+      demoRunId: initial.demoRunId,
+      workflow,
+    });
   let store: ReturnType<typeof createLibSqlOperationalStore> | undefined =
     createLibSqlOperationalStore({ url: databaseUrl });
   const closeStore = () => {
@@ -79,9 +82,9 @@ export async function decideMockDemo(
     current?.close();
   };
   const closeMastra = async () => {
-    const current = mastra;
-    mastra = undefined;
-    if (current) await shutdownDemoMastra(current);
+    const current = runtime;
+    runtime = undefined;
+    if (current) await current.close();
   };
   let journal = initial;
   const app = new Hono<AppEnv>();
@@ -92,7 +95,7 @@ export async function decideMockDemo(
   registerApprovalRoutes(app, {
     config: phase6Config(),
     store,
-    logger: { write: () => {} },
+    logger,
     authenticator: new MockDecisionAuthenticator({
       mode: "mock",
       enabled: true,
@@ -100,7 +103,7 @@ export async function decideMockDemo(
       nowMs: () => Date.parse(fixedNow),
     }),
     reconcileApprovalRun: createWorkflowApprovalRunReconciler(
-      mastra.getWorkflow("incidentIngestionWorkflow"),
+      runtime!.mastra.getWorkflow("incidentIngestionWorkflow"),
     ),
     clock: fixedClock(fixedNow),
   });
@@ -113,6 +116,8 @@ export async function decideMockDemo(
         fixture.tenantId,
         decision,
         signal,
+        redactionSources,
+        redactionSourceObserved,
       ))
     )
       throw new Error("DEMO_DECISION_REJECTED");
@@ -198,6 +203,7 @@ async function expireMockDemo(
   if (!initial.incidentId || !initial.approvalId || !initial.workflowRunId)
     throw new Error("DEMO_IDS_MISSING");
   const databaseUrl = pathToFileURL(initial.databasePath).href;
+  const traceDatabaseUrl = pathToFileURL(initial.traceDatabasePath).href;
   // The Phase 6 expiry path has no containment effect to reconcile. Keep its
   // provider response in-memory while the operational delivery ledger remains
   // authoritative; reopening a fresh DB-backed provider here would contend
@@ -208,13 +214,13 @@ async function expireMockDemo(
     mockState(initial.scenario, initial.demoRunId),
     expiryProvider,
   );
-  let mastra: Mastra | undefined = new Mastra({
-    storage: new LibSQLStore({
-      id: demoId("mastra", initial.demoRunId),
-      url: databaseUrl,
-    }),
-    workflows: { incidentIngestionWorkflow: workflow },
-  });
+  let runtime: Awaited<ReturnType<typeof createTracedDemoMastra>> | undefined =
+    await createTracedDemoMastra({
+      databaseUrl,
+      traceDatabaseUrl,
+      demoRunId: initial.demoRunId,
+      workflow,
+    });
   let store: ReturnType<typeof createLibSqlOperationalStore> | undefined =
     createLibSqlOperationalStore({ url: databaseUrl });
   const closeStore = () => {
@@ -223,9 +229,9 @@ async function expireMockDemo(
     current?.close();
   };
   const closeMastra = async () => {
-    const current = mastra;
-    mastra = undefined;
-    if (current) await shutdownDemoMastra(current);
+    const current = runtime;
+    runtime = undefined;
+    if (current) await current.close();
   };
   let journal = initial;
   try {
@@ -244,7 +250,7 @@ async function expireMockDemo(
       provider: expiryProvider,
       clock,
       reconcileApprovalRun: createWorkflowApprovalRunReconciler(
-        mastra.getWorkflow("incidentIngestionWorkflow"),
+        runtime!.mastra.getWorkflow("incidentIngestionWorkflow"),
       ),
     });
     const result = await dispatcher.runOnce();
@@ -312,6 +318,8 @@ async function submitMockDecision(
   tenantId: string,
   decision: "approve" | "reject",
   signal?: AbortSignal,
+  redactionSources?: RunOptions["redactionSources"],
+  redactionSourceObserved?: RunOptions["redactionSourceObserved"],
 ): Promise<boolean> {
   throwIfAborted(signal);
   if (!journal.incidentId || !journal.approvalId || !journal.planId)
@@ -322,6 +330,12 @@ async function submitMockDecision(
     planHash: await readPlanHash(journal),
     decision: decision === "approve" ? "approved" : "rejected",
     ...(decision === "reject" ? { reason: "Demo rejection." } : {}),
+    ...(redactionSources?.approvalComment
+      ? { comment: redactionSources.approvalComment }
+      : {}),
+    ...(redactionSources?.approvalActor
+      ? { actorHint: redactionSources.approvalActor }
+      : {}),
   });
   const nonce = randomBytes(16).toString("base64url");
   const path = `/api/incidents/${journal.incidentId}/approvals/${journal.approvalId}/decision`;
@@ -343,6 +357,10 @@ async function submitMockDecision(
     }),
   );
   throwIfAborted(signal);
+  if (response.status === 200 && redactionSources?.approvalComment)
+    redactionSourceObserved?.("approval-comment");
+  if (response.status === 200 && redactionSources?.approvalActor)
+    redactionSourceObserved?.("approval-actor");
   return response.status === 200;
 }
 

@@ -17,7 +17,11 @@ import { persistRedisDecodeFailure } from "../db/redis-decode-failure-operations
 import type { StructuredLogger } from "../logging.js";
 import { DomainEventSchema } from "../schemas/domain-event.js";
 import { opaqueId } from "../schemas/common.js";
-import { createPhase4TraceCarrier } from "../mastra/observability.js";
+import {
+  createPhase4TraceCarrier,
+  Phase10TraceCarrierSchema,
+  startPhase10Boundary,
+} from "../mastra/observability.js";
 
 const workerEventSchema = DomainEventSchema.extend({
   type: z.literal("security.alert.received"),
@@ -163,6 +167,16 @@ export async function startWorkflowWorker(
       return;
     }
     try {
+      const propagatedTrace = phase10Trace(event.data.payload);
+      const consumed = startPhase10Boundary({
+        boundary: "pubsub.consume",
+        tenantId: event.data.tenantId,
+        incidentId: event.data.incidentId,
+        runId: propagatedTrace?.runId ?? event.data.eventId,
+        correlationId: event.data.correlationId,
+        requestId: propagatedTrace?.requestId ?? event.data.eventId,
+        ...(propagatedTrace ? { context: propagatedTrace } : {}),
+      });
       const run = await input.workflow.createRun({
         runId: event.data.eventId,
         resourceId: event.data.incidentId,
@@ -172,17 +186,56 @@ export async function startWorkflowWorker(
         incidentId: event.data.incidentId,
         runId: event.data.eventId,
         correlationId: event.data.correlationId,
+        requestId: propagatedTrace?.requestId ?? event.data.eventId,
       });
-      const started = await run.startAsync({
-        inputData: {
-          eventId: event.data.eventId,
-          incidentId: event.data.incidentId,
+      let started;
+      try {
+        const workflow = startPhase10Boundary({
+          boundary: "workflow.start",
           tenantId: event.data.tenantId,
-          alertId: event.data.payload.alertId,
+          incidentId: event.data.incidentId,
+          runId: propagatedTrace?.runId ?? event.data.eventId,
           correlationId: event.data.correlationId,
-        },
-        ...traceCarrier,
-      });
+          requestId: propagatedTrace?.requestId ?? event.data.eventId,
+          context: consumed.context,
+        });
+        try {
+          // Advance the durable continuation to the workflow boundary before
+          // its first step materializes the operational run. Later suspend /
+          // resume steps therefore descend from workflow.start rather than
+          // reopening the outbox.publish parent as a sibling.
+          if (propagatedTrace)
+            await input.store.execute({
+              sql: `UPDATE outbox_events SET payload_json = json_set(
+                payload_json, '$.__phase10Trace', ?
+              ) WHERE id = ?`,
+              args: [
+                JSON.stringify({
+                  ...workflow.context,
+                  runId: event.data.eventId,
+                  requestId: propagatedTrace.requestId,
+                }),
+                event.data.eventId,
+              ],
+            });
+          started = await run.startAsync({
+            inputData: {
+              eventId: event.data.eventId,
+              incidentId: event.data.incidentId,
+              tenantId: event.data.tenantId,
+              alertId: event.data.payload.alertId,
+              correlationId: event.data.correlationId,
+            },
+            ...traceCarrier,
+          });
+          workflow.span.end({ attributes: { success: true } as never });
+        } catch (error) {
+          workflow.span.error({ error: error as Error, endSpan: true });
+          throw error;
+        }
+      } finally {
+        consumed.span.end({ attributes: { success: true } as never });
+      }
       input.logger.write({
         event: "worker.started",
         correlationId: event.data.correlationId,
@@ -283,6 +336,29 @@ export async function startWorkflowWorker(
   };
 }
 
+function phase10Trace(payload: unknown):
+  | Readonly<{
+      traceId: string;
+      parentSpanId?: string;
+      runId: string;
+      requestId: string;
+    }>
+  | undefined {
+  const raw =
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).__phase10Trace
+      : undefined;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+  return Phase10TraceCarrierSchema.safeParse(value).data;
+}
+
 /**
  * A parsed but non-authoritative envelope is poison at the Redis transport
  * boundary.  The serialized value is used only to calculate hash/size, then
@@ -380,9 +456,52 @@ async function matchesOutboxEnvelope(
     raw.correlationId === source.correlation_id &&
     raw.occurredAt === source.occurred_at &&
     (raw.causationId ?? null) === source.causation_id &&
-    canonicalJson(raw.payload) ===
-      canonicalJson(JSON.parse(String(source.payload_json))),
+    samePayloadExceptTrace(
+      raw.payload,
+      JSON.parse(String(source.payload_json)),
+    ),
   );
+}
+
+function samePayloadExceptTrace(left: unknown, right: unknown): boolean {
+  if (!left || typeof left !== "object" || !right || typeof right !== "object")
+    return canonicalJson(left) === canonicalJson(right);
+  const candidate = { ...(left as Record<string, unknown>) };
+  const source = { ...(right as Record<string, unknown>) };
+  const candidateCarrier = parseTraceCarrier(candidate);
+  const sourceCarrier = parseTraceCarrier(source);
+  delete candidate.__phase10Trace;
+  delete source.__phase10Trace;
+  if (canonicalJson(candidate) !== canonicalJson(source)) return false;
+  if (candidateCarrier.state !== sourceCarrier.state) return false;
+  // A malformed carrier must never be accepted merely because the candidate
+  // copied the same malformed bytes from an untrusted transport envelope.
+  if (candidateCarrier.state === "invalid") return false;
+  if (candidateCarrier.state !== "present") return true;
+  return (
+    sourceCarrier.state === "present" &&
+    canonicalJson(candidateCarrier.value) === canonicalJson(sourceCarrier.value)
+  );
+}
+
+function parseTraceCarrier(payload: Record<string, unknown>):
+  | Readonly<{ state: "absent" }>
+  | Readonly<{ state: "invalid" }>
+  | Readonly<{
+      state: "present";
+      value: ReturnType<typeof Phase10TraceCarrierSchema.parse>;
+    }> {
+  if (!("__phase10Trace" in payload)) return { state: "absent" };
+  const raw = payload.__phase10Trace;
+  if (typeof raw !== "string") return { state: "invalid" };
+  try {
+    const parsed = Phase10TraceCarrierSchema.safeParse(JSON.parse(raw));
+    return parsed.success
+      ? { state: "present", value: parsed.data }
+      : { state: "invalid" };
+  } catch {
+    return { state: "invalid" };
+  }
 }
 
 function canonicalJson(value: unknown): string {

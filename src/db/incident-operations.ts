@@ -21,6 +21,12 @@ export type OperationDependencies = Readonly<{
   clock?: Clock;
   ids?: IdGenerator;
   correlationId?: string;
+  phase10Trace?: Readonly<{
+    traceId: string;
+    parentSpanId?: string;
+    runId: string;
+    requestId: string;
+  }>;
   enforceAlertOrdering?: boolean;
   /** May enrich an alert only with local, transactionally verified facts. */
   beforeIncidentWrite?: (
@@ -221,7 +227,13 @@ export async function createIncidentFromAlertResult(
             dependencies.correlationId ?? persistedAlert.idempotencyKey,
           causationId: persistedAlert.sourceEventId,
           occurredAt: now,
-          payload: { alertId: persistedAlert.alertId, status: "received" },
+          payload: {
+            alertId: persistedAlert.alertId,
+            status: "received",
+            ...(dependencies.phase10Trace
+              ? { __phase10Trace: JSON.stringify(dependencies.phase10Trace) }
+              : {}),
+          },
         });
         return {
           duplicate: false,

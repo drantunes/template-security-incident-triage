@@ -10,6 +10,7 @@ export type EligibleGeneration = Readonly<{
   chunkCount: number;
   aggregateHash: string;
   allowedActionsJson: string;
+  mandatoryRulesJson: string;
   sourceHash: string;
 }>;
 

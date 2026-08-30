@@ -148,11 +148,11 @@ export async function claimRetrievalSelection(
         retrieval_id, tenant_id, incident_id, workflow_run_id, correlation_id,
         incident_kind, runbook_id, version, generation_id, index_name,
         activation_revision, source_hash, generation_aggregate_hash, citation,
-        allowed_actions_json,
+        allowed_actions_json, mandatory_rules_json,
         query_hash, status, error_code, attempt, lease_token, lease_expires_at,
         threshold, top_k, policy_version,
         selected_at, finished_at, selection_integrity_hash, aggregate_integrity_hash
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress',
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress',
         NULL, ?, ?, ?, ?, ?, 1, ?, NULL, ?, NULL)`,
       args: [
         selection.retrievalId,
@@ -170,6 +170,7 @@ export async function claimRetrievalSelection(
         generation.aggregateHash,
         citation,
         generation.allowedActionsJson,
+        generation.mandatoryRulesJson,
         input.queryHash,
         attempt,
         leaseToken,
