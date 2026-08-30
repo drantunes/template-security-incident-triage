@@ -45,49 +45,59 @@ export async function exportAnalyticsSince(
     limit < 1
   )
     throw new Error("PHASE10_ANALYTICS_CURSOR_INVALID");
-  const journal = await store.execute({
-    sql: "SELECT sequence,source,source_id,source_version,changed_at,snapshot_json FROM analytics_export_events WHERE sequence > ? ORDER BY sequence LIMIT ?",
-    args: [cursor, limit],
-  });
   const output: AnalyticsRecord[] = [];
-  for (const raw of journal.rows) {
-    const event = journalSchema.parse(raw);
-    // The snapshot is materialised in the append-only event; reading a mutable
-    // source row here would rewrite historical retries/approvals during export.
-    const row = publicRowSchema.parse(
-      JSON.parse(event.snapshot_json) as unknown,
-    );
-    if (row.id !== event.source_id)
-      throw new Error("PHASE10_ANALYTICS_SNAPSHOT_INVALID");
-    if (!row.occurred_at || !row.category)
-      throw new Error("PHASE10_ANALYTICS_SOURCE_INVALID");
-    // Version 9 could only reconstruct a provider terminal timestamp as the
-    // explicit 1970 sentinel. Keep that immutable journal row for audit, but
-    // never promote it into an authoritative metric sample.
-    if (
-      event.source === "provider_deliveries" &&
-      row.occurred_at === "1970-01-01T00:00:00.000Z"
-    )
-      continue;
-    output.push({
-      sequence: event.sequence,
-      source: event.source,
-      sourceId: row.id,
-      // `source_version` describes the mutable producer state and can repeat
-      // for a legitimate update (for example external_ref changes while a
-      // provider remains pending). The append-only journal sequence is the
-      // authoritative monotonic version for the read model.
-      sourceVersion: `${event.source_version}@${event.sequence}`,
-      tenantId: row.tenant_id,
-      incidentId: row.incident_id ?? undefined,
-      occurredAt: row.occurred_at,
-      category: row.category,
-      status: row.status ?? undefined,
-      scenario: row.scenario ?? undefined,
-      checksum: createHash("sha256")
-        .update(event.snapshot_json, "utf8")
-        .digest("hex"),
+  // A v9 historical terminal row can be intentionally withheld below because
+  // it has no authoritative timestamp. Continue scanning raw pages so a gap
+  // cannot hide later valid rows or stall a cursor-based consumer.
+  let rawCursor = cursor;
+  for (;;) {
+    const journal = await store.execute({
+      sql: "SELECT sequence,source,source_id,source_version,changed_at,snapshot_json FROM analytics_export_events WHERE sequence > ? ORDER BY sequence LIMIT ?",
+      args: [rawCursor, limit],
     });
+    if (!journal.rows.length) break;
+    for (const raw of journal.rows) {
+      const event = journalSchema.parse(raw);
+      rawCursor = event.sequence;
+      // The snapshot is materialised in the append-only event; reading a mutable
+      // source row here would rewrite historical retries/approvals during export.
+      const row = publicRowSchema.parse(
+        JSON.parse(event.snapshot_json) as unknown,
+      );
+      if (row.id !== event.source_id)
+        throw new Error("PHASE10_ANALYTICS_SNAPSHOT_INVALID");
+      if (!row.occurred_at || !row.category)
+        throw new Error("PHASE10_ANALYTICS_SOURCE_INVALID");
+      // Version 9 could only reconstruct a provider terminal timestamp as the
+      // explicit 1970 sentinel. Keep that immutable journal row for audit, but
+      // never promote it into an authoritative metric sample.
+      if (
+        event.source === "provider_deliveries" &&
+        row.occurred_at === "1970-01-01T00:00:00.000Z"
+      )
+        continue;
+      output.push({
+        sequence: event.sequence,
+        source: event.source,
+        sourceId: row.id,
+        // `source_version` describes the mutable producer state and can repeat
+        // for a legitimate update (for example external_ref changes while a
+        // provider remains pending). The append-only journal sequence is the
+        // authoritative monotonic version for the read model.
+        sourceVersion: `${event.source_version}@${event.sequence}`,
+        tenantId: row.tenant_id,
+        incidentId: row.incident_id ?? undefined,
+        occurredAt: row.occurred_at,
+        category: row.category,
+        status: row.status ?? undefined,
+        scenario: row.scenario ?? undefined,
+        checksum: createHash("sha256")
+          .update(event.snapshot_json, "utf8")
+          .digest("hex"),
+      });
+      if (output.length === limit) return Object.freeze(output);
+    }
+    if (journal.rows.length < limit) break;
   }
   return Object.freeze(output);
 }
