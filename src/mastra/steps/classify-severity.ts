@@ -70,6 +70,23 @@ export function createClassifySeverityStep(
           dependencies.planner,
           abortSignal,
         );
+        // The classification step, rather than a caller observing its result,
+        // owns the operational severity projection.  This keeps dashboard and
+        // workflow readbacks tied to the exact policy decision that produced
+        // the approval plan.
+        if (result.status === "classified") {
+          const persisted = await store.execute({
+            sql: `UPDATE incidents SET severity = ?
+              WHERE tenant_id = ? AND id = ? AND (severity IS NULL OR severity = ?)`,
+            args: [
+              result.decision.severity,
+              context.correlation.context.tenantId,
+              context.correlation.context.incidentId,
+              result.decision.severity,
+            ],
+          });
+          if (persisted.rowsAffected !== 1) throw new DomainError("CONFLICT");
+        }
         await appendPhase5Timeline(
           store,
           context,

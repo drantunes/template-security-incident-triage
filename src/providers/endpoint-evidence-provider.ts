@@ -1,8 +1,19 @@
-import type { EvidenceFact } from "../evidence/contracts.js";
+import {
+  EvidenceProviderResultSchema,
+  type EvidenceFact,
+} from "../evidence/contracts.js";
 import type {
   EndpointEvidenceProvider,
   SafeProviderCall,
 } from "./evidence-provider.js";
+import type { EvidenceProviderInput } from "../evidence/contracts.js";
+import {
+  readDemoEvidenceBaseline,
+  isDemoDeviceAuthorized,
+  consumeDemoDeviceNonce,
+  verifyDemoDevice,
+} from "../demo/evidence-baseline.js";
+import type { OperationalStore } from "../db/operational-store.js";
 import {
   executeMockInspection,
   type MockProviderOptions,
@@ -12,11 +23,36 @@ export class MockEndpointEvidenceProvider implements EndpointEvidenceProvider {
   readonly source = "endpoint" as const;
   readonly providerId = "mock-endpoint";
   readonly calls: SafeProviderCall[] = [];
-  constructor(private readonly options: MockProviderOptions = {}) {}
-  inspect(
+  private readonly usedNonces = new Set<string>();
+  constructor(
+    private readonly options: MockProviderOptions & {
+      /** DB-backed F9 authority, when the caller has an owned local store. */
+      openBaselineStore?: () => OperationalStore;
+      /** F9 owns a persisted baseline; corruption must not activate legacy facts. */
+      requireDemoBaseline?: boolean;
+      /** Explicit fixture authority for pre-F9 mock harnesses. */
+      verifyDeviceSignature?: (input: EvidenceProviderInput) => boolean;
+    } = {},
+  ) {}
+  async inspect(
     input: Parameters<EndpointEvidenceProvider["inspect"]>[0],
     options: Parameters<EndpointEvidenceProvider["inspect"]>[1],
   ) {
+    const baseline = await readDemoEvidenceBaseline(
+      this.options.openBaselineStore,
+      input,
+    );
+    if (this.options.requireDemoBaseline && !baseline)
+      return EvidenceProviderResultSchema.parse({
+        status: "invalid_response",
+        provider: this.providerId,
+        error: {
+          code: "INVALID_RESPONSE",
+          retryable: false,
+          safeRef: `provider:endpoint:attempt-${options.attempt}`,
+          attempt: options.attempt,
+        },
+      });
     return executeMockInspection({
       provider: "mock-endpoint",
       providerRef: "endpoint",
@@ -27,21 +63,38 @@ export class MockEndpointEvidenceProvider implements EndpointEvidenceProvider {
       ...(this.options.release ? { release: this.options.release } : {}),
       ...(this.options.onStart ? { onStart: this.options.onStart } : {}),
       callLog: this.calls,
-      facts: (request) =>
+      facts: async (request) =>
         endpointFacts(
-          request.occurredAt,
-          request.incidentKind,
-          request.deviceId,
+          request,
+          baseline,
+          this.usedNonces,
+          await isDemoDeviceAuthorized(this.options.openBaselineStore, request),
+          this.options.verifyDeviceSignature,
+          this.options.requireDemoBaseline
+            ? () =>
+                baseline?.device
+                  ? consumeDemoDeviceNonce(
+                      this.options.openBaselineStore,
+                      baseline.device,
+                      request,
+                    )
+                  : Promise.resolve(false)
+            : undefined,
         ),
     });
   }
 }
 
-function endpointFacts(
-  observedAt: string,
-  incidentKind: string,
-  deviceId?: string,
-): readonly EvidenceFact[] {
+async function endpointFacts(
+  input: EvidenceProviderInput,
+  baseline: Awaited<ReturnType<typeof readDemoEvidenceBaseline>>,
+  usedNonces: Set<string>,
+  authorized: boolean,
+  verifyDeviceSignature:
+    ((input: EvidenceProviderInput) => boolean) | undefined,
+  consumeNonce: (() => Promise<boolean>) | undefined,
+): Promise<readonly EvidenceFact[]> {
+  const { occurredAt: observedAt, incidentKind, deviceId } = input;
   if (incidentKind !== "unknown_device_login")
     return [
       booleanFact(
@@ -65,13 +118,20 @@ function endpointFacts(
       observedAt,
       "device-signature-valid",
       "device.signatureValid",
-      true,
+      // Absence of authority is never a signature. Legacy fixture paths must
+      // inject an explicit verifier instead of inheriting a permissive default.
+      baseline?.device
+        ? consumeNonce
+          ? verifyDemoDevice(baseline.device, input, new Set()) &&
+            (await consumeNonce())
+          : verifyDemoDevice(baseline.device, input, usedNonces)
+        : verifyDeviceSignature?.(input) === true,
     ),
     booleanFact(
       observedAt,
       "device-authorized",
       "device.authorized",
-      deviceId === "device-known-1",
+      authorized,
     ),
   ];
 }

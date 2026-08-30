@@ -30,7 +30,12 @@ export function createUpdateExternalIncidentStep(
     execute: async ({ inputData }) => {
       if (
         inputData.status === "manual-review" ||
-        inputData.status === "blocked"
+        inputData.status === "blocked" ||
+        // Expiry is an authority boundary, not a containment failure. The
+        // Phase 6 dispatcher already records the durable approval.expired
+        // timeline/outbox event before resuming this run; do not turn that
+        // zero-effect path into an external final-failed delivery.
+        inputData.status === "expired"
       )
         return inputData;
       const store = (dependencies.openStore ?? createLibSqlOperationalStore)();

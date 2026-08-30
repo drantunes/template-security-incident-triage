@@ -13,6 +13,8 @@
     "dev:server": "node --env-file-if-exists=.env --import tsx src/start.ts",
     "dev:studio": "mastra dev",
     "fixture:sign": "node --env-file-if-exists=.env scripts/sign-webhook.mjs scripts/fixtures/phase2-alert.json",
+    "demo": "node --import tsx scripts/phase9-demo.mts",
+    "demo:surfaces": "node --no-deprecation --import tsx scripts/phase9-demo-surfaces.mts",
     "build": "npm run runbooks:validate && tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=.env dist/start.js",
     "format": "prettier --write .",

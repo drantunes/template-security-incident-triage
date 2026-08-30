@@ -27,7 +27,9 @@ export async function executeMockInspection(input: {
   release?: Promise<void>;
   onStart?: () => void;
   callLog: SafeProviderCall[];
-  facts: (request: EvidenceProviderInput) => readonly EvidenceFact[];
+  facts: (
+    request: EvidenceProviderInput,
+  ) => readonly EvidenceFact[] | Promise<readonly EvidenceFact[]>;
 }): Promise<EvidenceProviderResult> {
   const request = EvidenceProviderInputSchema.safeParse(input.request);
   if (!request.success) throw new DomainError("VALIDATION_FAILED");
@@ -63,7 +65,7 @@ export async function executeMockInspection(input: {
   return EvidenceProviderResultSchema.parse({
     status: "success",
     provider: input.provider,
-    facts: input.facts(request.data),
+    facts: await input.facts(request.data),
   });
 }
 

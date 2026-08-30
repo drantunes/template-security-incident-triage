@@ -557,7 +557,9 @@ function createPhase6Workflow(
     },
     {
       identityProvider: new MockIdentityEvidenceProvider(),
-      endpointProvider: new MockEndpointEvidenceProvider(),
+      endpointProvider: new MockEndpointEvidenceProvider({
+        verifyDeviceSignature: (input) => input.deviceId === "device-new-1",
+      }),
       cloudProvider: new MockCloudEvidenceProvider(),
       clock: fixedClock("2026-08-28T10:00:30.000Z"),
       supervisor: async () => ({
