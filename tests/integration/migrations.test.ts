@@ -6,6 +6,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DuckDbAnalyticsStore } from "../../src/analytics/duckdb-analytics-store.js";
 import { migrateOperationalStore } from "../../src/db/migrate.js";
+import {
+  migrationChecksum,
+  migrations,
+} from "../../src/db/migrations/index.js";
+import { phase11CanonicalTenantReconciliationIntegrity } from "../../src/db/migrations/0023-phase11-canonical-tenant-reconciliation.js";
 import { exportAnalyticsSince } from "../../src/analytics/exporter.js";
 import {
   createTempDatabase,
@@ -159,6 +164,7 @@ describe("SOC migrations", () => {
         { version: 21 },
         { version: 22 },
         { version: 23 },
+        { version: 24 },
       ]);
       await expect(
         store.execute({
@@ -466,6 +472,45 @@ describe("SOC migrations", () => {
     } finally {
       first.close();
       second.close();
+    }
+  });
+
+  it("pins executable migration identity and rejects semantic descriptor drift", async () => {
+    const semanticDrift = {
+      ...phase11CanonicalTenantReconciliationIntegrity,
+      tenantPredicate: "isCanonicalTenantId/v2",
+    };
+    const checksum = migrationChecksum([], {
+      schema: "soc-migration-integrity/v1",
+      executable: phase11CanonicalTenantReconciliationIntegrity,
+    });
+    const driftedChecksum = migrationChecksum([], {
+      schema: "soc-migration-integrity/v1",
+      executable: semanticDrift,
+    });
+    expect(checksum).toBe(migrations[23]?.checksum);
+    expect(driftedChecksum).not.toBe(checksum);
+
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      // v23 retains its already-published checksum; v24 anchors its executable
+      // plan in the same forward transaction for both fresh and legacy stores.
+      await migrateOperationalStore(store, { targetVersion: 23 });
+      await expect(migrateOperationalStore(store)).resolves.toBeUndefined();
+      await expect(migrateOperationalStore(store)).resolves.toBeUndefined();
+
+      const driftedSet = migrations.map((migration) =>
+        migration.version === 24
+          ? { ...migration, checksum: driftedChecksum }
+          : migration,
+      );
+      await expect(
+        migrateOperationalStore(store, { migrationSet: driftedSet }),
+      ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    } finally {
+      store.close();
     }
   });
 

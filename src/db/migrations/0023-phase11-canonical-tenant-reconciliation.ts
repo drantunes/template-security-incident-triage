@@ -43,6 +43,42 @@ export const phase11CanonicalTenantReconciliationStatements = [
     BEGIN SELECT RAISE(ABORT, 'PHASE11_RETENTION_APPEND_ONLY'); END`,
 ] as const;
 
+/**
+ * Stable, executable-plan identity. Migration 0024 hashes this descriptor
+ * atomically with the 0023 reconciliation on fresh upgrades. It is explicit
+ * rather than derived from a function's source, so formatting and runtime
+ * differences cannot silently change the migration's identity.
+ */
+export const phase11CanonicalTenantReconciliationIntegrity = Object.freeze({
+  schema: "phase11-canonical-tenant-reconciliation/v1",
+  tenantPredicate: "isCanonicalTenantId/v1",
+  quarantine: "RETENTION_TENANT_NONCANONICAL",
+  copies: [
+    {
+      sourceTable: "retention_source_cursors_v22_reconciliation_source",
+      columns: ["tenant_id", "next_source"],
+      insertSql:
+        "INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES (?, ?)",
+    },
+    {
+      sourceTable: "retention_tombstone_claims_v22_reconciliation_source",
+      columns: [
+        "source",
+        "source_identity",
+        "tenant_id",
+        "retention_class",
+        "disposition",
+        "aged_at",
+        "tombstoned_at",
+        "sweep_id",
+      ],
+      insertSql: `INSERT INTO retention_tombstone_claims(
+        source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    },
+  ],
+});
+
 export async function reconcileCanonicalRetentionTenants(
   tx: StoreTransaction,
 ): Promise<void> {
@@ -50,50 +86,25 @@ export async function reconcileCanonicalRetentionTenants(
     phase11CanonicalTenantReconciliationStatements.map((sql) => ({ sql })),
   );
   const quarantinedAt = new Date().toISOString();
-  await copyRows(
-    tx,
-    "retention_source_cursors_v22_reconciliation_source",
-    ["tenant_id", "next_source"],
-    `INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES (?, ?)`,
-    quarantinedAt,
-  );
-  await copyRows(
-    tx,
-    "retention_tombstone_claims_v22_reconciliation_source",
-    [
-      "source",
-      "source_identity",
-      "tenant_id",
-      "retention_class",
-      "disposition",
-      "aged_at",
-      "tombstoned_at",
-      "sweep_id",
-    ],
-    `INSERT INTO retention_tombstone_claims(
-      source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    quarantinedAt,
-  );
+  for (const copy of phase11CanonicalTenantReconciliationIntegrity.copies)
+    await copyRows(tx, copy, quarantinedAt);
 }
 
 async function copyRows(
   tx: StoreTransaction,
-  sourceTable: string,
-  columns: readonly string[],
-  insertSql: string,
+  copy: (typeof phase11CanonicalTenantReconciliationIntegrity.copies)[number],
   quarantinedAt: string,
 ): Promise<void> {
   const result = await tx.execute({
-    sql: `SELECT ${columns.join(", ")} FROM ${sourceTable}`,
+    sql: `SELECT ${copy.columns.join(", ")} FROM ${copy.sourceTable}`,
   });
   for (const row of result.rows) {
     const tenantId = row.tenant_id;
     if (isCanonicalTenantId(tenantId)) {
-      const args: readonly InValue[] = columns.map(
+      const args: readonly InValue[] = copy.columns.map(
         (column) => row[column] ?? null,
       );
-      await tx.execute({ sql: insertSql, args });
+      await tx.execute({ sql: copy.insertSql, args });
       continue;
     }
     await tx.execute({
@@ -101,10 +112,10 @@ async function copyRows(
         source_table, tenant_id, payload_json, reason, quarantined_at
       ) VALUES (?, ?, ?, ?, ?)`,
       args: [
-        sourceTable,
+        copy.sourceTable,
         typeof tenantId === "string" ? tenantId : null,
         JSON.stringify(row),
-        "RETENTION_TENANT_NONCANONICAL",
+        phase11CanonicalTenantReconciliationIntegrity.quarantine,
         quarantinedAt,
       ],
     });

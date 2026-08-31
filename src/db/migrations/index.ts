@@ -24,6 +24,7 @@ import { phase11RetentionClaimsTenantKeyStatements } from "./0021-phase11-retent
 import { phase11RetentionTenantBoundaryStatements } from "./0022-phase11-retention-tenant-boundaries.js";
 import {
   phase11CanonicalTenantReconciliationStatements,
+  phase11CanonicalTenantReconciliationIntegrity,
   reconcileCanonicalRetentionTenants,
 } from "./0023-phase11-canonical-tenant-reconciliation.js";
 import type { StoreTransaction } from "../operational-store.js";
@@ -34,20 +35,44 @@ export type Migration = Readonly<{
   checksum: string;
   statements: readonly string[];
   apply?: (tx: StoreTransaction) => Promise<void>;
+  integrity?: MigrationIntegrityDescriptor;
+  /** Forward anchor for a published v1 checksum whose apply cannot be changed. */
+  integrityAnchor?: number;
 }>;
+
+export type MigrationIntegrityDescriptor = Readonly<{
+  schema: "soc-migration-integrity/v1";
+  executable: unknown;
+}>;
+
+export function migrationChecksum(
+  statements: readonly string[],
+  integrity?: MigrationIntegrityDescriptor,
+): string {
+  const material = integrity
+    ? canonicalJson({ statements, integrity })
+    : statements.join("\n");
+  return createHash("sha256").update(material).digest("hex");
+}
 
 function defineMigration(
   version: number,
   name: string,
   statements: readonly string[],
   apply?: (tx: StoreTransaction) => Promise<void>,
+  integrity?: MigrationIntegrityDescriptor,
+  integrityAnchor?: number,
 ): Migration {
+  if (apply && !integrity && integrityAnchor == null)
+    throw new Error("MIGRATION_EXECUTABLE_INTEGRITY_REQUIRED");
   return Object.freeze({
     version,
     name,
     statements,
-    checksum: createHash("sha256").update(statements.join("\n")).digest("hex"),
+    checksum: migrationChecksum(statements, integrity),
     ...(apply ? { apply } : {}),
+    ...(integrity ? { integrity } : {}),
+    ...(integrityAnchor == null ? {} : { integrityAnchor }),
   });
 }
 
@@ -135,5 +160,32 @@ export const migrations = Object.freeze([
     "phase11-canonical-tenant-reconciliation",
     phase11CanonicalTenantReconciliationStatements,
     reconcileCanonicalRetentionTenants,
+    undefined,
+    24,
+  ),
+  defineMigration(
+    24,
+    "phase11-canonical-tenant-reconciliation-integrity",
+    [],
+    undefined,
+    {
+      schema: "soc-migration-integrity/v1",
+      executable: phase11CanonicalTenantReconciliationIntegrity,
+    },
   ),
 ]);
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortCanonical(value));
+}
+
+function sortCanonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortCanonical);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, sortCanonical(nested)]),
+    );
+  return value;
+}

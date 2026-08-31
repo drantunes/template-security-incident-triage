@@ -78,6 +78,16 @@ function validateMigrationSet(
     if (migration.version !== index + 1) {
       throw new DomainError("VALIDATION_FAILED");
     }
+    if (
+      migration.apply &&
+      !migration.integrity &&
+      migration.integrityAnchor == null
+    )
+      throw new DomainError("VALIDATION_FAILED");
+    if (migration.integrityAnchor != null) {
+      const anchor = migrationSet[migration.integrityAnchor - 1];
+      if (!anchor?.integrity) throw new DomainError("VALIDATION_FAILED");
+    }
   });
 }
 
