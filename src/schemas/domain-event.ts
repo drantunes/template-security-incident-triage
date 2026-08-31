@@ -4,6 +4,7 @@ import {
   boundedJsonObject,
   opaqueId,
   schemaVersion,
+  tenantIdSchema,
   utcTimestamp,
 } from "./common.js";
 
@@ -27,7 +28,7 @@ export const DomainEventSchema = z
         schemaVersion,
         occurredAt: utcTimestamp,
         incidentId: opaqueId,
-        tenantId: opaqueId,
+        tenantId: tenantIdSchema,
         correlationId: opaqueId,
         causationId: opaqueId.optional(),
         payload: boundedJsonObject,

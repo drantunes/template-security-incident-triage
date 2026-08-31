@@ -22,24 +22,32 @@ import { phase11RetentionSourceCursorStatements } from "./0019-phase11-retention
 import { phase11ConsumerLedgerTenantStatements } from "./0020-phase11-consumer-ledger-tenant.js";
 import { phase11RetentionClaimsTenantKeyStatements } from "./0021-phase11-retention-claims-tenant-key.js";
 import { phase11RetentionTenantBoundaryStatements } from "./0022-phase11-retention-tenant-boundaries.js";
+import {
+  phase11CanonicalTenantReconciliationStatements,
+  reconcileCanonicalRetentionTenants,
+} from "./0023-phase11-canonical-tenant-reconciliation.js";
+import type { StoreTransaction } from "../operational-store.js";
 
 export type Migration = Readonly<{
   version: number;
   name: string;
   checksum: string;
   statements: readonly string[];
+  apply?: (tx: StoreTransaction) => Promise<void>;
 }>;
 
 function defineMigration(
   version: number,
   name: string,
   statements: readonly string[],
+  apply?: (tx: StoreTransaction) => Promise<void>,
 ): Migration {
   return Object.freeze({
     version,
     name,
     statements,
     checksum: createHash("sha256").update(statements.join("\n")).digest("hex"),
+    ...(apply ? { apply } : {}),
   });
 }
 
@@ -121,5 +129,11 @@ export const migrations = Object.freeze([
     22,
     "phase11-retention-tenant-boundaries",
     phase11RetentionTenantBoundaryStatements,
+  ),
+  defineMigration(
+    23,
+    "phase11-canonical-tenant-reconciliation",
+    phase11CanonicalTenantReconciliationStatements,
+    reconcileCanonicalRetentionTenants,
   ),
 ]);

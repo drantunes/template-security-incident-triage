@@ -74,7 +74,7 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(54);
+      expect(Number(indexes.rows[0]?.count)).toBe(55);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -158,6 +158,7 @@ describe("SOC migrations", () => {
         { version: 20 },
         { version: 21 },
         { version: 22 },
+        { version: 23 },
       ]);
       await expect(
         store.execute({
@@ -252,6 +253,46 @@ describe("SOC migrations", () => {
           sql: "SELECT count(*) AS count FROM retention_tombstone_claims_v21_legacy_withheld WHERE tenant_id = ' tenant-a '",
         }),
       ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reconciles v22 whitespace tenants through the shared Unicode boundary", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 22 });
+      const timestamp = "2026-08-27T12:00:00.000Z";
+      const emoji128 = "😀".repeat(128);
+      await store.execute({
+        sql: `INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES (?, 1), (?, 2), (?, 3)`,
+        args: ["\ttenant-tab", "\u00a0tenant-nbsp", emoji128],
+      });
+      await store.execute({
+        sql: `INSERT INTO retention_tombstone_claims(
+          source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
+        ) VALUES ('timeline_events', '["tab"]', ?, 'three-hundred-sixty-five-day', 'retained-authority', ?, ?, 'sweep-tab')`,
+        args: ["\ttenant-tab", timestamp, timestamp],
+      });
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_source_cursors ORDER BY next_source",
+        }),
+      ).resolves.toMatchObject({ rows: [{ tenant_id: emoji128 }] });
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM retention_tenant_quarantine",
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 3 }] });
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM retention_tombstone_claims WHERE tenant_id = ?",
+          args: ["\ttenant-tab"],
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 0 }] });
     } finally {
       store.close();
     }

@@ -48,7 +48,8 @@ export async function migrateOperationalStore(
         continue;
       }
 
-      await tx.batch(migration.statements.map((sql) => ({ sql })));
+      if (migration.apply) await migration.apply(tx);
+      else await tx.batch(migration.statements.map((sql) => ({ sql })));
       await tx.execute({
         sql: "INSERT INTO soc_schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
         args: [

@@ -28,13 +28,29 @@ describe("retention command and configuration", () => {
     for (const argv of [
       ["--limit", "1"],
       ["--tenant", " tenant-a ", "--limit", "1"],
+      ["--tenant", "\ttenant-a", "--limit", "1"],
+      ["--tenant", "\u00a0tenant-a", "--limit", "1"],
       ["--tenant", "a".repeat(129), "--limit", "1"],
+      ["--tenant", "😀".repeat(129), "--limit", "1"],
       ["--tenant", "tenant-a", "--limit", "1025"],
       ["--tenant", "tenant-a"],
     ])
       expect(() => parseRetentionCommand(argv)).toThrow(
         "RETENTION_COMMAND_INVALID",
       );
+  });
+
+  it("uses Unicode code points without normalizing tenant identity", () => {
+    const emoji128 = "😀".repeat(128);
+    expect(
+      parseRetentionCommand(["--tenant", emoji128, "--limit", "1"]),
+    ).toEqual({ tenantId: emoji128, limit: 1, dryRun: true });
+    expect(
+      parseRetentionCommand(["--tenant", "tenant-A", "--limit", "1"]),
+    ).toEqual({ tenantId: "tenant-A", limit: 1, dryRun: true });
+    expect(
+      parseRetentionCommand(["--tenant", "tenant-a", "--limit", "1"]),
+    ).toEqual({ tenantId: "tenant-a", limit: 1, dryRun: true });
   });
 
   it("rejects contradictory, duplicate, missing, unknown, and positional flags", () => {

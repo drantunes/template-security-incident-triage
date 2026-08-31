@@ -226,6 +226,15 @@ describe("server lifecycle", () => {
     } as const;
     for (const invalid of [
       {
+        name: "phase4",
+        setup: () => vi.stubEnv("MASTRA_MODEL", " "),
+        overrides: {
+          phase6Config,
+          phase7Config,
+          retentionConfig: disabledRetention,
+        },
+      },
+      {
         name: "phase6",
         setup: () => vi.stubEnv("MOCK_DECISIONS_ENABLED", "true"),
         overrides: { phase7Config, retentionConfig: disabledRetention },
@@ -249,17 +258,20 @@ describe("server lifecycle", () => {
       invalid.setup();
       const initializeStorage = vi.fn();
       const execute = vi.fn();
+      const loadMastraRuntime = vi.fn();
       await expect(
         startServerRuntime({
           config: makePhase2Config(),
           phase8Config,
           store: { execute } as unknown as OperationalStore,
           initializeStorage,
+          loadMastraRuntime,
           ...invalid.overrides,
         }),
       ).rejects.toThrow();
       expect(initializeStorage, invalid.name).not.toHaveBeenCalled();
       expect(execute, invalid.name).not.toHaveBeenCalled();
+      expect(loadMastraRuntime, invalid.name).not.toHaveBeenCalled();
     }
   });
 

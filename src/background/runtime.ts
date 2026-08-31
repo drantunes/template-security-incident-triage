@@ -23,6 +23,8 @@ import {
   type Phase8Config,
   type Phase6Config,
   type Phase7Config,
+  type Phase4Config,
+  readPhase4Config,
 } from "../env.js";
 import { consoleLogger, type StructuredLogger } from "../logging.js";
 import { createApp } from "../server.js";
@@ -49,6 +51,10 @@ type BindServer = (
   fetch: (request: Request) => Response | Promise<Response>,
   port: number,
 ) => Promise<BoundServer>;
+type MastraRuntimeModule = Readonly<{
+  createRuntimeMastra(config: Phase4Config): Mastra;
+  storage: Readonly<{ init(): void | Promise<void> }>;
+}>;
 
 export async function startServerRuntime(
   overrides: Readonly<{
@@ -62,12 +68,19 @@ export async function startServerRuntime(
     bindServer?: BindServer;
     phase6Config?: Phase6Config;
     phase7Config?: Phase7Config;
+    /** A validated F4 model/timeouts config is injected into Mastra assembly. */
+    phase4Config?: Phase4Config;
+    /** Test seam proving validation precedes the deferred Mastra module load. */
+    loadMastraRuntime?: () => Promise<MastraRuntimeModule>;
     /** A validated F8 config is injected once into every runtime boundary. */
     phase8Config?: Phase8Config;
     retentionConfig?: RetentionSchedulerConfig;
   }> = {},
 ): Promise<ServerRuntime> {
   const config = overrides.config ?? readPhase2Config();
+  // F4 is intentionally parsed before the runtime dynamically imports the
+  // Mastra graph (which can construct providers) or opens any local store.
+  const phase4Config = overrides.phase4Config ?? readPhase4Config();
   const phase8Config = overrides.phase8Config ?? readPhase8Config();
   assertPhase8ControlPlaneAuth(phase8Config);
   // Parse every runtime boundary before any store creation, storage init,
@@ -81,8 +94,12 @@ export async function startServerRuntime(
   const logger = overrides.logger ?? consoleLogger;
   const runtimeModule = overrides.mastraInstance
     ? undefined
-    : await import("../mastra/index.js");
-  const runtimeMastra = overrides.mastraInstance ?? runtimeModule!.mastra;
+    : await (
+        overrides.loadMastraRuntime ?? (() => import("../mastra/index.js"))
+      )();
+  const runtimeMastra =
+    overrides.mastraInstance ??
+    runtimeModule!.createRuntimeMastra(phase4Config);
   const initializeStorage =
     overrides.initializeStorage ??
     (runtimeModule

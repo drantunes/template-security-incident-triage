@@ -10,26 +10,32 @@ import {
 import { UNTRUSTED_DATA_INSTRUCTIONS } from "./investigator-output.js";
 import { PromptSafeFactSchema } from "./prompt-safe-evidence.js";
 
-export const correlationAnalyst = new Agent({
-  id: "correlation-analyst",
-  name: "Correlation Analyst",
-  description:
-    "Validates a bounded summary of deterministic persisted-evidence correlation.",
-  instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}
+export function createCorrelationAnalyst(model: string) {
+  return new Agent({
+    id: "correlation-analyst",
+    name: "Correlation Analyst",
+    description:
+      "Validates a bounded summary of deterministic persisted-evidence correlation.",
+    instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}
 You receive only prompt-safe tokens and numeric metadata derived from integrity-verified evidence.
 Validate the deterministic counts. Never classify severity, summarize, plan, or propose actions.`,
-  model: process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
-  maxRetries: 0,
-  tools: {},
-  defaultOptions: {
-    maxSteps: 1,
-    maxProcessorRetries: 0,
-    modelSettings: {
-      temperature: 0,
-      timeout: { totalMs: 3_000, stepMs: 1_500 },
+    model,
+    maxRetries: 0,
+    tools: {},
+    defaultOptions: {
+      maxSteps: 1,
+      maxProcessorRetries: 0,
+      modelSettings: {
+        temperature: 0,
+        timeout: { totalMs: 3_000, stepMs: 1_500 },
+      },
     },
-  },
-});
+  });
+}
+
+export const correlationAnalyst = createCorrelationAnalyst(
+  process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
+);
 
 export const CorrelationAnalystOutputSchema = z
   .object({

@@ -4,6 +4,7 @@ import type {
   OperationalStore,
   StoreTransaction,
 } from "./operational-store.js";
+import { isCanonicalTenantId } from "../schemas/common.js";
 
 const thirtyDaysMs = 30 * 86_400_000;
 const yearMs = 365 * 86_400_000;
@@ -453,7 +454,7 @@ function authoritySources(
 export function validateRetentionTenantId(
   tenantId: string | undefined,
 ): string {
-  if (!tenantId || tenantId.trim() !== tenantId || tenantId.length > 128)
+  if (!isCanonicalTenantId(tenantId))
     throw new Error("RETENTION_TENANT_INVALID");
   return tenantId;
 }
