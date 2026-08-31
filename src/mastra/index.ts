@@ -2,13 +2,34 @@ import { Mastra } from "@mastra/core/mastra";
 import { MastraAuthWorkos } from "@mastra/auth-workos";
 import { RedisStreamsPubSub } from "@mastra/redis-streams";
 
-import { smokeAgent } from "./agents/smoke-agent.js";
-import { identityInvestigator } from "./agents/identity-investigator.js";
-import { endpointInvestigator } from "./agents/endpoint-investigator.js";
-import { cloudInvestigator } from "./agents/cloud-investigator.js";
-import { correlationAnalyst } from "./agents/correlation-analyst.js";
-import { socSupervisor } from "./agents/soc-supervisor.js";
-import { responsePlanner } from "./agents/response-planner.js";
+import {
+  createSmokeAgent,
+  smokeAgent as defaultSmokeAgent,
+} from "./agents/smoke-agent.js";
+import {
+  createIdentityInvestigator,
+  identityInvestigator as defaultIdentityInvestigator,
+} from "./agents/identity-investigator.js";
+import {
+  createEndpointInvestigator,
+  endpointInvestigator as defaultEndpointInvestigator,
+} from "./agents/endpoint-investigator.js";
+import {
+  createCloudInvestigator,
+  cloudInvestigator as defaultCloudInvestigator,
+} from "./agents/cloud-investigator.js";
+import {
+  createCorrelationAnalyst,
+  correlationAnalyst as defaultCorrelationAnalyst,
+} from "./agents/correlation-analyst.js";
+import {
+  createSocSupervisor,
+  socSupervisor as defaultSocSupervisor,
+} from "./agents/soc-supervisor.js";
+import {
+  createResponsePlanner,
+  responsePlanner as defaultResponsePlanner,
+} from "./agents/response-planner.js";
 import { storage } from "./storage.js";
 import { baselineWorkflow } from "./workflows/baseline-workflow.js";
 import { createIncidentIngestionWorkflow } from "./workflows/incident-ingestion-workflow.js";
@@ -17,7 +38,9 @@ import { phase10MastraScorers } from "./evals/mastra-scorers.js";
 import {
   assertPhase8ControlPlaneAuth,
   hasRealPhase8Provider,
+  readPhase4Config,
   readPhase8Config,
+  type Phase4Config,
 } from "../env.js";
 import {
   createPhase8GeoIpProvider,
@@ -79,20 +102,25 @@ const phase8IdentityEvidenceProvider = phase8GeoIpProvider
       timeoutMs: phase8Config.ipinfo.timeoutMs,
     })
   : phase8IdentityEvidenceBase;
-const phase8IncidentIngestionWorkflow = createIncidentIngestionWorkflow(
-  createLibSqlOperationalStore,
-  {},
-  { identityProvider: phase8IdentityEvidenceProvider },
-  {},
-  {
-    enabled: true,
-    provider: phase8IncidentProvider,
-    mode: phase8Config.mode,
-    ...(phase8IdentityProvider
-      ? { identityProvider: phase8IdentityProvider }
-      : {}),
-  },
-);
+function createPhase8IncidentIngestionWorkflow(phase4Config: Phase4Config) {
+  return createIncidentIngestionWorkflow(
+    createLibSqlOperationalStore,
+    {},
+    {
+      identityProvider: phase8IdentityEvidenceProvider,
+      timeouts: phase4Config.timeouts,
+    },
+    {},
+    {
+      enabled: true,
+      provider: phase8IncidentProvider,
+      mode: phase8Config.mode,
+      ...(phase8IdentityProvider
+        ? { identityProvider: phase8IdentityProvider }
+        : {}),
+    },
+  );
+}
 // The official adapter is constructed once and handed directly to Mastra. It is
 // deliberately absent in mock mode; no staging configuration may silently use
 // the in-memory PubSub fallback.
@@ -124,23 +152,57 @@ const stagingPubSub = phase8Config.upstash.enabled
     })
   : undefined;
 
-export const mastra = new Mastra({
-  scorers: phase10MastraScorers,
-  agents: {
-    smokeAgent,
-    identityInvestigator,
-    endpointInvestigator,
-    cloudInvestigator,
-    correlationAnalyst,
-    socSupervisor,
-    responsePlanner,
-  },
-  workflows: {
-    baselineWorkflow,
-    incidentIngestionWorkflow: phase8IncidentIngestionWorkflow,
-  },
-  storage,
-  observability,
-  ...(stagingPubSub ? { pubsub: stagingPubSub } : {}),
-  ...(runtimeAuth ? { server: { auth: runtimeAuth } } : {}),
-});
+/** Builds Mastra only from a Phase 4 configuration already validated at boot. */
+export function createRuntimeMastra(
+  phase4Config: Phase4Config,
+  useDefaultAgents = false,
+): Mastra {
+  const identityInvestigator = useDefaultAgents
+    ? defaultIdentityInvestigator
+    : createIdentityInvestigator(phase4Config.model);
+  const endpointInvestigator = useDefaultAgents
+    ? defaultEndpointInvestigator
+    : createEndpointInvestigator(phase4Config.model);
+  const cloudInvestigator = useDefaultAgents
+    ? defaultCloudInvestigator
+    : createCloudInvestigator(phase4Config.model);
+  const smokeAgent = useDefaultAgents
+    ? defaultSmokeAgent
+    : createSmokeAgent(phase4Config.model);
+  const correlationAnalyst = useDefaultAgents
+    ? defaultCorrelationAnalyst
+    : createCorrelationAnalyst(phase4Config.model);
+  const socSupervisor = useDefaultAgents
+    ? defaultSocSupervisor
+    : createSocSupervisor(phase4Config.model, {
+        identityInvestigator,
+        endpointInvestigator,
+        cloudInvestigator,
+      });
+  const responsePlanner = useDefaultAgents
+    ? defaultResponsePlanner
+    : createResponsePlanner(phase4Config.model);
+  return new Mastra({
+    scorers: phase10MastraScorers,
+    agents: {
+      smokeAgent,
+      identityInvestigator,
+      endpointInvestigator,
+      cloudInvestigator,
+      correlationAnalyst,
+      socSupervisor,
+      responsePlanner,
+    },
+    workflows: {
+      baselineWorkflow,
+      incidentIngestionWorkflow:
+        createPhase8IncidentIngestionWorkflow(phase4Config),
+    },
+    storage,
+    observability,
+    ...(stagingPubSub ? { pubsub: stagingPubSub } : {}),
+    ...(runtimeAuth ? { server: { auth: runtimeAuth } } : {}),
+  });
+}
+
+export const mastra = createRuntimeMastra(readPhase4Config(), true);

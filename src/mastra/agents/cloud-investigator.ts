@@ -8,23 +8,29 @@ import {
   type InvestigatorInvoker,
 } from "./investigator-output.js";
 
-export const cloudInvestigator = new Agent({
-  id: "cloud-investigator",
-  name: "Cloud Investigator",
-  description: "Cites cloud facts for one trusted investigation scope.",
-  instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}\nUse only cloud-read-tool.`,
-  model: process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
-  maxRetries: 0,
-  tools: { cloudReadTool },
-  defaultOptions: {
-    maxSteps: 3,
-    maxProcessorRetries: 0,
-    modelSettings: {
-      temperature: 0,
-      timeout: { totalMs: 3_000, stepMs: 1_500 },
+export function createCloudInvestigator(model: string) {
+  return new Agent({
+    id: "cloud-investigator",
+    name: "Cloud Investigator",
+    description: "Cites cloud facts for one trusted investigation scope.",
+    instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}\nUse only cloud-read-tool.`,
+    model,
+    maxRetries: 0,
+    tools: { cloudReadTool },
+    defaultOptions: {
+      maxSteps: 3,
+      maxProcessorRetries: 0,
+      modelSettings: {
+        temperature: 0,
+        timeout: { totalMs: 3_000, stepMs: 1_500 },
+      },
     },
-  },
-});
+  });
+}
+
+export const cloudInvestigator = createCloudInvestigator(
+  process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
+);
 
 export const invokeCloudInvestigator: InvestigatorInvoker = async (
   input,

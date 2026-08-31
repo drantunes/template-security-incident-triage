@@ -5,10 +5,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { startServerRuntime } from "../../src/background/runtime.js";
 import { createLibSqlOperationalStore } from "../../src/db/libsql-operational-store.js";
+import type { OperationalStore } from "../../src/db/operational-store.js";
 import { baselineWorkflow } from "../../src/mastra/workflows/baseline-workflow.js";
 import { createIncidentIngestionWorkflow } from "../../src/mastra/workflows/incident-ingestion-workflow.js";
 import { makePhase2Config } from "../fixtures/phase2.js";
 import { readPhase8Config } from "../../src/env.js";
+import { retentionIntervalMs } from "../../src/config/retention.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -131,6 +133,7 @@ describe("server lifecycle", () => {
         incidentIngestionWorkflow: workflow,
       },
     });
+    const startupOrder: string[] = [];
     const runtime = await startServerRuntime({
       config: makePhase2Config({
         outbox: {
@@ -140,6 +143,9 @@ describe("server lifecycle", () => {
       }),
       store: database.createStore(),
       mastraInstance: mastra,
+      initializeStorage: async () => {
+        startupOrder.push("storage.init");
+      },
       logger: { write: () => {} },
       port: 0,
       bindServer: async (fetch) => ({
@@ -150,8 +156,149 @@ describe("server lifecycle", () => {
         },
       }),
     });
+    expect(startupOrder).toEqual(["storage.init"]);
     expect(runtime.port).toBe(43_210);
     await runtime.stop();
     await runtime.stop();
+  });
+
+  it("runs the explicitly scoped retention scheduler in the runtime lifecycle", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const workflow = createIncidentIngestionWorkflow(() =>
+      createLibSqlOperationalStore({ url: database.url }),
+    );
+    const mastra = new Mastra({
+      storage: new LibSQLStore({
+        id: "retention-lifecycle",
+        url: database.url,
+      }),
+      workflows: {
+        baselineWorkflow,
+        incidentIngestionWorkflow: workflow,
+      },
+    });
+    const runtime = await startServerRuntime({
+      config: makePhase2Config({
+        outbox: { ...makePhase2Config().outbox, pollIntervalMs: 60_000 },
+      }),
+      retentionConfig: {
+        enabled: true,
+        tenantId: "tenant-a",
+        limit: 8,
+        maxBatchesPerRun: 1,
+        intervalMs: retentionIntervalMs,
+      },
+      store: database.createStore(),
+      mastraInstance: mastra,
+      logger: { write: () => {} },
+      port: 0,
+      bindServer: async () => ({ port: 43_209, close: async () => {} }),
+    });
+    await expect(
+      database.createStore().execute({
+        sql: "SELECT next_source FROM retention_source_cursors WHERE tenant_id='tenant-a'",
+      }),
+    ).resolves.toMatchObject({
+      rows: [{ next_source: 1 }],
+    });
+    await runtime.stop();
+  });
+
+  it("rejects every late runtime configuration before storage initialization or SQL", async () => {
+    const phase8Config = readPhase8Config({ DEMO_MODE: "mock" });
+    const phase6Config = {
+      mode: "mock" as const,
+      mockDecisionsEnabled: false,
+      actionTimeoutMs: 1_000,
+      rateLimit: 8,
+    };
+    const phase7Config = {
+      enabled: false,
+      dashboardOrigin: "http://localhost:3000",
+      sessionMaxAgeSeconds: 28_800,
+      sseMaxConnections: 4,
+      trustedProxy: false,
+    };
+    const disabledRetention = {
+      enabled: false,
+      intervalMs: retentionIntervalMs,
+    } as const;
+    for (const invalid of [
+      {
+        name: "phase4",
+        setup: () => vi.stubEnv("MASTRA_MODEL", " "),
+        overrides: {
+          phase6Config,
+          phase7Config,
+          retentionConfig: disabledRetention,
+        },
+      },
+      {
+        name: "phase6",
+        setup: () => vi.stubEnv("MOCK_DECISIONS_ENABLED", "true"),
+        overrides: { phase7Config, retentionConfig: disabledRetention },
+      },
+      {
+        name: "phase7",
+        setup: () => vi.stubEnv("DASHBOARD_AUTH_ENABLED", "true"),
+        overrides: { phase6Config, retentionConfig: disabledRetention },
+      },
+      {
+        name: "retention",
+        setup: () => {
+          vi.stubEnv("RETENTION_SCHEDULER_ENABLED", "true");
+          vi.stubEnv("RETENTION_TENANT_ID", "tenant-a");
+          vi.stubEnv("RETENTION_SWEEP_LIMIT", "8");
+        },
+        overrides: { phase6Config, phase7Config },
+      },
+    ]) {
+      vi.unstubAllEnvs();
+      invalid.setup();
+      const initializeStorage = vi.fn();
+      const execute = vi.fn();
+      const loadMastraRuntime = vi.fn();
+      await expect(
+        startServerRuntime({
+          config: makePhase2Config(),
+          phase8Config,
+          store: { execute } as unknown as OperationalStore,
+          initializeStorage,
+          loadMastraRuntime,
+          ...invalid.overrides,
+        }),
+      ).rejects.toThrow();
+      expect(initializeStorage, invalid.name).not.toHaveBeenCalled();
+      expect(execute, invalid.name).not.toHaveBeenCalled();
+      expect(loadMastraRuntime, invalid.name).not.toHaveBeenCalled();
+    }
+  });
+
+  it("validates Phase 2 and Phase 8 before storage initialization or SQL", async () => {
+    for (const setup of [
+      () => {
+        vi.stubEnv("WEBHOOKS_ENABLED", "true");
+        vi.stubEnv("ALERT_WEBHOOK_SECRET", ` ${"a".repeat(16)}`);
+        vi.stubEnv("WORKOS_WEBHOOK_SECRET", "b".repeat(16));
+      },
+      () => {
+        vi.stubEnv("WEBHOOKS_ENABLED", "false");
+        vi.stubEnv("DEMO_MODE", "production");
+      },
+    ]) {
+      vi.unstubAllEnvs();
+      setup();
+      const initializeStorage = vi.fn();
+      const execute = vi.fn();
+      await expect(
+        startServerRuntime({
+          store: { execute } as unknown as OperationalStore,
+          initializeStorage,
+        }),
+      ).rejects.toThrow();
+      expect(initializeStorage).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+    }
   });
 });

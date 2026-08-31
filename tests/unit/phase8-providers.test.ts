@@ -33,7 +33,7 @@ const statusStateIds = {
 const linearConfig = {
   DEMO_MODE: "staging",
   LINEAR_PROVIDER_ENABLED: "true",
-  LINEAR_API_KEY: "linear-test-key",
+  LINEAR_API_KEY: "fake-linear-api-key",
   LINEAR_WORKSPACE_ID: "workspace_1",
   LINEAR_TEAM_ID: "team_1",
   LINEAR_SEVERITY_LABEL_IDS_JSON: JSON.stringify({
@@ -189,7 +189,7 @@ describe("Phase 8 real provider configuration", () => {
     const ipinfo = {
       DEMO_MODE: "staging",
       IPINFO_PROVIDER_ENABLED: "true",
-      IPINFO_TOKEN: "test-token",
+      IPINFO_TOKEN: "fake-ipinfo-token",
       GEOIP_CACHE_HMAC_KEY:
         "base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
       GEOIP_CACHE_HMAC_KEY_VERSION: "hmac-sha256-v2",

@@ -48,7 +48,8 @@ export async function migrateOperationalStore(
         continue;
       }
 
-      await tx.batch(migration.statements.map((sql) => ({ sql })));
+      if (migration.apply) await migration.apply(tx);
+      else await tx.batch(migration.statements.map((sql) => ({ sql })));
       await tx.execute({
         sql: "INSERT INTO soc_schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
         args: [
@@ -76,6 +77,24 @@ function validateMigrationSet(
   migrationSet.forEach((migration, index) => {
     if (migration.version !== index + 1) {
       throw new DomainError("VALIDATION_FAILED");
+    }
+    if (
+      migration.apply &&
+      !migration.integrity &&
+      migration.integrityAnchor == null
+    )
+      throw new DomainError("VALIDATION_FAILED");
+    if (
+      migration.version <= targetVersion &&
+      migration.integrityAnchor != null
+    ) {
+      const anchor = migrationSet[migration.integrityAnchor - 1];
+      if (
+        migration.integrityAnchor <= migration.version ||
+        !anchor?.integrity ||
+        migration.integrityAnchor > targetVersion
+      )
+        throw new DomainError("VALIDATION_FAILED");
     }
   });
 }

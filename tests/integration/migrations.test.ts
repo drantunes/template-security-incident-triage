@@ -2,11 +2,18 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DuckDbAnalyticsStore } from "../../src/analytics/duckdb-analytics-store.js";
 import { migrateOperationalStore } from "../../src/db/migrate.js";
+import {
+  migrationChecksum,
+  migrations,
+} from "../../src/db/migrations/index.js";
+import { phase11CanonicalTenantReconciliationIntegrity } from "../../src/db/migrations/0023-phase11-canonical-tenant-reconciliation.js";
+import { phase11CanonicalTenantReconciliationStatements } from "../../src/db/migrations/0023-phase11-canonical-tenant-reconciliation.js";
 import { exportAnalyticsSince } from "../../src/analytics/exporter.js";
+import { isCanonicalTenantId } from "../../src/schemas/common.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -39,11 +46,15 @@ describe("SOC migrations", () => {
             'containment_action_attempts','containment_gateway_audit',
             'approval_decision_audit','mock_incident_provider_effects',
             'mock_containment_effects','geoip_cache_entries','geoip_cache_leases','provider_effect_ledger',
-            'consumer_effect_ledger','workos_observed_memberships','workos_observed_sessions',
-            'workos_observed_positions','eval_results','analytics_export_events'
+            'consumer_effect_ledger','consumer_effect_ledger_legacy_withheld',
+            'retention_tombstone_claims_legacy_withheld',
+            'workos_observed_memberships','workos_observed_sessions',
+            'workos_observed_positions','eval_results','analytics_export_events',
+            'retention_audit_events','retention_tombstones','retention_tombstone_claims',
+            'retention_source_cursors'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(37);
+      expect(tables.rows).toHaveLength(43);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
       );
@@ -56,11 +67,21 @@ describe("SOC migrations", () => {
       expect(tables.rows.map((row) => row.name)).toContain(
         "workos_observed_positions",
       );
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_audit_events WHERE 1 = 0",
+        }),
+      ).resolves.toBeDefined();
+      await expect(
+        store.execute({
+          sql: "SELECT next_source FROM retention_source_cursors WHERE 1 = 0",
+        }),
+      ).resolves.toBeDefined();
 
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(47);
+      expect(Number(indexes.rows[0]?.count)).toBe(55);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -137,12 +158,150 @@ describe("SOC migrations", () => {
         { version: 13 },
         { version: 14 },
         { version: 15 },
+        { version: 16 },
+        { version: 17 },
+        { version: 18 },
+        { version: 19 },
+        { version: 20 },
+        { version: 21 },
+        { version: 22 },
+        { version: 23 },
+        { version: 24 },
+        { version: 25 },
       ]);
       await expect(
         store.execute({
           sql: `SELECT decision_provenance FROM approvals WHERE 1 = 0`,
         }),
       ).resolves.toBeDefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("migrates only legacy consumer effects with an unambiguous outbox tenant", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 19 });
+      const timestamp = "2026-08-27T12:00:00.000Z";
+      await store.execute({
+        sql: `INSERT INTO incidents(id, tenant_id, kind, subject_id, status, created_at, updated_at)
+          VALUES ('incident-consumer', 'tenant-a', 'unknown_device_login', 'subject', 'received', ?, ?)`,
+        args: [timestamp, timestamp],
+      });
+      await store.execute({
+        sql: `INSERT INTO outbox_events(
+          id, type, run_id, incident_id, tenant_id, schema_version, correlation_id, payload_json, occurred_at, available_at
+        ) VALUES ('outbox-consumer', 'security.incident.updated', 'run', 'incident-consumer', 'tenant-a', 1, 'correlation', '{}', ?, ?)`,
+        args: [timestamp, timestamp],
+      });
+      await store.execute({
+        sql: `INSERT INTO consumer_effect_ledger(
+          consumer_group, event_id, status, attempt_count, fence_token, lease_expires_at, completed_at
+        ) VALUES
+          ('security-workflow-starters', 'outbox-consumer', 'completed', 1, 'fence-owned', ?, ?),
+          ('phase9-device-nonce', 'opaque-legacy', 'completed', 1, 'fence-withheld', ?, ?)`,
+        args: [timestamp, timestamp, timestamp, timestamp],
+      });
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id, event_id FROM consumer_effect_ledger",
+        }),
+      ).resolves.toMatchObject({
+        rows: [{ tenant_id: "tenant-a", event_id: "outbox-consumer" }],
+      });
+      await expect(
+        store.execute({
+          sql: "SELECT consumer_group, event_id FROM consumer_effect_ledger_legacy_withheld",
+        }),
+      ).resolves.toMatchObject({
+        rows: [
+          { consumer_group: "phase9-device-nonce", event_id: "opaque-legacy" },
+        ],
+      });
+      await migrateOperationalStore(store);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("preserves only canonical legacy retention tenants and withholds invalid identities", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 21 });
+      const timestamp = "2026-08-27T12:00:00.000Z";
+      await store.execute({
+        sql: "INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES ('tenant-a', 1), (' tenant-a ', 2)",
+      });
+      await store.execute({
+        sql: `INSERT INTO retention_tombstone_claims(
+          source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
+        ) VALUES
+          ('timeline_events', '["valid"]', 'tenant-a', 'three-hundred-sixty-five-day', 'retained-authority', ?, ?, 'sweep-valid'),
+          ('timeline_events', '["withheld"]', ' tenant-a ', 'three-hundred-sixty-five-day', 'retained-authority', ?, ?, 'sweep-withheld')`,
+        args: [timestamp, timestamp, timestamp, timestamp],
+      });
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_source_cursors ORDER BY tenant_id",
+        }),
+      ).resolves.toMatchObject({ rows: [{ tenant_id: "tenant-a" }] });
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_tombstone_claims ORDER BY tenant_id",
+        }),
+      ).resolves.toMatchObject({ rows: [{ tenant_id: "tenant-a" }] });
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM retention_tombstone_claims_v21_legacy_withheld WHERE tenant_id = ' tenant-a '",
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 1 }] });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("reconciles v22 whitespace tenants through the shared Unicode boundary", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 22 });
+      const timestamp = "2026-08-27T12:00:00.000Z";
+      const emoji128 = "😀".repeat(128);
+      await store.execute({
+        sql: `INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES (?, 1), (?, 2), (?, 3)`,
+        args: ["\ttenant-tab", "\u00a0tenant-nbsp", emoji128],
+      });
+      await store.execute({
+        sql: `INSERT INTO retention_tombstone_claims(
+          source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
+        ) VALUES ('timeline_events', '["tab"]', ?, 'three-hundred-sixty-five-day', 'retained-authority', ?, ?, 'sweep-tab')`,
+        args: ["\ttenant-tab", timestamp, timestamp],
+      });
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_source_cursors ORDER BY next_source",
+        }),
+      ).resolves.toMatchObject({ rows: [{ tenant_id: emoji128 }] });
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM retention_tenant_quarantine",
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 3 }] });
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM retention_tombstone_claims WHERE tenant_id = ?",
+          args: ["\ttenant-tab"],
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 0 }] });
     } finally {
       store.close();
     }
@@ -316,6 +475,135 @@ describe("SOC migrations", () => {
     } finally {
       first.close();
       second.close();
+    }
+  });
+
+  it("pins executable migration identity and rejects semantic descriptor drift", async () => {
+    const semanticDrift = {
+      ...phase11CanonicalTenantReconciliationIntegrity,
+      tenantPolicy: { maxCodePoints: 127 },
+    };
+    const checksum = migrationChecksum([], {
+      schema: "soc-migration-integrity/v1",
+      executable: phase11CanonicalTenantReconciliationIntegrity,
+    });
+    const driftedChecksum = migrationChecksum([], {
+      schema: "soc-migration-integrity/v1",
+      executable: semanticDrift,
+    });
+    expect(checksum).toBe(migrations[24]?.checksum);
+    expect(driftedChecksum).not.toBe(checksum);
+    const boundaryTenant = "a".repeat(128);
+    expect(
+      isCanonicalTenantId(
+        boundaryTenant,
+        phase11CanonicalTenantReconciliationIntegrity.tenantPolicy,
+      ),
+    ).toBe(true);
+    expect(
+      isCanonicalTenantId(boundaryTenant, semanticDrift.tenantPolicy),
+    ).toBe(false);
+
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      // Simulate a database produced by the published v23→v24 path without
+      // using the current unsafe targetVersion route. Both historic checksums
+      // remain intact; the normal upgrade applies only the new v25 anchor.
+      await migrateOperationalStore(store, { targetVersion: 22 });
+      await store.transaction(async (tx) => {
+        await tx.batch(
+          phase11CanonicalTenantReconciliationStatements.map((sql) => ({
+            sql,
+          })),
+        );
+        await tx.execute({
+          sql: "INSERT INTO soc_schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+          args: [
+            migrations[22]!.version,
+            migrations[22]!.name,
+            migrations[22]!.checksum,
+            "2026-08-31T00:00:00.000Z",
+          ],
+        });
+        await tx.execute({
+          sql: "INSERT INTO soc_schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+          args: [
+            migrations[23]!.version,
+            migrations[23]!.name,
+            migrations[23]!.checksum,
+            "2026-08-31T00:00:00.000Z",
+          ],
+        });
+      });
+      await expect(migrateOperationalStore(store)).resolves.toBeUndefined();
+      await expect(
+        store.execute({
+          sql: "SELECT version FROM soc_schema_migrations WHERE version = 25",
+        }),
+      ).resolves.toMatchObject({ rows: [{ version: 25 }] });
+      await expect(migrateOperationalStore(store)).resolves.toBeUndefined();
+
+      const driftedSet = migrations.map((migration) =>
+        migration.version === 25
+          ? {
+              ...migration,
+              checksum: driftedChecksum,
+              integrity: {
+                schema: "soc-migration-integrity/v1" as const,
+                executable: semanticDrift,
+              },
+            }
+          : migration,
+      );
+      await expect(
+        migrateOperationalStore(store, { migrationSet: driftedSet }),
+      ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects an executable migration without its anchor before any SQL", async () => {
+    const execute = vi.fn();
+    const transaction = vi.fn();
+    await expect(
+      migrateOperationalStore(
+        { execute, transaction, close: () => {} },
+        { targetVersion: 24 },
+      ),
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(execute).not.toHaveBeenCalled();
+    expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it("rolls back an executable apply when its anchor cannot persist", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 22 });
+      await store.execute({
+        sql: `CREATE TRIGGER reject_retention_integrity_anchor
+          BEFORE INSERT ON soc_schema_migrations WHEN NEW.version = 25
+          BEGIN SELECT RAISE(ABORT, 'anchor rejected'); END`,
+      });
+      await expect(migrateOperationalStore(store)).rejects.toBeDefined();
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM soc_schema_migrations WHERE version IN (23, 24, 25)",
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+      await expect(
+        store.execute({
+          sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'retention_source_cursors'",
+        }),
+      ).resolves.toMatchObject({
+        rows: [{ name: "retention_source_cursors" }],
+      });
+    } finally {
+      store.close();
     }
   });
 

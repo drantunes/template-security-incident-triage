@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-import { opaqueId, schemaVersion, utcTimestamp } from "./common.js";
+import {
+  opaqueId,
+  schemaVersion,
+  tenantIdSchema,
+  utcTimestamp,
+} from "./common.js";
 
 export const IncidentKindSchema = z.enum([
   "unauthorized_privilege_change",
@@ -29,7 +34,7 @@ export const IncidentSchema = z
   .object({
     schemaVersion,
     incidentId: opaqueId,
-    tenantId: opaqueId,
+    tenantId: tenantIdSchema,
     subjectId: opaqueId,
     kind: IncidentKindSchema,
     severity: IncidentSeveritySchema.optional(),

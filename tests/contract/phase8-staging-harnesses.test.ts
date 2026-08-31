@@ -44,8 +44,8 @@ describe("Phase 8 staging harnesses (hermetic, default-deny)", () => {
         DEMO_MODE: "staging",
         WORKOS_PROVIDER_ENABLED: "true",
         WEBHOOKS_ENABLED: "true",
-        WORKOS_API_KEY: "key",
-        WORKOS_WEBHOOK_SECRET: "secret",
+        WORKOS_API_KEY: "fake-workos-api-key",
+        WORKOS_WEBHOOK_SECRET: "fake-workos-webhook-secret",
         WORKOS_STAGING_ORGANIZATION_ID: "tenant_1",
         WORKOS_STAGING_ALLOWED_USER_IDS: "<user_id>",
         WORKOS_STAGING_ALLOWED_ROLE_SLUGS: "admin",
@@ -56,8 +56,8 @@ describe("Phase 8 staging harnesses (hermetic, default-deny)", () => {
         DEMO_MODE: "staging",
         WORKOS_PROVIDER_ENABLED: "true",
         WEBHOOKS_ENABLED: "true",
-        WORKOS_API_KEY: "fake-workos-key",
-        WORKOS_WEBHOOK_SECRET: "fake-webhook-secret",
+        WORKOS_API_KEY: "fake-workos-api-key",
+        WORKOS_WEBHOOK_SECRET: "fake-workos-webhook-secret",
         WORKOS_STAGING_ORGANIZATION_ID: "tenant_1",
         WORKOS_STAGING_ALLOWED_USER_IDS: "user_1",
         WORKOS_STAGING_ALLOWED_ROLE_SLUGS: "admin",
@@ -69,7 +69,7 @@ describe("Phase 8 staging harnesses (hermetic, default-deny)", () => {
     const config = readPhase8Config({
       DEMO_MODE: "staging",
       IPINFO_PROVIDER_ENABLED: "true",
-      IPINFO_TOKEN: "fake-token",
+      IPINFO_TOKEN: "fake-ipinfo-token",
       GEOIP_CACHE_HMAC_KEY:
         "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
       GEOIP_CACHE_HMAC_KEY_VERSION: "hmac-sha256-v1",
@@ -95,7 +95,7 @@ describe("Phase 8 staging harnesses (hermetic, default-deny)", () => {
     const config = readPhase8Config({
       DEMO_MODE: "staging",
       LINEAR_PROVIDER_ENABLED: "true",
-      LINEAR_API_KEY: "fake-linear-key",
+      LINEAR_API_KEY: "fake-linear-api-key",
       LINEAR_WORKSPACE_ID: "workspace_1",
       LINEAR_TEAM_ID: "team_1",
       LINEAR_SEVERITY_LABEL_IDS_JSON: JSON.stringify({

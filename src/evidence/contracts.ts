@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { opaqueId, utcTimestamp } from "../schemas/common.js";
+import { opaqueId, tenantIdSchema, utcTimestamp } from "../schemas/common.js";
 import { IncidentKindSchema } from "../schemas/incident.js";
 
 export const MAX_CORRELATED_EVIDENCE_ITEMS = 3 * 16;
@@ -15,7 +15,7 @@ const InvestigationContextObjectSchema = z
     eventId: opaqueId,
     alertId: opaqueId,
     incidentId: opaqueId,
-    tenantId: opaqueId,
+    tenantId: tenantIdSchema,
     subjectId: opaqueId,
     workflowRunId: opaqueId,
     correlationId: opaqueId,

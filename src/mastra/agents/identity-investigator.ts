@@ -8,23 +8,29 @@ import {
   type InvestigatorInvoker,
 } from "./investigator-output.js";
 
-export const identityInvestigator = new Agent({
-  id: "identity-investigator",
-  name: "Identity Investigator",
-  description: "Cites identity facts for one trusted investigation scope.",
-  instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}\nUse only identity-read-tool.`,
-  model: process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
-  maxRetries: 0,
-  tools: { identityReadTool },
-  defaultOptions: {
-    maxSteps: 3,
-    maxProcessorRetries: 0,
-    modelSettings: {
-      temperature: 0,
-      timeout: { totalMs: 3_000, stepMs: 1_500 },
+export function createIdentityInvestigator(model: string) {
+  return new Agent({
+    id: "identity-investigator",
+    name: "Identity Investigator",
+    description: "Cites identity facts for one trusted investigation scope.",
+    instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}\nUse only identity-read-tool.`,
+    model,
+    maxRetries: 0,
+    tools: { identityReadTool },
+    defaultOptions: {
+      maxSteps: 3,
+      maxProcessorRetries: 0,
+      modelSettings: {
+        temperature: 0,
+        timeout: { totalMs: 3_000, stepMs: 1_500 },
+      },
     },
-  },
-});
+  });
+}
+
+export const identityInvestigator = createIdentityInvestigator(
+  process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
+);
 
 export const invokeIdentityInvestigator: InvestigatorInvoker = async (
   input,

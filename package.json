@@ -1,15 +1,15 @@
 {
-  "name": "mastra-security-incident",
+  "name": "template-security-incident-triage",
   "version": "0.1.0",
   "private": true,
-  "description": "Baseline for a security incident triage and response template built with Mastra.",
+  "description": "Community Mastra template for approval-gated security incident triage and response.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "node scripts/dev.mjs",
+    "dev": "node --import tsx scripts/dev.mjs",
     "dev:server": "node --env-file-if-exists=.env --import tsx src/start.ts",
     "dev:studio": "mastra dev",
     "fixture:sign": "node --env-file-if-exists=.env scripts/sign-webhook.mjs scripts/fixtures/phase2-alert.json",
@@ -17,6 +17,7 @@
     "demo:surfaces": "node --no-deprecation --import tsx scripts/phase9-demo-surfaces.mts",
     "phase10:report": "node --import tsx scripts/phase10-report.mts",
     "phase10:ci": "node --import tsx scripts/phase10-ci.mts",
+    "retention:sweep": "node --env-file-if-exists=.env --import tsx scripts/retention-sweep.mts",
     "build": "npm run runbooks:validate && tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=.env dist/start.js",
     "format": "prettier --write .",
@@ -66,5 +67,13 @@
   },
   "overrides": {
     "adm-zip": "0.6.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/drantunes/template-security-incident-triage.git"
+  },
+  "bugs": {
+    "url": "https://github.com/drantunes/template-security-incident-triage/issues"
+  },
+  "homepage": "https://github.com/drantunes/template-security-incident-triage#readme"
 }

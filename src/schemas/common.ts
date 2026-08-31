@@ -2,6 +2,37 @@ import { z } from "zod";
 
 export const schemaVersion = z.literal(1);
 export const opaqueId = z.string().trim().min(1).max(128);
+/**
+ * Tenant identities are opaque, byte-exact identifiers. Their length is
+ * counted in Unicode code points, matching SQLite's `length(TEXT)` semantics;
+ * accepted identities are never trimmed or normalized.
+ */
+export const maxTenantIdCodePoints = 128;
+
+export type CanonicalTenantPolicy = Readonly<{
+  maxCodePoints: number;
+}>;
+
+/** Values are consumed by every tenant boundary; identity itself is untouched. */
+export const canonicalTenantPolicy: CanonicalTenantPolicy = Object.freeze({
+  maxCodePoints: maxTenantIdCodePoints,
+});
+
+export function isCanonicalTenantId(
+  value: unknown,
+  policy: CanonicalTenantPolicy = canonicalTenantPolicy,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.trim() === value &&
+    Array.from(value).length <= policy.maxCodePoints
+  );
+}
+
+export const tenantIdSchema = z
+  .string()
+  .refine(isCanonicalTenantId, "tenant identity must be canonical and bounded");
 export const shortText = z.string().trim().min(1).max(256);
 export const longText = z.string().trim().min(1).max(4_096);
 export const utcTimestamp = z.iso.datetime({

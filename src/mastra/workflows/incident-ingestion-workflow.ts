@@ -8,7 +8,7 @@ import {
   INCIDENT_INGESTION_WORKFLOW_ID,
   materializeInvestigationStart,
 } from "../../db/workflow-run-operations.js";
-import { opaqueId } from "../../schemas/common.js";
+import { opaqueId, tenantIdSchema } from "../../schemas/common.js";
 import { CorrelationSchema } from "../../evidence/contracts.js";
 import {
   createRetrieveRunbookStep,
@@ -58,7 +58,7 @@ export const IncidentIngestionInputSchema = z
   .object({
     eventId: opaqueId,
     incidentId: opaqueId,
-    tenantId: opaqueId,
+    tenantId: tenantIdSchema,
     alertId: opaqueId,
     correlationId: opaqueId,
   })

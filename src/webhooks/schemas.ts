@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { boundedJsonObject } from "../schemas/common.js";
+import { boundedJsonObject, tenantIdSchema } from "../schemas/common.js";
 import { IncidentKindSchema } from "../schemas/incident.js";
 
 const webhookId = z
@@ -30,7 +30,7 @@ export const DemoAlertWebhookSchema = z
     sourceEventId: webhookId,
     kind: IncidentKindSchema,
     occurredAt: webhookTimestamp,
-    tenantId: webhookId,
+    tenantId: tenantIdSchema,
     subjectId: webhookId,
     sessionId: webhookId.optional(),
     deviceId: webhookId.optional(),

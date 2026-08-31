@@ -8,27 +8,40 @@ import { endpointInvestigator } from "./endpoint-investigator.js";
 import { identityInvestigator } from "./identity-investigator.js";
 import { UNTRUSTED_DATA_INSTRUCTIONS } from "./investigator-output.js";
 
-export const socSupervisor = new Agent({
-  id: "soc-supervisor",
-  name: "SOC Supervisor",
-  description:
-    "Bounded coordinator for the three Phase 4 investigation specialists.",
-  instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}
+export function createSocSupervisor(
+  model: string,
+  specialists: Readonly<{
+    identityInvestigator: typeof identityInvestigator;
+    endpointInvestigator: typeof endpointInvestigator;
+    cloudInvestigator: typeof cloudInvestigator;
+  }> = { identityInvestigator, endpointInvestigator, cloudInvestigator },
+) {
+  return new Agent({
+    id: "soc-supervisor",
+    name: "SOC Supervisor",
+    description:
+      "Bounded coordinator for the three Phase 4 investigation specialists.",
+    instructions: `${UNTRUSTED_DATA_INSTRUCTIONS}
 Validate that every specialist request uses the same trusted tenant, incident, subject, and run.
 The deterministic workflow owns fan-out, persistence, convergence, and ordering. Do not add capabilities.`,
-  model: process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
-  maxRetries: 0,
-  agents: { identityInvestigator, endpointInvestigator, cloudInvestigator },
-  tools: {},
-  defaultOptions: {
-    maxSteps: 4,
-    maxProcessorRetries: 0,
-    modelSettings: {
-      temperature: 0,
-      timeout: { totalMs: 3_000, stepMs: 1_500 },
+    model,
+    maxRetries: 0,
+    agents: specialists,
+    tools: {},
+    defaultOptions: {
+      maxSteps: 4,
+      maxProcessorRetries: 0,
+      modelSettings: {
+        temperature: 0,
+        timeout: { totalMs: 3_000, stepMs: 1_500 },
+      },
     },
-  },
-});
+  });
+}
+
+export const socSupervisor = createSocSupervisor(
+  process.env.MASTRA_MODEL ?? "openai/gpt-4o-mini",
+);
 
 export const SupervisorValidationSchema = z
   .object({
