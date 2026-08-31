@@ -28,6 +28,7 @@ describe("retention command and configuration", () => {
     for (const argv of [
       ["--limit", "1"],
       ["--tenant", " tenant-a ", "--limit", "1"],
+      ["--tenant", "a".repeat(129), "--limit", "1"],
       ["--tenant", "tenant-a", "--limit", "1025"],
       ["--tenant", "tenant-a"],
     ])
@@ -78,11 +79,13 @@ describe("retention command and configuration", () => {
         RETENTION_SCHEDULER_ENABLED: "true",
         RETENTION_TENANT_ID: "tenant-a",
         RETENTION_SWEEP_LIMIT: "32",
+        RETENTION_SWEEP_MAX_BATCHES: "4",
       }),
     ).toEqual({
       enabled: true,
       tenantId: "tenant-a",
       limit: 32,
+      maxBatchesPerRun: 4,
       intervalMs: 86_400_000,
     });
     expect(() =>
@@ -90,6 +93,14 @@ describe("retention command and configuration", () => {
         RETENTION_SCHEDULER_ENABLED: "true",
         RETENTION_TENANT_ID: " tenant-a ",
         RETENTION_SWEEP_LIMIT: "32",
+      }),
+    ).toThrow("RETENTION_SCHEDULER_CONFIG_INVALID");
+    expect(() =>
+      readRetentionSchedulerConfig({
+        RETENTION_SCHEDULER_ENABLED: "true",
+        RETENTION_TENANT_ID: "a".repeat(129),
+        RETENTION_SWEEP_LIMIT: "32",
+        RETENTION_SWEEP_MAX_BATCHES: "4",
       }),
     ).toThrow("RETENTION_SCHEDULER_CONFIG_INVALID");
   });

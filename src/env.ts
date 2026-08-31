@@ -4,11 +4,14 @@ const integer = (fallback: number, minimum: number, maximum: number) =>
   z.coerce.number().int().min(minimum).max(maximum).default(fallback);
 const optionalSecret = (minimum: number) =>
   z.preprocess(
-    (value) =>
-      typeof value === "string" && value.trim().length === 0
-        ? undefined
-        : value,
-    z.string().min(minimum).optional(),
+    (value) => (value === "" ? undefined : value),
+    z
+      .string()
+      .min(minimum)
+      .refine((value) => value.trim() === value, {
+        message: "Secret values must not have leading or trailing whitespace.",
+      })
+      .optional(),
   );
 
 const environmentSchema = z.object({

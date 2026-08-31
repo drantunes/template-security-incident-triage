@@ -8,6 +8,7 @@ const config = {
   enabled: true,
   tenantId: "tenant-a",
   limit: 8,
+  maxBatchesPerRun: 2,
   intervalMs: retentionIntervalMs,
 } as const;
 const result = {
@@ -81,5 +82,43 @@ describe("retention scheduler", () => {
       event: "retention.sweep.failed",
       errorCode: "RETENTION_SWEEP_FAILED",
     });
+  });
+
+  it("drains bounded batches, records exhausted budget, and rapidly reschedules without overlap", async () => {
+    let rapid: (() => void) | undefined;
+    const logger = { write: vi.fn() };
+    const runSweep = vi
+      .fn()
+      .mockResolvedValueOnce({ ...result, scanned: 8 })
+      .mockResolvedValueOnce({ ...result, scanned: 8 })
+      .mockResolvedValueOnce({ ...result, scanned: 3 });
+    const scheduler = await startRetentionScheduler(
+      {} as OperationalStore,
+      config,
+      logger,
+      {
+        runSweep,
+        setInterval: () => {
+          return { unref: () => {} } as NodeJS.Timeout;
+        },
+        clearInterval: vi.fn(),
+        setTimeout: (callback, delayMs) => {
+          expect(delayMs).toBe(0);
+          rapid = callback;
+          return { unref: () => {} } as NodeJS.Timeout;
+        },
+        clearTimeout: vi.fn(),
+      },
+    );
+    expect(runSweep).toHaveBeenCalledTimes(2);
+    expect(logger.write).toHaveBeenCalledWith({
+      event: "retention.sweep.budget.exhausted",
+      errorCode: "RETENTION_SWEEP_BUDGET_EXHAUSTED",
+    });
+    rapid?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runSweep).toHaveBeenCalledTimes(3);
+    await scheduler!.stop();
   });
 });

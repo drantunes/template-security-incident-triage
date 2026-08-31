@@ -9,6 +9,11 @@ const emptyToUndefined = z.preprocess(
     typeof value === "string" && value.length === 0 ? undefined : value,
   z.coerce.number().int().min(1).max(1_024).optional(),
 );
+const maxBatches = z.preprocess(
+  (value) =>
+    typeof value === "string" && value.length === 0 ? undefined : value,
+  z.coerce.number().int().min(1).max(64).optional(),
+);
 
 const retentionEnvironmentSchema = z.object({
   RETENTION_SCHEDULER_ENABLED: z
@@ -17,12 +22,14 @@ const retentionEnvironmentSchema = z.object({
     .transform((value) => value === "true"),
   RETENTION_TENANT_ID: z.string().default(""),
   RETENTION_SWEEP_LIMIT: emptyToUndefined,
+  RETENTION_SWEEP_MAX_BATCHES: maxBatches,
 });
 
 export type RetentionSchedulerConfig = Readonly<{
   enabled: boolean;
   tenantId?: string;
   limit?: number;
+  maxBatchesPerRun?: number;
   intervalMs: 86_400_000;
 }>;
 
@@ -41,12 +48,16 @@ export function readRetentionSchedulerConfig(
   } catch {
     throw new Error("RETENTION_SCHEDULER_CONFIG_INVALID");
   }
-  if (value.RETENTION_SWEEP_LIMIT == null)
+  if (
+    value.RETENTION_SWEEP_LIMIT == null ||
+    value.RETENTION_SWEEP_MAX_BATCHES == null
+  )
     throw new Error("RETENTION_SCHEDULER_CONFIG_INVALID");
   return Object.freeze({
     enabled: true,
     tenantId: value.RETENTION_TENANT_ID,
     limit: value.RETENTION_SWEEP_LIMIT,
+    maxBatchesPerRun: value.RETENTION_SWEEP_MAX_BATCHES,
     intervalMs: retentionIntervalMs,
   });
 }

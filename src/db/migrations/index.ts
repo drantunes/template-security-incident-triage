@@ -21,6 +21,7 @@ import { phase11RetentionAuditTenantStatements } from "./0018-phase11-retention-
 import { phase11RetentionSourceCursorStatements } from "./0019-phase11-retention-source-cursor.js";
 import { phase11ConsumerLedgerTenantStatements } from "./0020-phase11-consumer-ledger-tenant.js";
 import { phase11RetentionClaimsTenantKeyStatements } from "./0021-phase11-retention-claims-tenant-key.js";
+import { phase11RetentionTenantBoundaryStatements } from "./0022-phase11-retention-tenant-boundaries.js";
 
 export type Migration = Readonly<{
   version: number;
@@ -115,5 +116,10 @@ export const migrations = Object.freeze([
     21,
     "phase11-retention-claims-tenant-key",
     phase11RetentionClaimsTenantKeyStatements,
+  ),
+  defineMigration(
+    22,
+    "phase11-retention-tenant-boundaries",
+    phase11RetentionTenantBoundaryStatements,
   ),
 ]);

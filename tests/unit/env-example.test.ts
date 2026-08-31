@@ -24,29 +24,63 @@ describe("mock environment example", () => {
 });
 
 describe("optional secrets", () => {
-  it("normalizes blank secrets while disabled integrations remain mock-safe", () => {
+  it("normalizes only empty secrets while disabled integrations remain mock-safe", () => {
     expect(
       readPhase2Config({
         WEBHOOKS_ENABLED: "false",
-        ALERT_WEBHOOK_SECRET: "   ",
+        ALERT_WEBHOOK_SECRET: "",
       }).alertWebhookSecret,
     ).toBeUndefined();
     expect(
       readPhase6Config({
         MOCK_DECISIONS_ENABLED: "false",
-        MOCK_DECISION_SECRET: " ",
+        MOCK_DECISION_SECRET: "",
       }).mockDecisionSecret,
     ).toBeUndefined();
     expect(
-      readPhase7Config({ DASHBOARD_AUTH_ENABLED: "false", WORKOS_API_KEY: " " })
+      readPhase7Config({ DASHBOARD_AUTH_ENABLED: "false", WORKOS_API_KEY: "" })
         .workosApiKey,
     ).toBeUndefined();
     expect(
       readPhase8Config({
         WORKOS_PROVIDER_ENABLED: "false",
-        WORKOS_API_KEY: " ",
+        WORKOS_API_KEY: "",
       }).workos.apiKey,
     ).toBeUndefined();
+  });
+
+  it("rejects whitespace-padded secret material at every phase boundary", () => {
+    expect(() =>
+      readPhase2Config({
+        ALERT_WEBHOOK_SECRET: ` ${"a".repeat(16)}`,
+        WORKOS_WEBHOOK_SECRET: "b".repeat(16),
+      }),
+    ).toThrow("Invalid Phase 2 configuration.");
+    expect(() =>
+      readPhase6Config({
+        MOCK_DECISIONS_ENABLED: "false",
+        MOCK_DECISION_SECRET: `${"a".repeat(32)} `,
+      }),
+    ).toThrow("Invalid Phase 6 configuration.");
+    expect(() =>
+      readPhase7Config({
+        DASHBOARD_AUTH_ENABLED: "false",
+        DASHBOARD_CSRF_SECRET: ` ${"a".repeat(32)}`,
+      }),
+    ).toThrow("Invalid Phase 7 configuration.");
+    expect(() =>
+      readPhase8Config({
+        WORKOS_PROVIDER_ENABLED: "false",
+        WORKOS_API_KEY: `${"a".repeat(16)} `,
+      }),
+    ).toThrow("Invalid Phase 8 configuration.");
+    expect(() =>
+      readPhase8Config({
+        IPINFO_PROVIDER_ENABLED: "false",
+        GEOIP_CACHE_HMAC_KEY:
+          " base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+      }),
+    ).toThrow("Invalid Phase 8 configuration.");
   });
 
   it("fails early for short or missing secrets when a boundary is enabled", () => {

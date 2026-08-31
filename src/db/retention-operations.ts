@@ -453,7 +453,7 @@ function authoritySources(
 export function validateRetentionTenantId(
   tenantId: string | undefined,
 ): string {
-  if (!tenantId || tenantId.trim() !== tenantId)
+  if (!tenantId || tenantId.trim() !== tenantId || tenantId.length > 128)
     throw new Error("RETENTION_TENANT_INVALID");
   return tenantId;
 }

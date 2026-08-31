@@ -82,6 +82,28 @@ async function seededStore(tenantIds = ["tenant-a", "tenant-b"]) {
 }
 
 describe("Phase 11 retention sweep", () => {
+  it("rejects an overlong tenant before any retention SQL mutation", async () => {
+    const store = await seededStore();
+    await expect(
+      sweepRetention(store, {
+        now,
+        limit: 1,
+        tenantId: "a".repeat(129),
+        sweepId: "retention-overlong-tenant",
+      }),
+    ).rejects.toThrow("RETENTION_TENANT_INVALID");
+    await expect(
+      store.execute({
+        sql: "SELECT count(*) AS count FROM retention_tombstone_claims",
+      }),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+    await expect(
+      store.execute({
+        sql: "SELECT count(*) AS count FROM retention_source_cursors",
+      }),
+    ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+  });
+
   it("keeps dry-runs non-destructive and scopes a bounded sweep to one tenant", async () => {
     const store = await seededStore();
     const dryRun = await sweepRetention(store, {

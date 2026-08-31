@@ -74,7 +74,7 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(53);
+      expect(Number(indexes.rows[0]?.count)).toBe(54);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -157,6 +157,7 @@ describe("SOC migrations", () => {
         { version: 19 },
         { version: 20 },
         { version: 21 },
+        { version: 22 },
       ]);
       await expect(
         store.execute({
@@ -212,6 +213,45 @@ describe("SOC migrations", () => {
         ],
       });
       await migrateOperationalStore(store);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("preserves only canonical legacy retention tenants and withholds invalid identities", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 21 });
+      const timestamp = "2026-08-27T12:00:00.000Z";
+      await store.execute({
+        sql: "INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES ('tenant-a', 1), (' tenant-a ', 2)",
+      });
+      await store.execute({
+        sql: `INSERT INTO retention_tombstone_claims(
+          source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
+        ) VALUES
+          ('timeline_events', '["valid"]', 'tenant-a', 'three-hundred-sixty-five-day', 'retained-authority', ?, ?, 'sweep-valid'),
+          ('timeline_events', '["withheld"]', ' tenant-a ', 'three-hundred-sixty-five-day', 'retained-authority', ?, ?, 'sweep-withheld')`,
+        args: [timestamp, timestamp, timestamp, timestamp],
+      });
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_source_cursors ORDER BY tenant_id",
+        }),
+      ).resolves.toMatchObject({ rows: [{ tenant_id: "tenant-a" }] });
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_tombstone_claims ORDER BY tenant_id",
+        }),
+      ).resolves.toMatchObject({ rows: [{ tenant_id: "tenant-a" }] });
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM retention_tombstone_claims_v21_legacy_withheld WHERE tenant_id = ' tenant-a '",
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 1 }] });
     } finally {
       store.close();
     }

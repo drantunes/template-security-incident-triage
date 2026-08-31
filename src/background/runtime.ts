@@ -18,9 +18,11 @@ import {
   readPhase8Config,
   assertPhase8ControlPlaneAuth,
   readPhase6Config,
+  readPhase7Config,
   type Phase2Config,
   type Phase8Config,
   type Phase6Config,
+  type Phase7Config,
 } from "../env.js";
 import { consoleLogger, type StructuredLogger } from "../logging.js";
 import { createApp } from "../server.js";
@@ -59,6 +61,7 @@ export async function startServerRuntime(
     initializeStorage?: () => void | Promise<void>;
     bindServer?: BindServer;
     phase6Config?: Phase6Config;
+    phase7Config?: Phase7Config;
     /** A validated F8 config is injected once into every runtime boundary. */
     phase8Config?: Phase8Config;
     retentionConfig?: RetentionSchedulerConfig;
@@ -67,6 +70,13 @@ export async function startServerRuntime(
   const config = overrides.config ?? readPhase2Config();
   const phase8Config = overrides.phase8Config ?? readPhase8Config();
   assertPhase8ControlPlaneAuth(phase8Config);
+  // Parse every runtime boundary before any store creation, storage init,
+  // migration, scheduler, or provider side effect. Overrides are prevalidated
+  // test/embedding contracts and preserve that already-validated injection.
+  const phase6Config = overrides.phase6Config ?? readPhase6Config();
+  const phase7Config = overrides.phase7Config ?? readPhase7Config();
+  const retentionConfig =
+    overrides.retentionConfig ?? readRetentionSchedulerConfig();
   const store = overrides.store ?? createLibSqlOperationalStore();
   const logger = overrides.logger ?? consoleLogger;
   const runtimeModule = overrides.mastraInstance
@@ -89,16 +99,16 @@ export async function startServerRuntime(
     await migrateOperationalStore(store);
     retentionScheduler = await startRetentionScheduler(
       store,
-      overrides.retentionConfig ?? readRetentionSchedulerConfig(),
+      retentionConfig,
       logger,
     );
-    const phase6Config = overrides.phase6Config ?? readPhase6Config();
     const app = await createApp({
       config,
       store,
       logger,
       mastraInstance: runtimeMastra,
       phase6Config,
+      phase7Config,
       phase8Config,
     });
     await runtimeMastra.startWorkers();

@@ -1,9 +1,14 @@
 import { z } from "zod";
 
 const optionalSecret = z.preprocess(
-  (value) =>
-    typeof value === "string" && value.trim().length === 0 ? undefined : value,
-  z.string().trim().min(1).optional(),
+  (value) => (value === "" ? undefined : value),
+  z
+    .string()
+    .min(1)
+    .refine((value) => value.trim() === value, {
+      message: "Secret values must not have leading or trailing whitespace.",
+    })
+    .optional(),
 );
 const providerFlag = z
   .enum(["true", "false"])
@@ -174,7 +179,9 @@ function isPlaceholder(value: string): boolean {
 
 /** Provider credentials are never accepted as short placeholder-like values. */
 function hasMinimumSecretLength(value: string | undefined): boolean {
-  return typeof value === "string" && value.length >= 16;
+  return (
+    typeof value === "string" && value.trim() === value && value.length >= 16
+  );
 }
 
 function readCsv(value: string, name: string): ReadonlySet<string> {
