@@ -25,6 +25,7 @@ import { phase11RetentionTenantBoundaryStatements } from "./0022-phase11-retenti
 import {
   phase11CanonicalTenantReconciliationStatements,
   phase11CanonicalTenantReconciliationIntegrity,
+  phase11CanonicalTenantReconciliationLegacyIntegrity,
   reconcileCanonicalRetentionTenants,
 } from "./0023-phase11-canonical-tenant-reconciliation.js";
 import type { StoreTransaction } from "../operational-store.js";
@@ -161,11 +162,21 @@ export const migrations = Object.freeze([
     phase11CanonicalTenantReconciliationStatements,
     reconcileCanonicalRetentionTenants,
     undefined,
-    24,
+    25,
   ),
   defineMigration(
     24,
     "phase11-canonical-tenant-reconciliation-integrity",
+    [],
+    undefined,
+    {
+      schema: "soc-migration-integrity/v1",
+      executable: phase11CanonicalTenantReconciliationLegacyIntegrity,
+    },
+  ),
+  defineMigration(
+    25,
+    "phase11-canonical-tenant-reconciliation-policy-integrity",
     [],
     undefined,
     {

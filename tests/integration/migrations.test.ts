@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DuckDbAnalyticsStore } from "../../src/analytics/duckdb-analytics-store.js";
 import { migrateOperationalStore } from "../../src/db/migrate.js";
@@ -11,7 +11,9 @@ import {
   migrations,
 } from "../../src/db/migrations/index.js";
 import { phase11CanonicalTenantReconciliationIntegrity } from "../../src/db/migrations/0023-phase11-canonical-tenant-reconciliation.js";
+import { phase11CanonicalTenantReconciliationStatements } from "../../src/db/migrations/0023-phase11-canonical-tenant-reconciliation.js";
 import { exportAnalyticsSince } from "../../src/analytics/exporter.js";
+import { isCanonicalTenantId } from "../../src/schemas/common.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -165,6 +167,7 @@ describe("SOC migrations", () => {
         { version: 22 },
         { version: 23 },
         { version: 24 },
+        { version: 25 },
       ]);
       await expect(
         store.execute({
@@ -478,7 +481,7 @@ describe("SOC migrations", () => {
   it("pins executable migration identity and rejects semantic descriptor drift", async () => {
     const semanticDrift = {
       ...phase11CanonicalTenantReconciliationIntegrity,
-      tenantPredicate: "isCanonicalTenantId/v2",
+      tenantPolicy: { maxCodePoints: 127 },
     };
     const checksum = migrationChecksum([], {
       schema: "soc-migration-integrity/v1",
@@ -488,27 +491,117 @@ describe("SOC migrations", () => {
       schema: "soc-migration-integrity/v1",
       executable: semanticDrift,
     });
-    expect(checksum).toBe(migrations[23]?.checksum);
+    expect(checksum).toBe(migrations[24]?.checksum);
     expect(driftedChecksum).not.toBe(checksum);
+    const boundaryTenant = "a".repeat(128);
+    expect(
+      isCanonicalTenantId(
+        boundaryTenant,
+        phase11CanonicalTenantReconciliationIntegrity.tenantPolicy,
+      ),
+    ).toBe(true);
+    expect(
+      isCanonicalTenantId(boundaryTenant, semanticDrift.tenantPolicy),
+    ).toBe(false);
 
     const database = await createTempDatabase();
     databases.push(database);
     const store = database.createStore();
     try {
-      // v23 retains its already-published checksum; v24 anchors its executable
-      // plan in the same forward transaction for both fresh and legacy stores.
-      await migrateOperationalStore(store, { targetVersion: 23 });
+      // Simulate a database produced by the published v23→v24 path without
+      // using the current unsafe targetVersion route. Both historic checksums
+      // remain intact; the normal upgrade applies only the new v25 anchor.
+      await migrateOperationalStore(store, { targetVersion: 22 });
+      await store.transaction(async (tx) => {
+        await tx.batch(
+          phase11CanonicalTenantReconciliationStatements.map((sql) => ({
+            sql,
+          })),
+        );
+        await tx.execute({
+          sql: "INSERT INTO soc_schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+          args: [
+            migrations[22]!.version,
+            migrations[22]!.name,
+            migrations[22]!.checksum,
+            "2026-08-31T00:00:00.000Z",
+          ],
+        });
+        await tx.execute({
+          sql: "INSERT INTO soc_schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+          args: [
+            migrations[23]!.version,
+            migrations[23]!.name,
+            migrations[23]!.checksum,
+            "2026-08-31T00:00:00.000Z",
+          ],
+        });
+      });
       await expect(migrateOperationalStore(store)).resolves.toBeUndefined();
+      await expect(
+        store.execute({
+          sql: "SELECT version FROM soc_schema_migrations WHERE version = 25",
+        }),
+      ).resolves.toMatchObject({ rows: [{ version: 25 }] });
       await expect(migrateOperationalStore(store)).resolves.toBeUndefined();
 
       const driftedSet = migrations.map((migration) =>
-        migration.version === 24
-          ? { ...migration, checksum: driftedChecksum }
+        migration.version === 25
+          ? {
+              ...migration,
+              checksum: driftedChecksum,
+              integrity: {
+                schema: "soc-migration-integrity/v1" as const,
+                executable: semanticDrift,
+              },
+            }
           : migration,
       );
       await expect(
         migrateOperationalStore(store, { migrationSet: driftedSet }),
       ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects an executable migration without its anchor before any SQL", async () => {
+    const execute = vi.fn();
+    const transaction = vi.fn();
+    await expect(
+      migrateOperationalStore(
+        { execute, transaction, close: () => {} },
+        { targetVersion: 24 },
+      ),
+    ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
+    expect(execute).not.toHaveBeenCalled();
+    expect(transaction).not.toHaveBeenCalled();
+  });
+
+  it("rolls back an executable apply when its anchor cannot persist", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 22 });
+      await store.execute({
+        sql: `CREATE TRIGGER reject_retention_integrity_anchor
+          BEFORE INSERT ON soc_schema_migrations WHEN NEW.version = 25
+          BEGIN SELECT RAISE(ABORT, 'anchor rejected'); END`,
+      });
+      await expect(migrateOperationalStore(store)).rejects.toBeDefined();
+      await expect(
+        store.execute({
+          sql: "SELECT count(*) AS count FROM soc_schema_migrations WHERE version IN (23, 24, 25)",
+        }),
+      ).resolves.toMatchObject({ rows: [{ count: 0 }] });
+      await expect(
+        store.execute({
+          sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'retention_source_cursors'",
+        }),
+      ).resolves.toMatchObject({
+        rows: [{ name: "retention_source_cursors" }],
+      });
     } finally {
       store.close();
     }

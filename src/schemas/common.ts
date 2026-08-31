@@ -9,12 +9,24 @@ export const opaqueId = z.string().trim().min(1).max(128);
  */
 export const maxTenantIdCodePoints = 128;
 
-export function isCanonicalTenantId(value: unknown): value is string {
+export type CanonicalTenantPolicy = Readonly<{
+  maxCodePoints: number;
+}>;
+
+/** Values are consumed by every tenant boundary; identity itself is untouched. */
+export const canonicalTenantPolicy: CanonicalTenantPolicy = Object.freeze({
+  maxCodePoints: maxTenantIdCodePoints,
+});
+
+export function isCanonicalTenantId(
+  value: unknown,
+  policy: CanonicalTenantPolicy = canonicalTenantPolicy,
+): value is string {
   return (
     typeof value === "string" &&
     value.length > 0 &&
     value.trim() === value &&
-    Array.from(value).length <= maxTenantIdCodePoints
+    Array.from(value).length <= policy.maxCodePoints
   );
 }
 

@@ -1,6 +1,9 @@
 import type { InValue } from "@libsql/client";
 
-import { isCanonicalTenantId } from "../../schemas/common.js";
+import {
+  canonicalTenantPolicy,
+  isCanonicalTenantId,
+} from "../../schemas/common.js";
 import type { StoreTransaction } from "../operational-store.js";
 
 /**
@@ -44,39 +47,51 @@ export const phase11CanonicalTenantReconciliationStatements = [
 ] as const;
 
 /**
- * Stable, executable-plan identity. Migration 0024 hashes this descriptor
- * atomically with the 0023 reconciliation on fresh upgrades. It is explicit
- * rather than derived from a function's source, so formatting and runtime
- * differences cannot silently change the migration's identity.
+ * Stable, executable-plan identity. Published migration 0024 preserves the
+ * v1 descriptor; forward-only 0025 hashes the v2 policy descriptor atomically
+ * with the reconciliation. It is explicit rather than derived from a function
+ * source, so formatting and runtime differences cannot silently change it.
  */
+const reconciliationCopies = Object.freeze([
+  Object.freeze({
+    sourceTable: "retention_source_cursors_v22_reconciliation_source",
+    columns: Object.freeze(["tenant_id", "next_source"]),
+    insertSql:
+      "INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES (?, ?)",
+  }),
+  Object.freeze({
+    sourceTable: "retention_tombstone_claims_v22_reconciliation_source",
+    columns: Object.freeze([
+      "source",
+      "source_identity",
+      "tenant_id",
+      "retention_class",
+      "disposition",
+      "aged_at",
+      "tombstoned_at",
+      "sweep_id",
+    ]),
+    insertSql: `INSERT INTO retention_tombstone_claims(
+      source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  }),
+]);
+
+/** Exact descriptor persisted by already-published migration 0024. */
+export const phase11CanonicalTenantReconciliationLegacyIntegrity =
+  Object.freeze({
+    schema: "phase11-canonical-tenant-reconciliation/v1",
+    tenantPredicate: "isCanonicalTenantId/v1",
+    quarantine: "RETENTION_TENANT_NONCANONICAL",
+    copies: reconciliationCopies,
+  });
+
+/** Policy values below are both hash material and executable behavior. */
 export const phase11CanonicalTenantReconciliationIntegrity = Object.freeze({
-  schema: "phase11-canonical-tenant-reconciliation/v1",
-  tenantPredicate: "isCanonicalTenantId/v1",
+  schema: "phase11-canonical-tenant-reconciliation/v2",
+  tenantPolicy: canonicalTenantPolicy,
   quarantine: "RETENTION_TENANT_NONCANONICAL",
-  copies: [
-    {
-      sourceTable: "retention_source_cursors_v22_reconciliation_source",
-      columns: ["tenant_id", "next_source"],
-      insertSql:
-        "INSERT INTO retention_source_cursors(tenant_id, next_source) VALUES (?, ?)",
-    },
-    {
-      sourceTable: "retention_tombstone_claims_v22_reconciliation_source",
-      columns: [
-        "source",
-        "source_identity",
-        "tenant_id",
-        "retention_class",
-        "disposition",
-        "aged_at",
-        "tombstoned_at",
-        "sweep_id",
-      ],
-      insertSql: `INSERT INTO retention_tombstone_claims(
-        source, source_identity, tenant_id, retention_class, disposition, aged_at, tombstoned_at, sweep_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    },
-  ],
+  copies: reconciliationCopies,
 });
 
 export async function reconcileCanonicalRetentionTenants(
@@ -100,7 +115,12 @@ async function copyRows(
   });
   for (const row of result.rows) {
     const tenantId = row.tenant_id;
-    if (isCanonicalTenantId(tenantId)) {
+    if (
+      isCanonicalTenantId(
+        tenantId,
+        phase11CanonicalTenantReconciliationIntegrity.tenantPolicy,
+      )
+    ) {
       const args: readonly InValue[] = copy.columns.map(
         (column) => row[column] ?? null,
       );
