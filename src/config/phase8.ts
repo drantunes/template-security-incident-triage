@@ -1,6 +1,10 @@
 import { z } from "zod";
 
-const optionalSecret = z.string().trim().min(1).optional();
+const optionalSecret = z.preprocess(
+  (value) =>
+    typeof value === "string" && value.trim().length === 0 ? undefined : value,
+  z.string().trim().min(1).optional(),
+);
 const providerFlag = z
   .enum(["true", "false"])
   .default("false")
@@ -168,6 +172,11 @@ function isPlaceholder(value: string): boolean {
   return value.length === 0 || /<[^>]+>/u.test(value);
 }
 
+/** Provider credentials are never accepted as short placeholder-like values. */
+function hasMinimumSecretLength(value: string | undefined): boolean {
+  return typeof value === "string" && value.length >= 16;
+}
+
 function readCsv(value: string, name: string): ReadonlySet<string> {
   const entries = value
     .split(",")
@@ -288,8 +297,8 @@ export function readPhase8Config(
   if (
     value.WORKOS_PROVIDER_ENABLED &&
     (!value.WEBHOOKS_ENABLED ||
-      !value.WORKOS_API_KEY ||
-      !value.WORKOS_WEBHOOK_SECRET ||
+      !hasMinimumSecretLength(value.WORKOS_API_KEY) ||
+      !hasMinimumSecretLength(value.WORKOS_WEBHOOK_SECRET) ||
       isPlaceholder(value.WORKOS_STAGING_ORGANIZATION_ID) ||
       workosUsers.size === 0 ||
       workosRoles.size === 0 ||
@@ -298,7 +307,7 @@ export function readPhase8Config(
     throw new Error("WorkOS provider configuration is incomplete.");
   if (
     value.IPINFO_PROVIDER_ENABLED &&
-    (!value.IPINFO_TOKEN ||
+    (!hasMinimumSecretLength(value.IPINFO_TOKEN) ||
       !value.GEOIP_CACHE_HMAC_KEY ||
       !value.GEOIP_CACHE_HMAC_KEY_VERSION)
   )
@@ -356,7 +365,7 @@ export function readPhase8Config(
     : undefined;
   if (
     value.LINEAR_PROVIDER_ENABLED &&
-    (!value.LINEAR_API_KEY ||
+    (!hasMinimumSecretLength(value.LINEAR_API_KEY) ||
       isPlaceholder(value.LINEAR_WORKSPACE_ID) ||
       isPlaceholder(value.LINEAR_TEAM_ID) ||
       isPlaceholder(value.LINEAR_INTERNAL_BASE_URL))

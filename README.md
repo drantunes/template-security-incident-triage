@@ -1,112 +1,83 @@
 # Security Incident Triage and Response
 
-Phase 4 adds deterministic identity, endpoint, and cloud evidence collection, bounded supervisor agents, integrity-checked persistence, and correlation before the existing fail-closed RAG step. It remains mock-only: it does not connect to WorkOS, IPinfo, an EDR, or Upstash, classify severity, propose containment, or execute actions.
+Security Incident Triage and Response accepts synthetic identity-security alerts, gathers and correlates evidence against versioned runbooks, and produces a reviewable incident, summary, and containment plan. A human approval remains required before mock containment can run. It is built with Mastra.
 
-## Requirements
+## Why we built this
 
-- Node.js 22.13.0 or newer
-- npm
+Security teams often have enough individual signals to investigate an incident, but collecting them, applying a runbook, and keeping a decision trail consistent is slow. This template gives engineers and security teams a local, inspectable path from an alert to an approval-gated response.
 
-## Installation and local configuration
+The default experience is deliberately mock-first. It makes the workflow and its limits practical to explore without connecting a production identity provider or sending data to an external service.
 
-```sh
-npm ci
+## Features
+
+- Receives signed synthetic alerts for privilege changes, country changes, and unfamiliar devices through one investigation flow.
+- Correlates identity, endpoint, and cloud evidence with an active runbook before proposing a response.
+- Holds containment behind a tenant-scoped human approval and records the resulting timeline and audit trail.
+- Runs locally with mock providers while keeping real-provider checks opt-in for staging.
+
+## Quick start
+
+### 1. Clone the template
+
+```bash
+npx create-mastra@latest template-security-incident-triage --template https://github.com/drantunes/template-security-incident-triage
+cd template-security-incident-triage
+```
+
+### 2. Add your API keys
+
+```bash
 cp .env.example .env
-openssl rand -hex 32
 ```
 
-Put separately generated values in `ALERT_WEBHOOK_SECRET` and `WORKOS_WEBHOOK_SECRET`. The local LibSQL database needs no token. An OpenAI API key is needed when the Phase 4 workflow invokes its registered agents; automated tests inject deterministic model doubles and make no model or network calls. Runbook retrieval uses local BGE Small EN v1.5 embeddings with 384 dimensions and does not require an API key.
+The copied defaults start the local mock walkthrough without external API keys
+or webhook secrets. Real WorkOS, IPinfo, Linear, and Upstash integrations are
+staging opt-ins and fail early when their required configuration is incomplete.
 
-## Runbook validation and indexing
+### 3. Start the dev server
 
-Validate the strict frontmatter, canonical sections, action allowlist, links, deterministic chunk IDs and hashes without network access:
-
-```sh
-npm run runbooks:validate
-```
-
-Index all three validated runbooks into immutable physical LibSQL vector indexes and atomically activate one generation per incident kind:
-
-```sh
-npm run runbooks:index
-```
-
-The first explicit indexing run may download BGE Small EN v1.5 into `RUNBOOK_FASTEMBED_CACHE_DIR`; default tests and CI use deterministic test embeddings and never download a model. Repeating the command is idempotent for unchanged bytes. A changed published SemVer is rejected and must be introduced as a new version.
-
-Inspect the active pointers, CAS revisions and append-only activation ledger before maintenance:
-
-```sh
-npm run runbooks:inspect
-```
-
-Rollback accepts only a previously activated, retired and intact generation. It reads back the exact physical vector index, then atomically switches the pointer with the inspected revision and records a `rollback` event:
-
-```sh
-npm run runbooks:rollback -- <generation-id> <expected-revision>
-```
-
-Cleanup requires the exact retired/failed generation, index and chunk count. It defaults to dry-run, refuses active or in-flight retrievals, establishes a durable cleanup claim, revalidates immediately before deletion and never uses a wildcard:
-
-```sh
-npm run runbooks:cleanup -- <generation-id> <index-name> <chunk-count> --dry-run
-npm run runbooks:cleanup -- <generation-id> <index-name> <chunk-count> --execute
-```
-
-Retrieval ownership uses a 60-second fenced lease. A retry during a live lease is refused; after expiry, one CAS winner renews the lease while preserving the exact generation and policy selection. An expired owner cannot persist success or failure, and cleanup blocks valid leases while safely claiming a generation whose retrieval lease is stale.
-
-## Running
-
-Start Mastra Studio and the single Hono server together:
-
-```sh
+```bash
 npm run dev
 ```
 
-Studio is available at `http://localhost:4111`; Hono health is at `http://localhost:3000/health`. Only the Hono server owns the domain worker and outbox polling loop. Studio loads the registered workflows and shared LibSQL storage without starting a second dispatcher.
+Open [Mastra Studio](http://localhost:4111), select `baselineWorkflow`, and
+run it with `{ "message": "Studio is ready" }`. The result is
+`{ "message": "Studio is ready", "status": "ready" }`.
 
-The server startup order is migrations, Mastra workers, domain subscription, outbox reconciliation/polling, then HTTP bind. Shutdown stops polling, unsubscribes, flushes, closes HTTP/storage and shuts Mastra down.
+## Mock workflow and limits
 
-## Signed synthetic alert
+The mock flow can receive a signed alert, gather synthetic evidence, create a
+plan, and wait for an approved mock decision. GeoIP is a probabilistic signal:
+VPNs, proxies, and corporate networks can make a location look unusual. Device
+identity is an opaque signed cookie rather than fingerprinting; removing or
+rotating it can look like a new device. Treat either signal as evidence to
+correlate, not proof on its own.
 
-The demo endpoint requires `Content-Type: application/json` and:
+Retention scheduling is disabled in the default mock. For a long-lived local
+environment, enable it only with one exact tenant identity and an explicit
+bounded batch size; it runs at startup and every 24 hours. Inspect one tenant
+first with `npm run retention:sweep -- --tenant <tenant> --limit <1-1024>`;
+that command is dry-run by default and requires `--apply` to write.
 
-```text
-X-Alert-Signature: t=<unix_ms>,v1=<hmac_sha256_hex>
-```
+### Studio result
 
-The digest covers the exact bytes of `<unix_ms>.<raw-body>`, with a fixed absolute tolerance of 300 seconds. JSON whitespace or byte changes invalidate the signature. Multiple `v1` values are accepted for rotation.
+![Mastra Studio showing the synthetic baselineWorkflow output with message “Studio is ready” and status “ready”.](docs/assets/studio-baseline-workflow.jpg)
 
-Generate a header for the versioned synthetic fixture and send those exact file bytes:
+Synthetic local Studio output from `baselineWorkflow`; it contains no external
+account data.
 
-```sh
-SIGNATURE="$(npm run --silent fixture:sign)"
-curl --fail-with-body \
-  -H 'Content-Type: application/json' \
-  -H "X-Alert-Signature: ${SIGNATURE}" \
-  --data-binary @scripts/fixtures/phase2-alert.json \
-  http://localhost:3000/webhooks/alerts
-```
+## Making it yours
 
-A new or equivalent retry returns `202` only after incident, alert, initial timeline and outbox commit. The dispatcher then publishes `security.alert.received` through Mastra's configured PubSub, and the worker uses a deterministic run ID with `startAsync`. The workflow transitions `received` to `investigating`, validates one trusted tenant/incident/subject/run context, starts identity, endpoint and cloud gather steps with Mastra `.parallel()`, and persists every valid mock fact before correlation. Source failures remain explicit gaps; integrity or storage failures fail closed. Correlation uses only verified evidence IDs and records ordering, relations, contradictions and missing sources without severity or actions. The unchanged RAG step then resolves the unique active runbook generation and persists its exact citations. Missing, inactive, ambiguous, corrupted, low-score or unavailable runbooks still fail closed without a global fallback.
+- Replace the mock identity, GeoIP, incident, and PubSub adapters with their
+  existing staging contracts after configuring the corresponding provider.
+- Adapt the versioned runbook policy and approval rules for your incident types,
+  then add evaluation cases for the claims and actions you permit.
 
-`/webhooks/workos` is a synthetic adapter using `WorkOS-Signature` with the same cryptographic semantics. It supports only `mock.user.role_changed`, `mock.session.country_login` and `mock.session.unknown_device`. Unknown/incompatible authenticated mock events are acknowledged only after a redacted dead-letter record; this is not complete WorkOS event support.
+## About Mastra templates
 
-## Reliability and privacy
+Mastra templates are ready-to-use projects that show what you can build with
+Mastra. Clone one, try it in Studio, and adapt it to your use case.
 
-- Invalid signatures, schemas and storage fail closed.
-- Raw payloads, signature headers, secrets, cookies and PII are not logged or persisted; only `sha256:` references are stored.
-- Outbox publication uses an expiring lease/fence, bounded retry/backoff and dead-letter.
-- Publish-before-mark and local transport loss are reconciled against the durable workflow marker.
-- HTTP acceptance never waits for workflow completion.
-
-## Quality gates
-
-```sh
-npm run format:check
-npm run lint
-npm run typecheck
-npm run runbooks:validate
-npm test
-npm run build
-npm run audit
-```
+This community template is authored and maintained by Diego. Contributions
+happen in this repository; read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+included [Apache-2.0 license](LICENSE).

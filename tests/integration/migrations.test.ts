@@ -39,11 +39,15 @@ describe("SOC migrations", () => {
             'containment_action_attempts','containment_gateway_audit',
             'approval_decision_audit','mock_incident_provider_effects',
             'mock_containment_effects','geoip_cache_entries','geoip_cache_leases','provider_effect_ledger',
-            'consumer_effect_ledger','workos_observed_memberships','workos_observed_sessions',
-            'workos_observed_positions','eval_results','analytics_export_events'
+            'consumer_effect_ledger','consumer_effect_ledger_legacy_withheld',
+            'retention_tombstone_claims_legacy_withheld',
+            'workos_observed_memberships','workos_observed_sessions',
+            'workos_observed_positions','eval_results','analytics_export_events',
+            'retention_audit_events','retention_tombstones','retention_tombstone_claims',
+            'retention_source_cursors'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(37);
+      expect(tables.rows).toHaveLength(43);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
       );
@@ -56,11 +60,21 @@ describe("SOC migrations", () => {
       expect(tables.rows.map((row) => row.name)).toContain(
         "workos_observed_positions",
       );
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id FROM retention_audit_events WHERE 1 = 0",
+        }),
+      ).resolves.toBeDefined();
+      await expect(
+        store.execute({
+          sql: "SELECT next_source FROM retention_source_cursors WHERE 1 = 0",
+        }),
+      ).resolves.toBeDefined();
 
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(47);
+      expect(Number(indexes.rows[0]?.count)).toBe(53);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -137,12 +151,67 @@ describe("SOC migrations", () => {
         { version: 13 },
         { version: 14 },
         { version: 15 },
+        { version: 16 },
+        { version: 17 },
+        { version: 18 },
+        { version: 19 },
+        { version: 20 },
+        { version: 21 },
       ]);
       await expect(
         store.execute({
           sql: `SELECT decision_provenance FROM approvals WHERE 1 = 0`,
         }),
       ).resolves.toBeDefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("migrates only legacy consumer effects with an unambiguous outbox tenant", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 19 });
+      const timestamp = "2026-08-27T12:00:00.000Z";
+      await store.execute({
+        sql: `INSERT INTO incidents(id, tenant_id, kind, subject_id, status, created_at, updated_at)
+          VALUES ('incident-consumer', 'tenant-a', 'unknown_device_login', 'subject', 'received', ?, ?)`,
+        args: [timestamp, timestamp],
+      });
+      await store.execute({
+        sql: `INSERT INTO outbox_events(
+          id, type, run_id, incident_id, tenant_id, schema_version, correlation_id, payload_json, occurred_at, available_at
+        ) VALUES ('outbox-consumer', 'security.incident.updated', 'run', 'incident-consumer', 'tenant-a', 1, 'correlation', '{}', ?, ?)`,
+        args: [timestamp, timestamp],
+      });
+      await store.execute({
+        sql: `INSERT INTO consumer_effect_ledger(
+          consumer_group, event_id, status, attempt_count, fence_token, lease_expires_at, completed_at
+        ) VALUES
+          ('security-workflow-starters', 'outbox-consumer', 'completed', 1, 'fence-owned', ?, ?),
+          ('phase9-device-nonce', 'opaque-legacy', 'completed', 1, 'fence-withheld', ?, ?)`,
+        args: [timestamp, timestamp, timestamp, timestamp],
+      });
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT tenant_id, event_id FROM consumer_effect_ledger",
+        }),
+      ).resolves.toMatchObject({
+        rows: [{ tenant_id: "tenant-a", event_id: "outbox-consumer" }],
+      });
+      await expect(
+        store.execute({
+          sql: "SELECT consumer_group, event_id FROM consumer_effect_ledger_legacy_withheld",
+        }),
+      ).resolves.toMatchObject({
+        rows: [
+          { consumer_group: "phase9-device-nonce", event_id: "opaque-legacy" },
+        ],
+      });
+      await migrateOperationalStore(store);
     } finally {
       store.close();
     }

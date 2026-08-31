@@ -120,7 +120,11 @@ export async function startWorkflowWorker(
       await ack?.();
       return;
     }
-    const effect = await claimConsumerEffect(input.store, event.data.eventId);
+    const effect = await claimConsumerEffect(
+      input.store,
+      event.data.tenantId,
+      event.data.eventId,
+    );
     if (effect.state === "terminal" || effect.state === "busy") {
       input.logger.write({
         event: "worker.no_op",
@@ -143,6 +147,7 @@ export async function startWorkflowWorker(
       });
       const terminal = await deadLetterConsumerEffect(
         input.store,
+        event.data.tenantId,
         event.data.eventId,
         effect.attemptCount,
         effect.fenceToken,
@@ -159,6 +164,7 @@ export async function startWorkflowWorker(
       });
       const completed = await completeConsumerEffect(
         input.store,
+        event.data.tenantId,
         event.data.eventId,
         effect.attemptCount,
         effect.fenceToken,
@@ -244,6 +250,7 @@ export async function startWorkflowWorker(
       });
       const completed = await completeConsumerEffect(
         input.store,
+        event.data.tenantId,
         event.data.eventId,
         effect.attemptCount,
         effect.fenceToken,
@@ -271,6 +278,7 @@ export async function startWorkflowWorker(
         await (input.schedule ?? delay)(Math.floor(cap * jitter));
         await releaseConsumerEffect(
           input.store,
+          event.data.tenantId,
           event.data.eventId,
           attempt,
           effect.fenceToken,
@@ -305,6 +313,7 @@ export async function startWorkflowWorker(
       });
       const deadLettered = await deadLetterConsumerEffect(
         input.store,
+        event.data.tenantId,
         event.data.eventId,
         attempt,
         effect.fenceToken,
@@ -542,6 +551,7 @@ function createSemaphore(limit: number) {
 
 async function claimConsumerEffect(
   store: OperationalStore,
+  tenantId: string,
   eventId: string,
 ): Promise<
   Readonly<{
@@ -556,8 +566,8 @@ async function claimConsumerEffect(
   return store.transaction(async (tx) => {
     const current = await tx.execute({
       sql: `SELECT status, attempt_count, lease_expires_at FROM consumer_effect_ledger
-        WHERE consumer_group = 'security-workflow-starters' AND event_id = ?`,
-      args: [eventId],
+        WHERE tenant_id = ? AND consumer_group = 'security-workflow-starters' AND event_id = ?`,
+      args: [tenantId, eventId],
     });
     const row = current.rows[0];
     if (row && ["completed", "dead_lettered"].includes(String(row.status)))
@@ -578,8 +588,15 @@ async function claimConsumerEffect(
         sql: `UPDATE consumer_effect_ledger SET status = 'processing', attempt_count = ?,
           fence_token = ?, lease_expires_at = ?, completed_at = NULL
           WHERE consumer_group = 'security-workflow-starters' AND event_id = ?
-            AND lease_expires_at <= ? AND status = 'processing'`,
-        args: [attempt, `worker:${eventId}:${attempt}`, lease, eventId, nowIso],
+            AND tenant_id = ? AND lease_expires_at <= ? AND status = 'processing'`,
+        args: [
+          attempt,
+          `worker:${eventId}:${attempt}`,
+          lease,
+          eventId,
+          tenantId,
+          nowIso,
+        ],
       });
       if (updated.rowsAffected !== 1)
         return {
@@ -590,9 +607,15 @@ async function claimConsumerEffect(
     } else {
       await tx.execute({
         sql: `INSERT INTO consumer_effect_ledger(
-          consumer_group, event_id, status, attempt_count, fence_token, lease_expires_at
-        ) VALUES ('security-workflow-starters', ?, 'processing', ?, ?, ?)`,
-        args: [eventId, attempt, `worker:${eventId}:${attempt}`, lease],
+          tenant_id, consumer_group, event_id, status, attempt_count, fence_token, lease_expires_at
+        ) VALUES (?, 'security-workflow-starters', ?, 'processing', ?, ?, ?)`,
+        args: [
+          tenantId,
+          eventId,
+          attempt,
+          `worker:${eventId}:${attempt}`,
+          lease,
+        ],
       });
     }
     return {
@@ -605,20 +628,28 @@ async function claimConsumerEffect(
 
 async function releaseConsumerEffect(
   store: OperationalStore,
+  tenantId: string,
   eventId: string,
   attemptCount: number,
   fenceToken: string,
 ): Promise<void> {
   await store.execute({
     sql: `UPDATE consumer_effect_ledger SET lease_expires_at = ?
-      WHERE consumer_group = 'security-workflow-starters' AND event_id = ?
+      WHERE tenant_id = ? AND consumer_group = 'security-workflow-starters' AND event_id = ?
         AND status = 'processing' AND attempt_count = ? AND fence_token = ?`,
-    args: [new Date(0).toISOString(), eventId, attemptCount, fenceToken],
+    args: [
+      new Date(0).toISOString(),
+      tenantId,
+      eventId,
+      attemptCount,
+      fenceToken,
+    ],
   });
 }
 
 async function completeConsumerEffect(
   store: OperationalStore,
+  tenantId: string,
   eventId: string,
   attemptCount: number,
   fenceToken: string,
@@ -626,15 +657,16 @@ async function completeConsumerEffect(
   const now = new Date().toISOString();
   const updated = await store.execute({
     sql: `UPDATE consumer_effect_ledger SET status = 'completed', completed_at = ?, lease_expires_at = ?
-      WHERE consumer_group = 'security-workflow-starters' AND event_id = ?
+      WHERE tenant_id = ? AND consumer_group = 'security-workflow-starters' AND event_id = ?
         AND status = 'processing' AND attempt_count = ? AND fence_token = ?`,
-    args: [now, now, eventId, attemptCount, fenceToken],
+    args: [now, now, tenantId, eventId, attemptCount, fenceToken],
   });
   return updated.rowsAffected === 1;
 }
 
 async function deadLetterConsumerEffect(
   store: OperationalStore,
+  tenantId: string,
   eventId: string,
   attemptCount: number,
   fenceToken: string,
@@ -642,9 +674,9 @@ async function deadLetterConsumerEffect(
   const now = new Date().toISOString();
   const updated = await store.execute({
     sql: `UPDATE consumer_effect_ledger SET status = 'dead_lettered', completed_at = ?, lease_expires_at = ?
-      WHERE consumer_group = 'security-workflow-starters' AND event_id = ?
+      WHERE tenant_id = ? AND consumer_group = 'security-workflow-starters' AND event_id = ?
         AND status = 'processing' AND attempt_count = ? AND fence_token = ?`,
-    args: [now, now, eventId, attemptCount, fenceToken],
+    args: [now, now, tenantId, eventId, attemptCount, fenceToken],
   });
   return updated.rowsAffected === 1;
 }

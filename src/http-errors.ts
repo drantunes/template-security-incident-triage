@@ -6,6 +6,7 @@ import type { StructuredLogger } from "./logging.js";
 export type HttpErrorCode =
   | "UNSUPPORTED_MEDIA_TYPE"
   | "PAYLOAD_TOO_LARGE"
+  | "RATE_LIMITED"
   | "SIGNATURE_MISSING"
   | "SIGNATURE_MALFORMED"
   | "SIGNATURE_INVALID"
@@ -20,7 +21,7 @@ export type HttpErrorCode =
 export function errorResponse(
   context: Context<AppEnv>,
   code: HttpErrorCode,
-  status: 401 | 403 | 409 | 413 | 415 | 422 | 500 | 503,
+  status: 401 | 403 | 409 | 413 | 415 | 422 | 429 | 500 | 503,
   retryable: boolean,
   logger: StructuredLogger,
 ) {
@@ -48,6 +49,8 @@ function publicMessage(code: HttpErrorCode): string {
       return "Content-Type must be application/json.";
     case "PAYLOAD_TOO_LARGE":
       return "The request body is too large.";
+    case "RATE_LIMITED":
+      return "Too many requests. Please retry later.";
     case "PAYLOAD_INVALID":
       return "The request payload is invalid.";
     case "ALERT_CONFLICT":

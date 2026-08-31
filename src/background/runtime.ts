@@ -4,6 +4,14 @@ import type { Mastra } from "@mastra/core/mastra";
 import { createLibSqlOperationalStore } from "../db/libsql-operational-store.js";
 import { migrateOperationalStore } from "../db/migrate.js";
 import { purgeExpiredGeoIpCache } from "../db/geoip-cache-operations.js";
+import {
+  startRetentionScheduler,
+  type RetentionScheduler,
+} from "./retention-scheduler.js";
+import {
+  readRetentionSchedulerConfig,
+  type RetentionSchedulerConfig,
+} from "../config/retention.js";
 import type { OperationalStore } from "../db/operational-store.js";
 import {
   readPhase2Config,
@@ -47,10 +55,13 @@ export async function startServerRuntime(
     logger?: StructuredLogger;
     port?: number;
     mastraInstance?: Mastra;
+    /** Initializes the shared Mastra storage before operational migrations. */
+    initializeStorage?: () => void | Promise<void>;
     bindServer?: BindServer;
     phase6Config?: Phase6Config;
     /** A validated F8 config is injected once into every runtime boundary. */
     phase8Config?: Phase8Config;
+    retentionConfig?: RetentionSchedulerConfig;
   }> = {},
 ): Promise<ServerRuntime> {
   const config = overrides.config ?? readPhase2Config();
@@ -58,15 +69,29 @@ export async function startServerRuntime(
   assertPhase8ControlPlaneAuth(phase8Config);
   const store = overrides.store ?? createLibSqlOperationalStore();
   const logger = overrides.logger ?? consoleLogger;
-  const runtimeMastra =
-    overrides.mastraInstance ?? (await import("../mastra/index.js")).mastra;
+  const runtimeModule = overrides.mastraInstance
+    ? undefined
+    : await import("../mastra/index.js");
+  const runtimeMastra = overrides.mastraInstance ?? runtimeModule!.mastra;
+  const initializeStorage =
+    overrides.initializeStorage ??
+    (runtimeModule
+      ? () => runtimeModule.storage.init()
+      : async () => undefined);
   let unsubscribe: (() => Promise<void>) | undefined;
   let timer: NodeJS.Timeout | undefined;
   let server: BoundServer | undefined;
   let iteration: Promise<unknown> | undefined;
+  let retentionScheduler: RetentionScheduler | undefined;
   let stopped = false;
   try {
+    await initializeStorage();
     await migrateOperationalStore(store);
+    retentionScheduler = await startRetentionScheduler(
+      store,
+      overrides.retentionConfig ?? readRetentionSchedulerConfig(),
+      logger,
+    );
     const phase6Config = overrides.phase6Config ?? readPhase6Config();
     const app = await createApp({
       config,
@@ -163,6 +188,7 @@ export async function startServerRuntime(
           }
         };
         if (server) await attempt(() => server!.close());
+        if (retentionScheduler) await attempt(() => retentionScheduler!.stop());
         await attempt(() =>
           Promise.race([
             iteration ?? Promise.resolve(),
@@ -178,6 +204,7 @@ export async function startServerRuntime(
     });
   } catch (error) {
     if (timer) clearInterval(timer);
+    await retentionScheduler?.stop();
     await unsubscribe?.();
     await server?.close();
     store.close();

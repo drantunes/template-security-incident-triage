@@ -15,6 +15,12 @@ import { phase10EvalAuthorityStatements } from "./0012-phase10-eval-authority.js
 import { phase10RunbookAuthoritySnapshotStatements } from "./0013-phase10-runbook-authority-snapshot.js";
 import { phase10ProviderObservedAtStatements } from "./0014-phase10-provider-observed-at.js";
 import { phase10ApprovalHistoryStatements } from "./0015-phase10-approval-history.js";
+import { phase11RetentionStatements } from "./0016-phase11-retention.js";
+import { phase11RetentionClaimsStatements } from "./0017-phase11-retention-claims.js";
+import { phase11RetentionAuditTenantStatements } from "./0018-phase11-retention-audit-tenant.js";
+import { phase11RetentionSourceCursorStatements } from "./0019-phase11-retention-source-cursor.js";
+import { phase11ConsumerLedgerTenantStatements } from "./0020-phase11-consumer-ledger-tenant.js";
+import { phase11RetentionClaimsTenantKeyStatements } from "./0021-phase11-retention-claims-tenant-key.js";
 
 export type Migration = Readonly<{
   version: number;
@@ -83,5 +89,31 @@ export const migrations = Object.freeze([
     15,
     "phase10-approval-history",
     phase10ApprovalHistoryStatements,
+  ),
+  defineMigration(16, "phase11-retention", phase11RetentionStatements),
+  defineMigration(
+    17,
+    "phase11-retention-claims",
+    phase11RetentionClaimsStatements,
+  ),
+  defineMigration(
+    18,
+    "phase11-retention-audit-tenant",
+    phase11RetentionAuditTenantStatements,
+  ),
+  defineMigration(
+    19,
+    "phase11-retention-source-cursor",
+    phase11RetentionSourceCursorStatements,
+  ),
+  defineMigration(
+    20,
+    "phase11-consumer-ledger-tenant",
+    phase11ConsumerLedgerTenantStatements,
+  ),
+  defineMigration(
+    21,
+    "phase11-retention-claims-tenant-key",
+    phase11RetentionClaimsTenantKeyStatements,
   ),
 ]);

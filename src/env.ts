@@ -2,6 +2,14 @@ import { z } from "zod";
 
 const integer = (fallback: number, minimum: number, maximum: number) =>
   z.coerce.number().int().min(minimum).max(maximum).default(fallback);
+const optionalSecret = (minimum: number) =>
+  z.preprocess(
+    (value) =>
+      typeof value === "string" && value.trim().length === 0
+        ? undefined
+        : value,
+    z.string().min(minimum).optional(),
+  );
 
 const environmentSchema = z.object({
   // The Phase 2 HTTP/outbox configuration is also used by the Phase 8
@@ -12,8 +20,8 @@ const environmentSchema = z.object({
     .enum(["true", "false"])
     .default("true")
     .transform((value) => value === "true"),
-  ALERT_WEBHOOK_SECRET: z.string().min(16).optional(),
-  WORKOS_WEBHOOK_SECRET: z.string().min(16).optional(),
+  ALERT_WEBHOOK_SECRET: optionalSecret(16),
+  WORKOS_WEBHOOK_SECRET: optionalSecret(16),
   ALERT_WEBHOOK_SOURCES: z.string().default("demo"),
   WEBHOOK_MAX_BODY_BYTES: integer(65_536, 1_024, 262_144),
   MASTRA_MAX_BODY_BYTES: integer(1_048_576, 65_536, 4_194_304),
@@ -132,8 +140,8 @@ const phase6EnvironmentSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
-  MOCK_DECISION_SECRET: z.string().min(32).optional(),
-  APPROVAL_RESUME_SECRET: z.string().min(32).optional(),
+  MOCK_DECISION_SECRET: optionalSecret(32),
+  APPROVAL_RESUME_SECRET: optionalSecret(32),
   CONTAINMENT_ACTION_TIMEOUT_MS: integer(1_000, 100, 10_000),
   CONTAINMENT_RATE_LIMIT: integer(8, 1, 32),
 });
@@ -182,12 +190,12 @@ const phase7EnvironmentSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
-  WORKOS_API_KEY: z.string().min(16).optional(),
-  WORKOS_CLIENT_ID: z.string().min(8).optional(),
+  WORKOS_API_KEY: optionalSecret(16),
+  WORKOS_CLIENT_ID: optionalSecret(8),
   WORKOS_REDIRECT_URI: z.url().optional(),
-  WORKOS_COOKIE_PASSWORD: z.string().min(32).optional(),
+  WORKOS_COOKIE_PASSWORD: optionalSecret(32),
   DASHBOARD_ORIGIN: z.url().default("http://localhost:3000"),
-  DASHBOARD_CSRF_SECRET: z.string().min(32).optional(),
+  DASHBOARD_CSRF_SECRET: optionalSecret(32),
   DASHBOARD_SESSION_MAX_AGE_SECONDS: integer(28_800, 60, 28_800),
   DASHBOARD_SSE_MAX_CONNECTIONS: integer(4, 1, 16),
   DASHBOARD_TRUSTED_PROXY: z

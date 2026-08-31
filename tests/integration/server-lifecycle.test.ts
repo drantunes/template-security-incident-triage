@@ -9,6 +9,7 @@ import { baselineWorkflow } from "../../src/mastra/workflows/baseline-workflow.j
 import { createIncidentIngestionWorkflow } from "../../src/mastra/workflows/incident-ingestion-workflow.js";
 import { makePhase2Config } from "../fixtures/phase2.js";
 import { readPhase8Config } from "../../src/env.js";
+import { retentionIntervalMs } from "../../src/config/retention.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -131,6 +132,7 @@ describe("server lifecycle", () => {
         incidentIngestionWorkflow: workflow,
       },
     });
+    const startupOrder: string[] = [];
     const runtime = await startServerRuntime({
       config: makePhase2Config({
         outbox: {
@@ -140,6 +142,9 @@ describe("server lifecycle", () => {
       }),
       store: database.createStore(),
       mastraInstance: mastra,
+      initializeStorage: async () => {
+        startupOrder.push("storage.init");
+      },
       logger: { write: () => {} },
       port: 0,
       bindServer: async (fetch) => ({
@@ -150,8 +155,51 @@ describe("server lifecycle", () => {
         },
       }),
     });
+    expect(startupOrder).toEqual(["storage.init"]);
     expect(runtime.port).toBe(43_210);
     await runtime.stop();
+    await runtime.stop();
+  });
+
+  it("runs the explicitly scoped retention scheduler in the runtime lifecycle", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const workflow = createIncidentIngestionWorkflow(() =>
+      createLibSqlOperationalStore({ url: database.url }),
+    );
+    const mastra = new Mastra({
+      storage: new LibSQLStore({
+        id: "retention-lifecycle",
+        url: database.url,
+      }),
+      workflows: {
+        baselineWorkflow,
+        incidentIngestionWorkflow: workflow,
+      },
+    });
+    const runtime = await startServerRuntime({
+      config: makePhase2Config({
+        outbox: { ...makePhase2Config().outbox, pollIntervalMs: 60_000 },
+      }),
+      retentionConfig: {
+        enabled: true,
+        tenantId: "tenant-a",
+        limit: 8,
+        intervalMs: retentionIntervalMs,
+      },
+      store: database.createStore(),
+      mastraInstance: mastra,
+      logger: { write: () => {} },
+      port: 0,
+      bindServer: async () => ({ port: 43_209, close: async () => {} }),
+    });
+    await expect(
+      database.createStore().execute({
+        sql: "SELECT next_source FROM retention_source_cursors WHERE tenant_id='tenant-a'",
+      }),
+    ).resolves.toMatchObject({
+      rows: [{ next_source: 1 }],
+    });
     await runtime.stop();
   });
 });

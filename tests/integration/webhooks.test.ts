@@ -5,6 +5,10 @@ import { migrateOperationalStore } from "../../src/db/migrate.js";
 import type { OperationalStore } from "../../src/db/operational-store.js";
 import type { LogRecord } from "../../src/logging.js";
 import { createApp } from "../../src/server.js";
+import {
+  FixedWindowWebhookRateLimiter,
+  type WebhookClientKeyResolver,
+} from "../../src/webhook-rate-limit.js";
 import { baselineWorkflow } from "../../src/mastra/workflows/baseline-workflow.js";
 import { incidentIngestionWorkflow } from "../../src/mastra/workflows/incident-ingestion-workflow.js";
 import {
@@ -29,7 +33,14 @@ afterEach(async () => {
   await Promise.all(databases.splice(0).map((database) => database.cleanup()));
 });
 
-async function setup(maxBodyBytes = 65_536, mastraMaxBodyBytes = 1_048_576) {
+async function setup(
+  maxBodyBytes = 65_536,
+  mastraMaxBodyBytes = 1_048_576,
+  rateLimit?: Readonly<{
+    limiter: FixedWindowWebhookRateLimiter;
+    resolveClient?: WebhookClientKeyResolver;
+  }>,
+) {
   const database = await createTempDatabase();
   databases.push(database);
   const store = database.createStore();
@@ -45,6 +56,10 @@ async function setup(maxBodyBytes = 65_536, mastraMaxBodyBytes = 1_048_576) {
     createRequestId: () => "request-1",
     nowMs: () => phase2NowMs,
     mastraInstance: testMastra,
+    ...(rateLimit ? { webhookRateLimiter: rateLimit.limiter } : {}),
+    ...(rateLimit?.resolveClient
+      ? { webhookClientKeyResolver: rateLimit.resolveClient }
+      : {}),
   });
   return { app, store, logs };
 }
@@ -56,6 +71,7 @@ async function postAlert(
     signature?: string;
     contentType?: string;
     rawBody?: string;
+    headers?: Record<string, string>;
   }> = {},
 ) {
   const body = options.rawBody ?? JSON.stringify(payload);
@@ -65,6 +81,7 @@ async function postAlert(
       "Content-Type": options.contentType ?? "application/json",
       "X-Alert-Signature": options.signature ?? signBody(body),
       "X-Correlation-ID": "correlation-1",
+      ...options.headers,
     },
     body,
   });
@@ -73,6 +90,7 @@ async function postAlert(
 async function postWorkOs(
   app: Awaited<ReturnType<typeof createApp>>,
   payload: unknown,
+  headers: Record<string, string> = {},
 ) {
   const body = JSON.stringify(payload);
   return app.request("/webhooks/workos", {
@@ -80,6 +98,7 @@ async function postWorkOs(
     headers: {
       "Content-Type": "application/json",
       "WorkOS-Signature": signBody(body, workosSecret),
+      ...headers,
     },
     body,
   });
@@ -99,6 +118,102 @@ async function counts(store: OperationalStore) {
 }
 
 describe("signed webhook ingestion", () => {
+  it("limits before body/HMAC/JSON and ignores forwarded-header spoofing", async () => {
+    let now = phase2NowMs;
+    const { app, store } = await setup(1_024, 1_048_576, {
+      limiter: new FixedWindowWebhookRateLimiter({
+        maxRequests: 1,
+        windowMs: 10_000,
+        maxBuckets: 8,
+        cleanupBatchSize: 8,
+        nowMs: () => now,
+      }),
+    });
+    try {
+      expect(
+        (
+          await postAlert(app, makeDemoWebhook(), {
+            headers: { "X-Forwarded-For": "198.51.100.1" },
+          })
+        ).status,
+      ).toBe(202);
+      const limited = await postAlert(app, makeDemoWebhook(), {
+        signature: "invalid",
+        rawBody: "x".repeat(2_000),
+        headers: { "X-Forwarded-For": "203.0.113.9" },
+      });
+      expect(limited.status).toBe(429);
+      expect(limited.headers.get("Retry-After")).toBe("10");
+      expect(await counts(store)).toMatchObject({ incidents: 1 });
+      now += 10_000;
+      expect((await postAlert(app, makeDemoWebhook())).status).toBe(202);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("isolates route and client buckets for alerts and WorkOS", async () => {
+    const { app, store } = await setup(65_536, 1_048_576, {
+      limiter: new FixedWindowWebhookRateLimiter({
+        maxRequests: 1,
+        windowMs: 10_000,
+        maxBuckets: 8,
+        cleanupBatchSize: 8,
+        nowMs: () => phase2NowMs,
+      }),
+      resolveClient: (context) =>
+        context.req.header("X-Test-Client") ?? "unattributed",
+    });
+    try {
+      expect(
+        (
+          await postAlert(app, makeDemoWebhook(), {
+            headers: { "X-Test-Client": "a" },
+          })
+        ).status,
+      ).toBe(202);
+      expect(
+        (
+          await postWorkOs(
+            app,
+            {
+              id: "event-rate-workos",
+              event: "mock.session.country_login",
+              created_at: "2026-08-27T12:00:00.000Z",
+              data: {
+                tenant_id: "tenant-1",
+                subject_id: "subject-1",
+                actor_id: "actor-1",
+                session_id: "session-rate",
+                ip: "203.0.113.10",
+              },
+            },
+            { "X-Test-Client": "a" },
+          )
+        ).status,
+      ).toBe(202);
+      expect(
+        (
+          await postAlert(
+            app,
+            makeDemoWebhook({ sourceEventId: "alert-rate-client-b" }),
+            {
+              headers: { "X-Test-Client": "b" },
+            },
+          )
+        ).status,
+      ).toBe(202);
+      expect(
+        (
+          await postAlert(app, makeDemoWebhook(), {
+            headers: { "X-Test-Client": "a" },
+          })
+        ).status,
+      ).toBe(429);
+    } finally {
+      store.close();
+    }
+  });
   it("commits incident, alert, timeline and outbox before returning 202", async () => {
     const { app, store, logs } = await setup();
     try {

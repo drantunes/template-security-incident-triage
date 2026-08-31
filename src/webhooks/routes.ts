@@ -29,6 +29,12 @@ import {
   verifyWebhookSignature,
   WORKOS_WEBHOOK_TOLERANCE_MS,
 } from "./signature.js";
+import {
+  FixedWindowWebhookRateLimiter,
+  webhookRateLimitMiddleware,
+  type WebhookClientKeyResolver,
+  type WebhookRateLimiter,
+} from "../webhook-rate-limit.js";
 
 type WebhookRouteDependencies = Readonly<{
   config: Phase2Config;
@@ -38,6 +44,8 @@ type WebhookRouteDependencies = Readonly<{
   nowMs?: () => number;
   /** Replay/demo clock for durable incident.received; production omits it. */
   clock?: Clock;
+  rateLimiter?: WebhookRateLimiter;
+  resolveClient?: WebhookClientKeyResolver;
 }>;
 
 class PayloadDecodeError extends Error {}
@@ -59,6 +67,25 @@ export function registerWebhookRoutes(
         dependencies.logger,
       ),
   });
+  const limiter =
+    dependencies.rateLimiter ??
+    new FixedWindowWebhookRateLimiter({
+      maxRequests: 120,
+      windowMs: 60_000,
+      maxBuckets: 1_024,
+      cleanupBatchSize: 64,
+      nowMs: dependencies.nowMs ?? Date.now,
+    });
+  const rateLimit = (route: string) =>
+    webhookRateLimitMiddleware({
+      limiter,
+      route,
+      logger: dependencies.logger,
+      ...(dependencies.resolveClient
+        ? { resolveClient: dependencies.resolveClient }
+        : {}),
+    });
+  app.use("/webhooks/alerts", rateLimit("alerts"));
   app.post("/webhooks/alerts", mediaType, limit, async (context) => {
     return handleWebhook(context, dependencies, {
       signatureHeader: "X-Alert-Signature",
@@ -74,6 +101,7 @@ export function registerWebhookRoutes(
   });
   const phase8 = dependencies.phase8Config;
   if (phase8?.workos.enabled) {
+    app.use("/webhooks/workos", rateLimit("workos"));
     app.post("/webhooks/workos", mediaType, limit, async (context) => {
       return handleWebhook(context, dependencies, {
         signatureHeader: "WorkOS-Signature",
@@ -96,6 +124,10 @@ export function registerWebhookRoutes(
       });
     });
   }
+  app.use(
+    phase8?.workos.enabled ? "/webhooks/workos/mock" : "/webhooks/workos",
+    rateLimit(phase8?.workos.enabled ? "workos.mock" : "workos"),
+  );
   app.post(
     phase8?.workos.enabled ? "/webhooks/workos/mock" : "/webhooks/workos",
     mediaType,

@@ -31,6 +31,10 @@ import { readPhase6Config, type Phase6Config } from "./env.js";
 import { readPhase7Config, type Phase7Config } from "./env.js";
 import { createWorkosDashboardSessionClient } from "./auth/workos-session.js";
 import { registerDashboardRoutes } from "./dashboard/routes.js";
+import type {
+  WebhookClientKeyResolver,
+  WebhookRateLimiter,
+} from "./webhook-rate-limit.js";
 
 export async function createApp(
   input: Readonly<{
@@ -43,6 +47,8 @@ export async function createApp(
     phase6Config?: Phase6Config;
     phase7Config?: Phase7Config;
     phase8Config?: Phase8Config;
+    webhookRateLimiter?: WebhookRateLimiter;
+    webhookClientKeyResolver?: WebhookClientKeyResolver;
   }>,
 ): Promise<Hono<AppEnv>> {
   const logger = input.logger ?? consoleLogger;
@@ -59,6 +65,12 @@ export async function createApp(
     store: input.store,
     logger,
     ...(input.nowMs ? { nowMs: input.nowMs } : {}),
+    ...(input.webhookRateLimiter
+      ? { rateLimiter: input.webhookRateLimiter }
+      : {}),
+    ...(input.webhookClientKeyResolver
+      ? { resolveClient: input.webhookClientKeyResolver }
+      : {}),
   });
 
   app.use(

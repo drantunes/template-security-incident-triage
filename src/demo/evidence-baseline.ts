@@ -178,10 +178,16 @@ export async function consumeDemoDeviceNonce(
       .digest("hex");
     const result = await store.execute({
       sql: `INSERT OR IGNORE INTO consumer_effect_ledger(
-        consumer_group, event_id, status, attempt_count, fence_token,
+        tenant_id, consumer_group, event_id, status, attempt_count, fence_token,
         lease_expires_at, completed_at
-      ) VALUES ('phase9-device-nonce', ?, 'completed', 1, ?, ?, ?)`,
-      args: [nonceKey, nonceKey, device.expiresAt, input.occurredAt],
+      ) VALUES (?, 'phase9-device-nonce', ?, 'completed', 1, ?, ?, ?)`,
+      args: [
+        input.tenantId,
+        nonceKey,
+        nonceKey,
+        device.expiresAt,
+        input.occurredAt,
+      ],
     });
     return result.rowsAffected === 1;
   } finally {
