@@ -27,6 +27,9 @@ import {
 } from "../agents/investigator-output.js";
 import { projectFactsForPrompt } from "../agents/prompt-safe-evidence.js";
 import type { EvidenceReadTool } from "../tools/evidence-read-tool.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
+import { readWorkflowPhase10Trace } from "../phase10-trace-context.js";
+import { startPhase10Boundary } from "../observability.js";
 
 export type GatherDependencies<Source extends EvidenceSourceV1> = Readonly<{
   openStore?: () => OperationalStore;
@@ -58,6 +61,32 @@ export function createGatherEvidenceStep<Source extends EvidenceSourceV1>(
       const toolCallId = `tc_${createHash("sha256")
         .update(`${inputData.workflowRunId}:${source}`, "utf8")
         .digest("hex")}`;
+      // Start the gather interval before its provider/tool/agent work begins.
+      // The three workflow branches run concurrently, so their persisted
+      // boundary timing must evidence overlap rather than merely a shared
+      // parent or start-order.
+      const gatherStore = (
+        dependencies.openStore ?? createLibSqlOperationalStore
+      )();
+      const gatherContext = await readWorkflowPhase10Trace(gatherStore, {
+        tenantId: inputData.tenantId,
+        incidentId: inputData.incidentId,
+        workflowRunId: inputData.workflowRunId,
+      });
+      const gatherTrace = startPhase10Boundary({
+        boundary: `gather.${source}` as const,
+        tenantId: inputData.tenantId,
+        incidentId: inputData.incidentId,
+        runId: inputData.workflowRunId,
+        correlationId: inputData.correlationId,
+        requestId: gatherContext?.requestId ?? inputData.workflowRunId,
+        ...(gatherContext ? { context: gatherContext } : {}),
+        identifiers: {
+          stepId,
+          toolCallId,
+          provider: `${source}-read-tool`,
+        },
+      });
       const request = {
         tenantId: inputData.tenantId,
         incidentId: inputData.incidentId,
@@ -127,17 +156,42 @@ export function createGatherEvidenceStep<Source extends EvidenceSourceV1>(
           sensitivity: fact.sensitivity,
         })),
       );
-      const agentResult = await generateWithOneSchemaRetry(
-        (attempt) =>
-          dependencies.investigator(
-            {
-              facts: promptFacts,
-            },
-            attempt,
-            abortSignal,
-          ),
-        InvestigatorOutputSchema,
-      ).catch((error: unknown) => ({ status: "operational" as const, error }));
+      const traceStore = (
+        dependencies.openStore ?? createLibSqlOperationalStore
+      )();
+      let agentResult;
+      try {
+        agentResult = await withinWorkflowPhase10Boundary(
+          traceStore,
+          {
+            tenantId: inputData.tenantId,
+            incidentId: inputData.incidentId,
+            workflowRunId: inputData.workflowRunId,
+            correlationId: inputData.correlationId,
+            boundary: `agent.${source}` as const,
+            stepId,
+            toolCallId,
+            provider: `${source}-investigator`,
+            // The three gather branches deliberately share workflow.start.
+            advance: false,
+          },
+          () =>
+            generateWithOneSchemaRetry(
+              (attempt) =>
+                dependencies.investigator(
+                  { facts: promptFacts },
+                  attempt,
+                  abortSignal,
+                ),
+              InvestigatorOutputSchema,
+            ),
+        ).catch((error: unknown) => ({
+          status: "operational" as const,
+          error,
+        }));
+      } finally {
+        traceStore.close();
+      }
       if (agentResult.status === "operational")
         return failedBranch(
           agentOperationalFailure(source, agentResult.error, abortSignal),
@@ -174,6 +228,8 @@ export function createGatherEvidenceStep<Source extends EvidenceSourceV1>(
           },
         );
         const finishedAt = clock.now();
+        gatherTrace.span.end({ attributes: { success: true } as never });
+        gatherStore.close();
         return BranchResultSchema.parse({
           source,
           status: evidence.some((item) => item.incomplete)

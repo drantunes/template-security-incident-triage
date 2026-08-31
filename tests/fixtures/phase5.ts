@@ -86,6 +86,7 @@ export function phase5Context(
         incidentKinds: [kind],
         owner: "security",
         status: "active",
+        mandatoryRules: ["Fixture mandatory rule."],
       },
       sourcePath: `src/mastra/runbooks/${kind}.md`,
       sourceHash: "a".repeat(64),

@@ -13,8 +13,11 @@ import {
   type RunbookFrontmatter,
 } from "./schemas.js";
 import { RUNBOOK_SECTIONS, sectionKey } from "./sections.js";
+import { mandatoryRulesByRunbook } from "./mandatory-rules.js";
 
 const MAX_RUNBOOK_BYTES = 65_536;
+const phase10SourceMarker =
+  /<!-- phase10-redaction-source: [^<>\r\n]{1,512} -->\n?/gu;
 const expectedIdentity: Readonly<Record<IncidentKind, string>> = {
   unauthorized_privilege_change: "RB-IDENTITY-001",
   disallowed_country_login: "RB-IDENTITY-002",
@@ -96,13 +99,24 @@ export async function loadRunbook(
     fail();
   }
   if (markdown.includes("\r")) fail();
-  const { frontmatter, body } = parseFrontmatter(markdown);
+  // The report-only fixture marker proves source-content redaction without
+  // becoming retrievable text. Its byte hash still commits to the exact file.
+  const { frontmatter, body } = parseFrontmatter(
+    markdown.replace(phase10SourceMarker, ""),
+  );
   const metadataResult = RunbookFrontmatterSchema.safeParse(frontmatter);
   if (!metadataResult.success) fail();
   const metadata = metadataResult.data;
   if (metadata.incidentKinds.length !== 1) fail();
   const kind = metadata.incidentKinds[0];
   if (!kind || expectedIdentity[kind] !== metadata.id) fail();
+  if (
+    metadata.mandatoryRules.join("\0") !==
+    mandatoryRulesByRunbook[
+      metadata.id as keyof typeof mandatoryRulesByRunbook
+    ]?.join("\0")
+  )
+    fail();
   const sections = parseSections(body);
   if (!sections[0]?.body.includes(`Incident kind: \`${kind}\``)) fail();
   await validateLinks(body, rootPath);
@@ -139,7 +153,7 @@ function parseFrontmatter(markdown: string): {
   const result: Record<string, unknown> = {};
   let list: string[] | undefined;
   for (const line of header) {
-    const item = /^ {2}- ([a-z_]+)$/u.exec(line);
+    const item = /^ {2}- ([A-Za-z0-9 ,.'`()_-]{1,512})$/u.exec(line);
     if (item) {
       if (!list || !item[1]) fail();
       list.push(item[1]);

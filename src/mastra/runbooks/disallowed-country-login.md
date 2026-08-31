@@ -5,6 +5,9 @@ incidentKinds:
   - disallowed_country_login
 owner: security
 status: active
+mandatoryRules:
+  - Missing policy or session evidence requires manual review.
+  - A `soc_manager` must approve the exact structured plan, session, subject, impact, rollback, expiration, and plan hash.
 ---
 
 ## Purpose and Preconditions

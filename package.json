@@ -15,6 +15,8 @@
     "fixture:sign": "node --env-file-if-exists=.env scripts/sign-webhook.mjs scripts/fixtures/phase2-alert.json",
     "demo": "node --import tsx scripts/phase9-demo.mts",
     "demo:surfaces": "node --no-deprecation --import tsx scripts/phase9-demo-surfaces.mts",
+    "phase10:report": "node --import tsx scripts/phase10-report.mts",
+    "phase10:ci": "node --import tsx scripts/phase10-ci.mts",
     "build": "npm run runbooks:validate && tsc -p tsconfig.build.json",
     "start": "node --env-file-if-exists=.env dist/start.js",
     "format": "prettier --write .",
@@ -35,6 +37,7 @@
     "postinstall": "node scripts/apply-vendored-redis-streams-patch.mjs"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.4",
     "@hono/node-server": "2.1.1",
     "@libsql/client": "0.17.4",
     "@linear/sdk": "92.0.0",

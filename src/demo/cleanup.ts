@@ -1,6 +1,7 @@
 import {
   readJournal,
   removeOwnedDatabase,
+  removeOwnedTraceDatabase,
   resourceHash,
   semanticDatabaseHash,
 } from "./journal.js";
@@ -40,6 +41,7 @@ export async function cleanupDemo(
           databasePath,
         ),
     });
+    await removeOwnedTraceDatabase(root, cleaning);
     return transition(
       root,
       cleaning,

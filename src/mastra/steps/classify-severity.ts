@@ -28,6 +28,7 @@ import {
 import { generateWithOneSchemaRetry } from "../agents/investigator-output.js";
 import { invokeResponsePlanner } from "../agents/response-planner.js";
 import { RunbookRetrievedSchema } from "./retrieve-runbook.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export type Phase5StepDependencies = Readonly<{
   openStore?: () => OperationalStore;
@@ -65,10 +66,18 @@ export function createClassifySeverityStep(
               : "INTEGRITY_CHECK_FAILED",
           ]);
         }
-        const result = await classifySeverity(
-          context,
-          dependencies.planner,
-          abortSignal,
+        const result = await withinWorkflowPhase10Boundary(
+          store,
+          {
+            tenantId: context.correlation.context.tenantId,
+            incidentId: context.correlation.context.incidentId,
+            workflowRunId: context.correlation.context.workflowRunId,
+            correlationId: context.correlation.context.correlationId,
+            boundary: "severity.policy",
+            stepId: "classify-severity",
+            provider: "response-planner",
+          },
+          () => classifySeverity(context, dependencies.planner, abortSignal),
         );
         // The classification step, rather than a caller observing its result,
         // owns the operational severity projection.  This keeps dashboard and

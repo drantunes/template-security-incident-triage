@@ -160,6 +160,33 @@ export async function removeOwnedDatabase(
   await rm(`${expected}-shm`, { force: true });
 }
 
+/** Removes only the separately journaled, closed observability database. */
+export async function removeOwnedTraceDatabase(
+  root: string,
+  journal: DemoJournal,
+): Promise<void> {
+  const expected = resolve(root, `${journal.demoRunId}.trace.db`);
+  if (resolve(journal.traceDatabasePath) !== expected)
+    throw new Error("DEMO_TRACE_DATABASE_OWNERSHIP_DENIED");
+  const resource = journal.resources.find(
+    (candidate) =>
+      candidate.kind === "local_trace_database" &&
+      candidate.ref === `local-trace:${journal.demoRunId}`,
+  );
+  if (!resource || resource.ownership !== "created")
+    throw new Error("DEMO_TRACE_DATABASE_OWNERSHIP_DENIED");
+  // Mastra/libSQL can checkpoint the closed trace DB after the runner's last
+  // semantic journal transition, changing physical SQLite bytes without a
+  // logical trace mutation. Ownership remains bound by the exclusive-create
+  // journal resource and exact derived path; require presence but never treat
+  // a checkpoint as foreign data.
+  if (!(await exists(expected)))
+    throw new Error("DEMO_TRACE_DATABASE_PRECONDITION_FAILED");
+  await rm(expected, { force: true });
+  await rm(`${expected}-wal`, { force: true });
+  await rm(`${expected}-shm`, { force: true });
+}
+
 /**
  * Reserve the exact DB path before libSQL can open it. A journal path is not
  * creation proof: only an exclusive create proves this run owns the resource.
@@ -194,6 +221,33 @@ export async function reserveOwnedDatabase(
       throw new Error("DEMO_DATABASE_ALREADY_EXISTS", { cause: error });
     throw error;
   }
+  await handle.close();
+}
+
+/**
+ * Reserves the run-owned observability database independently from the
+ * operational database.  The trace store is never adopted from a prior run.
+ */
+export async function reserveOwnedTraceDatabase(
+  root: string,
+  journal: DemoJournal,
+): Promise<void> {
+  const expected = resolve(root, `${journal.demoRunId}.trace.db`);
+  if (resolve(journal.traceDatabasePath) !== expected)
+    throw new Error("DEMO_TRACE_DATABASE_OWNERSHIP_DENIED");
+  const claimed = journal.resources.some(
+    (resource) =>
+      resource.kind === "local_trace_database" &&
+      resource.ref === `local-trace:${journal.demoRunId}` &&
+      resource.ownership === "created" &&
+      resource.expectedHash === `pending:${journal.demoRunId}`,
+  );
+  if (!claimed) throw new Error("DEMO_TRACE_DATABASE_OWNERSHIP_DENIED");
+  for (const path of [expected, `${expected}-wal`, `${expected}-shm`]) {
+    if (await exists(path))
+      throw new Error("DEMO_TRACE_DATABASE_ALREADY_EXISTS");
+  }
+  const handle = await open(expected, "wx", 0o600);
   await handle.close();
 }
 
@@ -426,6 +480,7 @@ export function newJournal(
     state: "prepared",
     createdAt: now,
     databasePath: resolve(input.root, `${input.demoRunId}.db`),
+    traceDatabasePath: resolve(input.root, `${input.demoRunId}.trace.db`),
     resources: [],
   };
 }

@@ -53,9 +53,11 @@ export async function persistScenarioEvidenceBaseline(
   store: ReturnType<typeof createLibSqlOperationalStore>,
   fixture: ReturnType<typeof fixtureForScenario>,
   incidentId: string,
+  sourceCanary?: string,
 ): Promise<void> {
   const baseline: DemoEvidenceBaseline = {
     version: 1,
+    ...(sourceCanary ? { redactionSource: sourceCanary } : {}),
     identity: {
       actorId: fixture.actor.id,
       previousRole:

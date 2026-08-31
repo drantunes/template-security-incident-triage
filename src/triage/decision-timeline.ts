@@ -7,7 +7,7 @@ import type { DecisionContext } from "./decision-context.js";
 export async function appendPhase5Timeline(
   store: OperationalStore,
   context: DecisionContext,
-  stage: "classification" | "summary" | "proposal" | "validation",
+  stage: "classification" | "summary" | "proposal" | "validation" | "triage",
   status: "completed" | "manual-review" | "blocked",
   payload: Readonly<Record<string, string | number | boolean | null>>,
 ) {
@@ -28,7 +28,8 @@ export async function appendPhase5Timeline(
     planHashVersion: 1,
     ...payload,
   });
-  const type = `triage.${stage}.${status}`;
+  const type =
+    stage === "triage" ? "triage.completed" : `triage.${stage}.${status}`;
   try {
     await store.transaction(async (tx) => {
       const existing = await tx.execute({

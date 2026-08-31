@@ -5,6 +5,9 @@ incidentKinds:
   - unauthorized_privilege_change
 owner: security
 status: active
+mandatoryRules:
+  - Missing required evidence requires manual review.
+  - A `soc_manager` must approve the exact structured plan, target, previous role, session identifiers, impact, rollback, expiration, and plan hash before any allowed action.
 ---
 
 ## Purpose and Preconditions

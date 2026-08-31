@@ -17,6 +17,11 @@ import type { Clock } from "../../domain/clock.js";
 import type { IdGenerator } from "../../domain/id-generator.js";
 import { ContainmentActionOutcomeSchema } from "../../schemas/containment.js";
 import type { IdentityProvider } from "../../providers/identity-provider.js";
+import { startPhase10Boundary } from "../observability.js";
+import {
+  advanceWorkflowPhase10Trace,
+  readWorkflowPhase10Trace,
+} from "../phase10-trace-context.js";
 
 export function createExecuteContainmentStep(
   dependencies: Readonly<{
@@ -62,6 +67,11 @@ export function createExecuteContainmentStep(
       }
       const store = (dependencies.openStore ?? createLibSqlOperationalStore)();
       try {
+        let traceContext = await readWorkflowPhase10Trace(store, {
+          tenantId: inputData.plan.tenantId,
+          incidentId: inputData.plan.incidentId,
+          workflowRunId: inputData.workflowRunId,
+        });
         const approved = await getIncident(
           store,
           inputData.plan.tenantId,
@@ -146,14 +156,60 @@ export function createExecuteContainmentStep(
         });
         const outcomes = [];
         for (const action of inputData.plan.actions) {
-          const outcome = await gateway.executeApprovedAction({
+          // The resume step advances the durable carrier immediately before
+          // this step. Re-read at the external-provider boundary so a resumed
+          // workflow cannot retain a stale decision parent from an earlier
+          // in-memory snapshot.
+          traceContext =
+            (await readWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+            })) ?? traceContext;
+          const trace = startPhase10Boundary({
+            boundary: "provider.containment",
             tenantId: inputData.plan.tenantId,
             incidentId: inputData.plan.incidentId,
-            workflowRunId: inputData.workflowRunId,
-            approvalId: inputData.authoritative.approvalId,
-            plan: inputData.plan,
-            action,
+            runId: inputData.workflowRunId,
+            correlationId: inputData.correlationId,
+            requestId: inputData.workflowRunId,
+            ...(traceContext ? { context: traceContext } : {}),
+            identifiers: {
+              stepId: "execute-containment",
+              toolCallId: action.actionId,
+              provider: "mock-containment",
+            },
           });
+          let outcome;
+          try {
+            outcome = await gateway.executeApprovedAction({
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+              approvalId: inputData.authoritative.approvalId,
+              plan: inputData.plan,
+              action,
+            });
+            trace.span.end({ attributes: { success: true } as never });
+            if (traceContext) {
+              const next = {
+                ...trace.context,
+                runId: inputData.workflowRunId,
+                requestId: traceContext.requestId,
+              };
+              await advanceWorkflowPhase10Trace(store, {
+                tenantId: inputData.plan.tenantId,
+                incidentId: inputData.plan.incidentId,
+                workflowRunId: inputData.workflowRunId,
+                previous: traceContext,
+                next,
+              });
+              traceContext = next;
+            }
+          } catch (error) {
+            trace.span.error({ error: error as Error, endSpan: true });
+            throw error;
+          }
           outcomes.push(outcome);
           if (
             outcome.status !== "completed" ||

@@ -12,6 +12,7 @@ import {
   type IncidentProvider,
 } from "../../providers/incident-provider.js";
 import { MockIncidentProvider } from "../../providers/mock-incident-provider.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export function createOpenExternalIncidentStep(
   dependencies: Readonly<{
@@ -59,25 +60,38 @@ export function createOpenExternalIncidentStep(
           planHash: inputData.plan.planHash,
           actionTypes: inputData.plan.actions.map((action) => action.type),
         });
-        const delivery = await deliverExternalIncident(
+        const delivery = await withinWorkflowPhase10Boundary(
           store,
-          provider,
           {
-            operation: "open-awaiting-approval",
-            projection,
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
             workflowRunId: inputData.workflowRunId,
             correlationId: inputData.correlationId,
+            boundary: "provider.linear",
+            stepId: "open-external-incident",
+            provider: "mock-incident",
           },
-          {
-            ...(dependencies.clock ? { clock: dependencies.clock } : {}),
-            ...(dependencies.ids ? { ids: dependencies.ids } : {}),
-            ...(dependencies.maxAttempts
-              ? { maxAttempts: dependencies.maxAttempts }
-              : {}),
-            ...(dependencies.timeoutMs
-              ? { timeoutMs: dependencies.timeoutMs }
-              : {}),
-          },
+          () =>
+            deliverExternalIncident(
+              store,
+              provider,
+              {
+                operation: "open-awaiting-approval",
+                projection,
+                workflowRunId: inputData.workflowRunId,
+                correlationId: inputData.correlationId,
+              },
+              {
+                ...(dependencies.clock ? { clock: dependencies.clock } : {}),
+                ...(dependencies.ids ? { ids: dependencies.ids } : {}),
+                ...(dependencies.maxAttempts
+                  ? { maxAttempts: dependencies.maxAttempts }
+                  : {}),
+                ...(dependencies.timeoutMs
+                  ? { timeoutMs: dependencies.timeoutMs }
+                  : {}),
+              },
+            ),
         );
         // D-026 orders the externally traceable, redacted issue before the
         // first suspend.  A durable retry/uncertain record is not evidence of

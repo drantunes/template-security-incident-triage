@@ -18,6 +18,11 @@ import type { MockContainmentState } from "../containment/mock-state.js";
 import type { IdentityProvider } from "../providers/identity-provider.js";
 import { ContainmentPlanSchema } from "../schemas/containment.js";
 import type { ReconcileApprovalRun } from "../approval/workflow-resume-reconciler.js";
+import { startPhase10Boundary } from "../mastra/observability.js";
+import {
+  advanceWorkflowPhase10Trace,
+  readWorkflowPhase10Trace,
+} from "../mastra/phase10-trace-context.js";
 
 export class Phase6RecoveryDispatcher {
   constructor(
@@ -314,31 +319,77 @@ export class Phase6RecoveryDispatcher {
       workflowRunId: String(row.workflow_run_id),
       correlationId: `expiry_${String(row.approval_id)}`,
     };
-    if (row.incident_status === "awaiting_approval") {
-      const changed = await expirePendingApproval(
-        this.dependencies.store,
-        work,
-        {
-          clock: this.dependencies.clock,
-          ids: this.dependencies.ids ?? uuidGenerator,
-        },
-      );
-      if (!changed) return false;
+    const workflowTrace = await readWorkflowPhase10Trace(
+      this.dependencies.store,
+      {
+        tenantId: work.tenantId,
+        incidentId: work.incidentId,
+        workflowRunId: work.workflowRunId,
+      },
+    );
+    const trace = startPhase10Boundary({
+      boundary: "approval.expiry",
+      tenantId: work.tenantId,
+      incidentId: work.incidentId,
+      runId: work.workflowRunId,
+      correlationId: work.correlationId,
+      requestId: work.approvalId,
+      ...(workflowTrace ? { context: workflowTrace } : {}),
+      identifiers: { stepId: "approval-expiry", provider: "linear" },
+    });
+    try {
+      if (row.incident_status === "awaiting_approval") {
+        const changed = await expirePendingApproval(
+          this.dependencies.store,
+          work,
+          {
+            clock: this.dependencies.clock,
+            ids: this.dependencies.ids ?? uuidGenerator,
+          },
+        );
+        if (!changed) {
+          trace.span.end({ attributes: { success: false } as never });
+          return false;
+        }
+      }
+      // The reconciler resumes immediately below; persist the completed
+      // expiry span first so approval.resume cannot reopen approval.await.
+      trace.span.end({ attributes: { success: true } as never });
+      if (workflowTrace)
+        await advanceWorkflowPhase10Trace(this.dependencies.store, {
+          tenantId: work.tenantId,
+          incidentId: work.incidentId,
+          workflowRunId: work.workflowRunId,
+          previous: workflowTrace,
+          next: {
+            ...trace.context,
+            runId: work.workflowRunId,
+            requestId: workflowTrace.requestId,
+          },
+        });
+      const reconciliation = await this.dependencies.reconcileApprovalRun({
+        workflowRunId: work.workflowRunId,
+        resumeReceiptId: `expiry_${work.approvalId}`,
+        expectedResultStatuses: ["expired"],
+      });
+      if (reconciliation === "in_progress") {
+        trace.span.end({ attributes: { success: false } as never });
+        return false;
+      }
+      const marked = await this.dependencies.store.execute({
+        sql: `UPDATE approvals SET expiry_resumed_at = ?
+          WHERE tenant_id = ? AND incident_id = ? AND id = ?
+            AND decision IS NULL AND expiry_resumed_at IS NULL`,
+        args: [now, work.tenantId, work.incidentId, work.approvalId],
+      });
+      trace.span.end({
+        attributes: { success: marked.rowsAffected === 1 } as never,
+      });
+      return marked.rowsAffected === 1;
+    } catch (error) {
+      trace.span.error({ error: error as Error, endSpan: true });
+      throw error;
     }
-    const reconciliation = await this.dependencies.reconcileApprovalRun({
-      workflowRunId: work.workflowRunId,
-      resumeReceiptId: `expiry_${work.approvalId}`,
-      expectedResultStatuses: ["expired"],
-    });
-    if (reconciliation === "in_progress") return false;
-    const marked = await this.dependencies.store.execute({
-      sql: `UPDATE approvals SET expiry_resumed_at = ?
-        WHERE tenant_id = ? AND incident_id = ? AND id = ?
-          AND decision IS NULL AND expiry_resumed_at IS NULL`,
-      args: [now, work.tenantId, work.incidentId, work.approvalId],
-    });
-    if (marked.rowsAffected !== 1) return false;
-    return true;
   }
 
   private async deliverOne(): Promise<boolean> {

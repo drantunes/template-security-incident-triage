@@ -16,6 +16,9 @@ export const RunbookFrontmatterSchema = z
     incidentKinds: z.array(IncidentKindSchema).min(1).max(3),
     owner: z.literal("security"),
     status: z.enum(["active", "inactive"]),
+    // These are the runbook's own mandatory statements, copied verbatim from
+    // the procedure.  They intentionally are not synthetic rule identifiers.
+    mandatoryRules: z.array(z.string().min(8).max(512)).min(1).max(8),
   })
   .strict()
   .refine(

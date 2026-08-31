@@ -10,6 +10,11 @@ import type { Clock } from "../../domain/clock.js";
 import type { IdGenerator } from "../../domain/id-generator.js";
 import type { ContainmentExecutionResult } from "../../approval/phase6-contracts.js";
 import { closeValidatedTerminalIncident } from "../../containment/terminal-readiness.js";
+import { startPhase10Boundary } from "../observability.js";
+import {
+  advanceWorkflowPhase10Trace,
+  readWorkflowPhase10Trace,
+} from "../phase10-trace-context.js";
 
 export function createFinalizeIncidentStep(
   dependencies: Readonly<{
@@ -31,6 +36,69 @@ export function createFinalizeIncidentStep(
       )
         return inputData;
       if (inputData.status === "containment-failed") {
+        const store = (
+          dependencies.openStore ?? createLibSqlOperationalStore
+        )();
+        try {
+          let context = await readWorkflowPhase10Trace(store, {
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+          });
+          if (context) {
+            const cleanup = startPhase10Boundary({
+              boundary: "workflow.cleanup",
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              runId: inputData.workflowRunId,
+              correlationId: inputData.correlationId,
+              requestId: context.requestId,
+              context,
+              identifiers: { stepId: "finalize-incident" },
+            });
+            cleanup.span.end({ attributes: { success: true } as never });
+            await advanceWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+              previous: context,
+              next: {
+                ...cleanup.context,
+                runId: inputData.workflowRunId,
+                requestId: context.requestId,
+              },
+            });
+            context = await readWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+            });
+          }
+          const trace = startPhase10Boundary({
+            boundary: "triage.completed",
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            runId: inputData.workflowRunId,
+            correlationId: inputData.correlationId,
+            requestId: context?.requestId ?? inputData.workflowRunId,
+            ...(context ? { context } : {}),
+          });
+          trace.span.end({ attributes: { success: false } as never });
+          if (context)
+            await advanceWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+              previous: context,
+              next: {
+                ...trace.context,
+                runId: inputData.workflowRunId,
+                requestId: context.requestId,
+              },
+            });
+        } finally {
+          store.close();
+        }
         return {
           status: "failed" as const,
           incidentId: inputData.plan.incidentId,
@@ -44,6 +112,49 @@ export function createFinalizeIncidentStep(
           dependencies.openStore ?? createLibSqlOperationalStore
         )();
         try {
+          let context = await readWorkflowPhase10Trace(store, {
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+          });
+          if (context) {
+            const cleanup = startPhase10Boundary({
+              boundary: "workflow.cleanup",
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              runId: inputData.workflowRunId,
+              correlationId: inputData.correlationId,
+              requestId: context.requestId,
+              context,
+              identifiers: { stepId: "finalize-incident" },
+            });
+            cleanup.span.end({ attributes: { success: true } as never });
+            await advanceWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+              previous: context,
+              next: {
+                ...cleanup.context,
+                runId: inputData.workflowRunId,
+                requestId: context.requestId,
+              },
+            });
+            context = await readWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+            });
+          }
+          const trace = startPhase10Boundary({
+            boundary: "triage.completed",
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            runId: inputData.workflowRunId,
+            correlationId: inputData.correlationId,
+            requestId: context?.requestId ?? inputData.workflowRunId,
+            ...(context ? { context } : {}),
+          });
           // Expiry resumes the same durable workflow through the Phase 6
           // receipt. Keep its operational marker aligned with the completed
           // Mastra run just as approved/rejected terminal paths do.
@@ -56,6 +167,19 @@ export function createFinalizeIncidentStep(
               inputData.plan.incidentId,
             ],
           });
+          trace.span.end({ attributes: { success: true } as never });
+          if (context)
+            await advanceWorkflowPhase10Trace(store, {
+              tenantId: inputData.plan.tenantId,
+              incidentId: inputData.plan.incidentId,
+              workflowRunId: inputData.workflowRunId,
+              previous: context,
+              next: {
+                ...trace.context,
+                runId: inputData.workflowRunId,
+                requestId: context.requestId,
+              },
+            });
         } finally {
           store.close();
         }
@@ -67,6 +191,53 @@ export function createFinalizeIncidentStep(
       }
       const store = (dependencies.openStore ?? createLibSqlOperationalStore)();
       try {
+        let context = await readWorkflowPhase10Trace(store, {
+          tenantId: inputData.plan.tenantId,
+          incidentId: inputData.plan.incidentId,
+          workflowRunId: inputData.workflowRunId,
+        });
+        // Cleanup is an explicit terminal boundary: it records that the
+        // resumable workflow marker is about to be closed without exporting
+        // any incident content. The final completion span must descend from
+        // it, rather than looking like a sibling of provider delivery.
+        if (context) {
+          const cleanup = startPhase10Boundary({
+            boundary: "workflow.cleanup",
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            runId: inputData.workflowRunId,
+            correlationId: inputData.correlationId,
+            requestId: context.requestId,
+            context,
+            identifiers: { stepId: "finalize-incident" },
+          });
+          cleanup.span.end({ attributes: { success: true } as never });
+          await advanceWorkflowPhase10Trace(store, {
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+            previous: context,
+            next: {
+              ...cleanup.context,
+              runId: inputData.workflowRunId,
+              requestId: context.requestId,
+            },
+          });
+          context = await readWorkflowPhase10Trace(store, {
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+          });
+        }
+        const trace = startPhase10Boundary({
+          boundary: "triage.completed",
+          tenantId: inputData.plan.tenantId,
+          incidentId: inputData.plan.incidentId,
+          runId: inputData.workflowRunId,
+          correlationId: inputData.correlationId,
+          requestId: context?.requestId ?? inputData.workflowRunId,
+          ...(context ? { context } : {}),
+        });
         await closeValidatedTerminalIncident(
           store,
           {
@@ -92,7 +263,21 @@ export function createFinalizeIncidentStep(
             inputData.plan.incidentId,
           ],
         });
-        return finalResult(inputData);
+        const result = finalResult(inputData);
+        trace.span.end({ attributes: { success: true } as never });
+        if (context)
+          await advanceWorkflowPhase10Trace(store, {
+            tenantId: inputData.plan.tenantId,
+            incidentId: inputData.plan.incidentId,
+            workflowRunId: inputData.workflowRunId,
+            previous: context,
+            next: {
+              ...trace.context,
+              runId: inputData.workflowRunId,
+              requestId: context.requestId,
+            },
+          });
+        return result;
       } finally {
         store.close();
       }

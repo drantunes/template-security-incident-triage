@@ -1,4 +1,2 @@
-dist
-node_modules
-.mastra
-package-lock.json
+# The Diego-approved dataset manifest has a byte-level SHA-256 contract.
+src/mastra/evals/datasets/v1/manifest.json

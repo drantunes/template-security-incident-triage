@@ -13,6 +13,7 @@ import { storage } from "./storage.js";
 import { baselineWorkflow } from "./workflows/baseline-workflow.js";
 import { createIncidentIngestionWorkflow } from "./workflows/incident-ingestion-workflow.js";
 import { observability } from "./observability.js";
+import { phase10MastraScorers } from "./evals/mastra-scorers.js";
 import {
   assertPhase8ControlPlaneAuth,
   hasRealPhase8Provider,
@@ -124,6 +125,7 @@ const stagingPubSub = phase8Config.upstash.enabled
   : undefined;
 
 export const mastra = new Mastra({
+  scorers: phase10MastraScorers,
   agents: {
     smokeAgent,
     identityInvestigator,

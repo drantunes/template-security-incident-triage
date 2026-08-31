@@ -47,8 +47,9 @@ const DEMO_TEST_BUDGET_MS = 8_000;
 
 /**
  * The E2E boundary must never leave a child alive after a hung CLI/observer.
- * `execFile` waits for the SIGTERM'd process before rejecting, so callers can
- * safely remove their owned root in afterEach.
+ * The bounded child acknowledges SIGTERM before exit, so callers never race a
+ * PID probe (which can observe a short-lived zombie under CI load) with their
+ * owned-root cleanup.
  */
 function invokeBoundedNode(
   args: readonly string[],
@@ -244,26 +245,35 @@ describe("Phase 9 hermetic demos", () => {
     const root = await mkdtemp(join(tmpdir(), "phase9-bounded-child-"));
     roots.push(root);
     const pidPath = join(root, "child.pid");
+    const terminatedPath = join(root, "child.terminated");
     const artifactPath = join(root, "late-artifact");
     const started = performance.now();
+    let termination: unknown;
     try {
       await invokeBoundedNode(
         [
           "-e",
-          "require('node:fs').writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => require('node:fs').writeFileSync(process.argv[2], 'late'), 5000)",
+          "const fs=require('node:fs'); fs.writeFileSync(process.argv[1], String(process.pid)); process.on('SIGTERM',()=>{fs.writeFileSync(process.argv[2],'terminated');process.exit(143)}); setTimeout(() => fs.writeFileSync(process.argv[3], 'late'), 5000)",
           pidPath,
+          terminatedPath,
           artifactPath,
         ],
         { timeoutMs: 100 },
       );
-      throw new Error("expected bounded child to time out");
     } catch (error) {
-      expect(error).toMatchObject({ killed: true, signal: "SIGTERM" });
+      termination = error;
     }
+    expect(termination).toSatisfy(
+      (
+        error: { killed?: boolean; signal?: string; code?: number } | undefined,
+      ) =>
+        error?.killed === true ||
+        error?.signal === "SIGTERM" ||
+        error?.code === 143,
+    );
     expect(performance.now() - started).toBeLessThan(2_000);
-    const childPid = Number(await readFile(pidPath, "utf8"));
-    await new Promise<void>((resolve) => setTimeout(resolve, 25));
-    expect(() => process.kill(childPid, 0)).toThrow();
+    expect(await readFile(pidPath, "utf8")).toMatch(/^\d+$/u);
+    expect(await readFile(terminatedPath, "utf8")).toBe("terminated");
     await expect(access(artifactPath)).rejects.toThrow();
   });
 

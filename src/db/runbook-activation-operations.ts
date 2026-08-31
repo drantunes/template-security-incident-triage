@@ -121,7 +121,7 @@ export async function resolveRollbackGeneration(
   const result = await store.execute({
     sql: `SELECT g.incident_kind, g.runbook_id, g.version, g.generation_id,
       g.index_name, g.chunk_count, g.aggregate_hash, g.state,
-      v.allowed_actions_json, v.source_hash, v.declared_status,
+      v.allowed_actions_json, v.mandatory_rules_json, v.source_hash, v.declared_status,
       a.revision,
       EXISTS(SELECT 1 FROM runbook_activation_events e
         WHERE e.incident_kind = g.incident_kind
@@ -151,6 +151,7 @@ export async function resolveRollbackGeneration(
     chunkCount: Number(row.chunk_count),
     aggregateHash: String(row.aggregate_hash),
     allowedActionsJson: String(row.allowed_actions_json),
+    mandatoryRulesJson: String(row.mandatory_rules_json),
     sourceHash: String(row.source_hash),
   };
 }

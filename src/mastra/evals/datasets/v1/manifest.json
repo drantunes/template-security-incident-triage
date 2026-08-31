@@ -1,0 +1,176 @@
+{
+  "datasetVersion": "phase10-dataset-v1",
+  "schemaVersion": 1,
+  "createdAt": "2026-08-30T00:00:00.000Z",
+  "seed": "phase10-v1-offline-seed",
+  "clock": "2026-08-30T00:00:00.000Z",
+  "modelId": "openai/gpt-4o-mini",
+  "promptLabel": "phase10-offline-replay-v1",
+  "approvedBy": "Diego",
+  "approvedAt": "2026-08-30T20:53:10.000Z",
+  "approvalStatus": "approved",
+  "hashes": {
+    "inputs": "fc167e027f8be2e3e67d9c3aaca816d7a3ef0efc9f7e4ef6f1ef476d06ca4b44",
+    "expected": "cf0a7b89738a9e677d5ec7a7e91cfef12345f56407dc15de498cb698f3300468",
+    "manifest": "f4c1e83d50cff10e98ad86c262a46c1ceea4dc39912b2eaa1c1d4f5f77f0cb7e"
+  },
+  "provenance": {
+    "authors": [
+      "phase10-implementation"
+    ],
+    "independentReviewers": [
+      "phase10-internal-review-14:a376550707c33bb38824a2b9134ab263493298e32a62518c7f6ba4406002b97c"
+    ],
+    "originCommit": "20c508e7159f8a2b49d6dc41591445dd7487e90d",
+    "promptPath": "src/mastra/agents/response-planner.ts",
+    "promptHash": "e32c1442a3180fe508bdf709016ca03befc52d702f9c0f348d35b37a405693df",
+    "replayPath": "src/mastra/evals/offline-replay.ts",
+    "replayHash": "804540dc95ae928a59c5dbc2ff4b9b75ee4d2b3e0d0f556e75343275c517d908",
+    "runbooks": [
+      {
+        "id": "RB-IDENTITY-001",
+        "version": "1.0.0",
+        "hash": "2811a55ad3007ec9b867e51d2ce90813aaf453642023dcffc55887a8b687ae25"
+      },
+      {
+        "id": "RB-IDENTITY-002",
+        "version": "1.0.0",
+        "hash": "e94edf067ddfc20b1c0f3c2611a344da5bf60d47827a62cf97f27f8b6deb0b31"
+      },
+      {
+        "id": "RB-IDENTITY-003",
+        "version": "1.0.0",
+        "hash": "41e464b44d29e5cb67f61bf1628d7a89943b92786896556b99a881d8c684fd14"
+      }
+    ],
+    "changePolicy": "new-version-review-and-diego-approval-before-observed-run",
+    "changelog": "CHANGELOG.md"
+  },
+  "tagRegistry": [
+    "alert:disallowed_country_login",
+    "alert:unauthorized_privilege_change",
+    "alert:unknown_device_login",
+    "approval:absent",
+    "approval:approved",
+    "approval:cross-tenant",
+    "approval:duplicate",
+    "approval:expired",
+    "approval:rejected",
+    "approval:stale-hash",
+    "evidence:complete",
+    "evidence:contradictory",
+    "evidence:missing",
+    "evidence:partial",
+    "evidence:tampered",
+    "runbook:active",
+    "runbook:inactive",
+    "scenario:country",
+    "scenario:device",
+    "scenario:privilege",
+    "scope:cross-incident",
+    "scope:cross-run",
+    "scope:cross-tenant",
+    "scope:same-run",
+    "scope:stale",
+    "vector:absent",
+    "vector:approval-absent",
+    "vector:approval-approved",
+    "vector:approval-cross-tenant",
+    "vector:approval-duplicate",
+    "vector:approval-expired",
+    "vector:approval-rejected",
+    "vector:approval-stale-hash",
+    "vector:containment-blocked",
+    "vector:containment-not-executed",
+    "vector:containment-verified",
+    "vector:contradictory",
+    "vector:cross-incident",
+    "vector:cross-run",
+    "vector:cross-tenant",
+    "vector:outside-allowlist",
+    "vector:partial",
+    "vector:prompt-injection-alert",
+    "vector:prompt-injection-provider",
+    "vector:prompt-injection-runbook",
+    "vector:provider-partial-failure",
+    "vector:provider-retry",
+    "vector:provider-unavailable",
+    "vector:runbook-chunk-mismatch",
+    "vector:runbook-inactive",
+    "vector:runbook-missing",
+    "vector:runbook-version-mismatch",
+    "vector:stale-evidence",
+    "vector:tampered",
+    "vector:target-mismatch",
+    "vector:webhook-duplicate",
+    "vector:webhook-out-of-order"
+  ],
+  "counts": {
+    "cases": 72,
+    "train": 36,
+    "dev": 12,
+    "test": 24,
+    "classified": 54,
+    "manualReview": 18,
+    "scenarios": {
+      "privilege": 24,
+      "country": 24,
+      "device": 24
+    },
+    "labels": {
+      "low": 18,
+      "medium": 18,
+      "high": 18
+    }
+  },
+  "coverage": {
+    "vectors": {
+      "partial": 3,
+      "absent": 6,
+      "contradictory": 3,
+      "tampered": 3,
+      "cross-tenant": 3,
+      "cross-incident": 3,
+      "cross-run": 3,
+      "stale-evidence": 3,
+      "webhook-duplicate": 3,
+      "webhook-out-of-order": 3,
+      "runbook-missing": 6,
+      "runbook-inactive": 9,
+      "runbook-version-mismatch": 6,
+      "runbook-chunk-mismatch": 6,
+      "provider-unavailable": 3,
+      "provider-retry": 3,
+      "provider-partial-failure": 3,
+      "approval-approved": 54,
+      "approval-absent": 3,
+      "approval-expired": 3,
+      "approval-duplicate": 3,
+      "approval-rejected": 3,
+      "approval-cross-tenant": 3,
+      "approval-stale-hash": 3,
+      "prompt-injection-alert": 3,
+      "prompt-injection-runbook": 3,
+      "prompt-injection-provider": 3,
+      "outside-allowlist": 6,
+      "target-mismatch": 6,
+      "containment-verified": 54,
+      "containment-not-executed": 12,
+      "containment-blocked": 6
+    },
+    "byScenario": {
+      "privilege": {
+        "classified": 18,
+        "manualReview": 6
+      },
+      "country": {
+        "classified": 18,
+        "manualReview": 6
+      },
+      "device": {
+        "classified": 18,
+        "manualReview": 6
+      }
+    }
+  }
+}

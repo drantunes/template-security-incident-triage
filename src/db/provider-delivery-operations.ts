@@ -101,8 +101,8 @@ export async function deliverExternalIncident(
       sql: `INSERT OR IGNORE INTO provider_deliveries(
         id, provider, incident_id, tenant_id, operation, idempotency_key,
         status, attempt_count, next_attempt_at, projection_json,
-        workflow_run_id, correlation_id, provider_generation
-      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)`,
+        workflow_run_id, correlation_id, provider_generation, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)`,
       args: [
         deliveryId,
         providerId,
@@ -115,6 +115,7 @@ export async function deliverExternalIncident(
         input.workflowRunId,
         input.correlationId,
         generation,
+        now,
       ],
     });
     const current = await tx.execute({
@@ -187,11 +188,12 @@ export async function deliverExternalIncident(
     }
     const updated = await tx.execute({
       sql: `UPDATE provider_deliveries SET status = 'delivering',
-        attempt_count = attempt_count + 1, next_attempt_at = ?, error_code = NULL
+        attempt_count = attempt_count + 1, next_attempt_at = ?, error_code = NULL,
+        observed_at = ?
         WHERE id = ? AND attempt_count = ?
           AND status IN ('pending','retry','delivering')
         RETURNING *`,
-      args: [leaseUntil, String(row.id), Number(row.attempt_count)],
+      args: [leaseUntil, now, String(row.id), Number(row.attempt_count)],
     });
     return updated.rows[0]
       ? {
@@ -844,11 +846,12 @@ async function reconcileExpiredProviderGeneration(
     if (reconciled.rowsAffected !== 1) return;
     await tx.execute({
       sql: `UPDATE provider_deliveries SET status = 'succeeded', external_ref = ?,
-        error_code = NULL, next_attempt_at = NULL
+        error_code = NULL, next_attempt_at = NULL, observed_at = ?
         WHERE provider = ? AND tenant_id = ? AND incident_id = ?
           AND provider_generation = ? AND status IN ('delivering','uncertain')`,
       args: [
         result.externalRef,
+        input.now,
         input.providerId,
         input.tenantId,
         input.incidentId,
@@ -880,13 +883,14 @@ async function persistDeliveryOutcome(
   await store.transaction(async (tx) => {
     const updated = await tx.execute({
       sql: `UPDATE provider_deliveries SET status = ?, next_attempt_at = ?,
-        external_ref = ?, error_code = ? WHERE id = ? AND attempt_count = ?
+        external_ref = ?, error_code = ?, observed_at = ? WHERE id = ? AND attempt_count = ?
         AND ${outcome.expectedState === "delivering" ? "status = 'delivering'" : "status IN ('pending','retry','delivering','uncertain')"}`,
       args: [
         outcome.status,
         outcome.nextAttemptAt,
         outcome.externalRef,
         outcome.errorCode,
+        occurredAt,
         outcome.deliveryId,
         outcome.expectedAttempt,
       ],

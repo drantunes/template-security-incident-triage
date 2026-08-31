@@ -24,6 +24,7 @@ import { generateWithOneSchemaRetry } from "../agents/investigator-output.js";
 import { invokeResponsePlanner } from "../agents/response-planner.js";
 import type { Phase5StepDependencies } from "./classify-severity.js";
 import { RunbookRetrievedSchema } from "./retrieve-runbook.js";
+import { withinWorkflowPhase10Boundary } from "../phase10-trace-context.js";
 
 export function createProposeContainmentStep(
   dependencies: Phase5StepDependencies = {},
@@ -67,100 +68,130 @@ export function createProposeContainmentStep(
             reasonCodes: ["INTEGRITY_CHECK_FAILED"],
           });
         }
-        let candidate;
-        try {
-          candidate = createContainmentCandidate(context, inputData.decision);
-        } catch {
-          const stopped = {
-            status: "manual-review" as const,
-            incidentId: inputData.decision.incidentId,
-            reasonCodes: [
-              inputData.decision.severity === "low"
-                ? ("BENIGN_EXPLANATION" as const)
-                : ("TARGET_NOT_PROVEN" as const),
-            ],
-          };
-          await appendPhase5Timeline(
-            store,
-            context,
-            "proposal",
-            "manual-review",
-            {
-              result: stopped.status,
-              reasonCodes: stopped.reasonCodes.join(","),
-            },
-          );
-          return stopped;
-        }
-        let generated;
-        try {
-          generated = await generateWithOneSchemaRetry(
-            (attempt) =>
-              (dependencies.planner ?? invokeResponsePlanner)(
+        return await withinWorkflowPhase10Boundary(
+          store,
+          {
+            tenantId: context.correlation.context.tenantId,
+            incidentId: context.correlation.context.incidentId,
+            workflowRunId: context.correlation.context.workflowRunId,
+            correlationId: context.correlation.context.correlationId,
+            boundary: "containment.plan",
+            stepId: "propose-containment",
+            provider: "response-planner",
+          },
+          async () => {
+            let candidate;
+            try {
+              candidate = createContainmentCandidate(
+                context,
+                inputData.decision,
+              );
+            } catch {
+              const stopped = {
+                status: "manual-review" as const,
+                incidentId: inputData.decision.incidentId,
+                reasonCodes: [
+                  inputData.decision.severity === "low"
+                    ? ("BENIGN_EXPLANATION" as const)
+                    : ("TARGET_NOT_PROVEN" as const),
+                ],
+              };
+              await appendPhase5Timeline(
+                store,
+                context,
+                "proposal",
+                "manual-review",
                 {
-                  task: "containment",
-                  projection: projectDecisionContext(context),
-                  candidate,
+                  result: stopped.status,
+                  reasonCodes: stopped.reasonCodes.join(","),
                 },
-                attempt,
-                abortSignal,
-              ),
-            ContainmentAnalysisCandidateSchema,
-          );
-        } catch {
-          const stopped = {
-            status: "manual-review" as const,
-            incidentId: inputData.decision.incidentId,
-            reasonCodes: ["MODEL_UNAVAILABLE" as const],
-          };
-          await appendPhase5Timeline(
-            store,
-            context,
-            "proposal",
-            "manual-review",
-            {
-              result: stopped.status,
-              reasonCodes: stopped.reasonCodes.join(","),
-            },
-          );
-          return stopped;
-        }
-        let candidateMatches = false;
-        if (generated.status === "success") {
-          try {
-            candidateMatches =
-              canonicalJson(normalizeContainmentCandidate(generated.output)) ===
-              canonicalJson(normalizeContainmentCandidate(candidate));
-          } catch {
-            candidateMatches = false;
-          }
-        }
-        if (!candidateMatches) {
-          const stopped = {
-            status: "blocked" as const,
-            incidentId: inputData.decision.incidentId,
-            reasonCodes: [
-              generated.status === "success"
-                ? ("ACTION_NOT_ALLOWED" as const)
-                : ("MODEL_SCHEMA_INVALID" as const),
-            ],
-          };
-          await appendPhase5Timeline(store, context, "proposal", "blocked", {
-            result: stopped.status,
-            reasonCodes: stopped.reasonCodes.join(","),
-          });
-          return stopped;
-        }
-        await appendPhase5Timeline(store, context, "proposal", "completed", {
-          result: "proposed",
-          actionCount: candidate.actions.length,
-        });
-        return ProposalStepResultSchema.parse({
-          status: "proposed",
-          decision: inputData.decision,
-          summary: inputData.summary,
-          candidate,
-        });
+              );
+              return stopped;
+            }
+            let generated;
+            try {
+              generated = await generateWithOneSchemaRetry(
+                (attempt) =>
+                  (dependencies.planner ?? invokeResponsePlanner)(
+                    {
+                      task: "containment",
+                      projection: projectDecisionContext(context),
+                      candidate,
+                    },
+                    attempt,
+                    abortSignal,
+                  ),
+                ContainmentAnalysisCandidateSchema,
+              );
+            } catch {
+              const stopped = {
+                status: "manual-review" as const,
+                incidentId: inputData.decision.incidentId,
+                reasonCodes: ["MODEL_UNAVAILABLE" as const],
+              };
+              await appendPhase5Timeline(
+                store,
+                context,
+                "proposal",
+                "manual-review",
+                {
+                  result: stopped.status,
+                  reasonCodes: stopped.reasonCodes.join(","),
+                },
+              );
+              return stopped;
+            }
+            let candidateMatches = false;
+            if (generated.status === "success") {
+              try {
+                candidateMatches =
+                  canonicalJson(
+                    normalizeContainmentCandidate(generated.output),
+                  ) === canonicalJson(normalizeContainmentCandidate(candidate));
+              } catch {
+                candidateMatches = false;
+              }
+            }
+            if (!candidateMatches) {
+              const stopped = {
+                status: "blocked" as const,
+                incidentId: inputData.decision.incidentId,
+                reasonCodes: [
+                  generated.status === "success"
+                    ? ("ACTION_NOT_ALLOWED" as const)
+                    : ("MODEL_SCHEMA_INVALID" as const),
+                ],
+              };
+              await appendPhase5Timeline(
+                store,
+                context,
+                "proposal",
+                "blocked",
+                {
+                  result: stopped.status,
+                  reasonCodes: stopped.reasonCodes.join(","),
+                },
+              );
+              return stopped;
+            }
+            await appendPhase5Timeline(
+              store,
+              context,
+              "proposal",
+              "completed",
+              {
+                result: "proposed",
+                actionCount: candidate.actions.length,
+              },
+            );
+            return ProposalStepResultSchema.parse({
+              status: "proposed",
+              decision: inputData.decision,
+              summary: inputData.summary,
+              candidate,
+            });
+          },
+        );
       } finally {
         store.close();
       }

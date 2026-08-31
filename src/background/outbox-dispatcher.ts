@@ -9,6 +9,10 @@ import {
 import type { OperationalStore } from "../db/operational-store.js";
 import { DomainError } from "../domain/errors.js";
 import type { StructuredLogger } from "../logging.js";
+import {
+  Phase10TraceCarrierSchema,
+  startPhase10Boundary,
+} from "../mastra/observability.js";
 
 export type DispatcherOptions = Readonly<{
   batchSize: number;
@@ -81,7 +85,63 @@ export class OutboxDispatcher {
         continue;
       }
       try {
-        await this.pubsub.publish(item.event.type, item.event);
+        const boundary = startPhase10Boundary({
+          boundary: "outbox.publish",
+          tenantId: item.event.data.tenantId,
+          incidentId: item.event.data.incidentId,
+          runId:
+            phase10Trace(item.event.data.payload)?.runId ??
+            item.event.data.eventId,
+          correlationId: item.event.data.correlationId,
+          requestId:
+            phase10Trace(item.event.data.payload)?.requestId ??
+            item.event.data.eventId,
+          ...(phase10Trace(item.event.data.payload)
+            ? { context: phase10Trace(item.event.data.payload) }
+            : {}),
+        });
+        try {
+          const published = phase10Trace(item.event.data.payload)
+            ? {
+                ...item.event,
+                data: {
+                  ...item.event.data,
+                  payload: {
+                    ...item.event.data.payload,
+                    __phase10Trace: JSON.stringify({
+                      ...boundary.context,
+                      // The outbox UUID is the durable workflow-run identity.
+                      // Rebind here so the worker's Mastra run, operational
+                      // marker and transport carrier agree after the process
+                      // boundary.
+                      runId: item.event.data.eventId,
+                      requestId:
+                        phase10Trace(item.event.data.payload)?.requestId ??
+                        item.event.data.eventId,
+                    }),
+                  },
+                },
+              }
+            : item.event;
+          // Advance the authoritative outbox carrier before publishing. The
+          // worker later binds the delivered envelope to this exact durable
+          // value and the workflow persists it for suspend/resume branches.
+          if (phase10Trace(item.event.data.payload))
+            await this.store.execute({
+              sql: `UPDATE outbox_events SET payload_json = ?
+                WHERE id = ? AND available_at = ? AND published_at IS NULL`,
+              args: [
+                JSON.stringify(published.data.payload),
+                item.event.data.eventId,
+                item.leaseToken,
+              ],
+            });
+          await this.pubsub.publish(item.event.type, published);
+          boundary.span.end({ attributes: { success: true } as never });
+        } catch (error) {
+          boundary.span.error({ error: error as Error, endSpan: true });
+          throw error;
+        }
       } catch {
         const outcome = await recordOutboxFailure(this.store, {
           id: item.event.data.eventId,
@@ -128,4 +188,20 @@ export class OutboxDispatcher {
     }
     return claimed.length;
   }
+}
+
+function phase10Trace(payload: unknown) {
+  const raw =
+    payload && typeof payload === "object"
+      ? (payload as Record<string, unknown>).__phase10Trace
+      : undefined;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+  return Phase10TraceCarrierSchema.safeParse(value).data;
 }

@@ -4,16 +4,17 @@ import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
 import { EventEmitterPubSub } from "@mastra/core/events";
-import { LibSQLStore } from "@mastra/libsql";
-import { Mastra } from "@mastra/core/mastra";
 import { Hono } from "hono";
 
 import { createLibSqlOperationalStore } from "../db/libsql-operational-store.js";
+import { fixedClock } from "../domain/clock.js";
 import { migrateOperationalStore } from "../db/migrate.js";
 import { registerWebhookRoutes } from "../webhooks/routes.js";
 import { OutboxDispatcher } from "../background/outbox-dispatcher.js";
+import { MockIncidentProvider } from "../providers/mock-incident-provider.js";
 import { startWorkflowWorker } from "../background/workflow-worker.js";
 import type { AppEnv } from "../http-context.js";
+import { requestContextMiddleware } from "../http-context.js";
 import { LibSqlRunbookVectorStore } from "../runbooks/vector-store.js";
 import { DeterministicRunbookEmbedder } from "../runbooks/embeddings.js";
 import { indexRunbook } from "../runbooks/indexer.js";
@@ -25,6 +26,7 @@ import {
   newJournal,
   readJournal,
   reserveOwnedDatabase,
+  reserveOwnedTraceDatabase,
   resourceHash,
   writeJournal,
 } from "./journal.js";
@@ -40,10 +42,10 @@ import {
 } from "./seed-baseline.js";
 import {
   createDemoWorkflow,
+  createTracedDemoMastra,
   fixedNow,
   mockState,
   phase2Config,
-  shutdownDemoMastra,
   webhookSecret,
 } from "./runtime.js";
 import {
@@ -59,11 +61,14 @@ import { waitForApproval } from "./runner-decision.js";
 import type { DemoRunResult, RunOptions } from "./runner-types.js";
 
 export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
+  const logger = options.logger ?? { write: () => {} };
   const deadline =
     options.timeoutMs === undefined
       ? undefined
       : performance.now() + options.timeoutMs;
   const root = demoRoot(options.root);
+  const runbookRoot =
+    options.runbookRoot ?? resolve(process.cwd(), "src/mastra/runbooks");
   const runKeyHash = createHash("sha256").update(options.runKey).digest("hex");
   const demoRunId = demoId("demo", `${options.scenario}\0${runKeyHash}`);
   const existing = await readJournal(root, demoRunId);
@@ -81,6 +86,9 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
         options.timeoutMs,
         undefined,
         options.signal,
+        logger,
+        options.redactionSources,
+        options.redactionSourceObserved,
       );
     if (existing.state === "terminal") {
       const store = createLibSqlOperationalStore({
@@ -133,9 +141,10 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
   );
   const records: DemoRecord[] = [record(journal, "preflight")];
   const databaseUrl = pathToFileURL(journal.databasePath).href;
+  const traceDatabaseUrl = pathToFileURL(journal.traceDatabasePath).href;
   let store: ReturnType<typeof createLibSqlOperationalStore> | undefined;
   let vector: LibSqlRunbookVectorStore | undefined;
-  let runtime: Mastra | undefined;
+  let runtime: Awaited<ReturnType<typeof createTracedDemoMastra>> | undefined;
   const closeStore = () => {
     const current = store;
     store = undefined;
@@ -149,7 +158,7 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
   const closeRuntime = async () => {
     const current = runtime;
     runtime = undefined;
-    if (current) await shutdownDemoMastra(current);
+    if (current) await current.close();
   };
   try {
     // Claim the exact database path before any schema or seed write.  An
@@ -162,20 +171,32 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
         ownership: "created",
         expectedHash: pendingDatabasePrecondition(journal.demoRunId),
       },
+      {
+        kind: "local_trace_database",
+        ref: `local-trace:${journal.demoRunId}`,
+        ownership: "created",
+        expectedHash: pendingDatabasePrecondition(journal.demoRunId),
+      },
     ]);
     // The journal is durable before the filesystem effect.  A pre-existing
     // database or sidecar is rejected rather than adopted by this run.
     await reserveOwnedDatabase(root, journal);
+    await reserveOwnedTraceDatabase(root, journal);
     const reservedResources = await Promise.all(
       journal.resources.map(async (resource) =>
-        resource.kind === "local_database"
+        resource.kind === "local_database" ||
+        resource.kind === "local_trace_database"
           ? {
               ...resource,
               // A zero-byte file can only have come from the exclusive
               // reservation above. This journaled byte hash is the creation
               // proof used until a semantic DB snapshot is available.
               expectedHash: reservedDatabasePrecondition(
-                await resourceHash(journal.databasePath),
+                await resourceHash(
+                  resource.kind === "local_database"
+                    ? journal.databasePath
+                    : journal.traceDatabasePath,
+                ),
               ),
             }
           : resource,
@@ -194,14 +215,16 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
     await migrateOperationalStore(store);
     throwIfDeadlineExceeded(deadline);
     throwIfAborted(options.signal);
-    await seedScenarioBaseline(
-      store,
-      fixtureForScenario(options.scenario, demoRunId),
-    );
+    const fixture = fixtureForScenario(options.scenario, demoRunId);
+    if (options.redactionSources?.alert)
+      Object.assign(fixture.changes, {
+        phase10RedactionSource: options.redactionSources.alert,
+      });
+    await seedScenarioBaseline(store, fixture);
     throwIfDeadlineExceeded(deadline);
     vector = new LibSqlRunbookVectorStore({ url: databaseUrl });
     for (const [index, runbook] of (
-      await loadRunbooks(resolve(process.cwd(), "src/mastra/runbooks"))
+      await loadRunbooks(runbookRoot)
     ).entries()) {
       await indexRunbook(
         store,
@@ -214,35 +237,42 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
         },
       );
     }
-    journal = await transition(root, journal, "seeded", [
-      {
-        kind: "local_database",
-        ref: `local:${demoRunId}`,
-        ownership: "created",
-        expectedHash: pendingDatabasePrecondition(journal.demoRunId),
-      },
-    ]);
+    if (options.runbookRoot) options.redactionSourceObserved?.("runbook");
+    journal = await transition(root, journal, "seeded", journal.resources);
     journal = await refreshDatabaseHash(root, journal);
     records.push(record(journal, "seed"));
 
     await closeVector();
     const state = mockState(options.scenario, demoRunId);
-    const workflow = createDemoWorkflow(databaseUrl, state);
-    runtime = new Mastra({
-      storage: new LibSQLStore({
-        id: demoId("mastra", demoRunId),
-        url: databaseUrl,
+    const workflow = createDemoWorkflow(
+      databaseUrl,
+      state,
+      new MockIncidentProvider({
+        openStore: () => createLibSqlOperationalStore({ url: databaseUrl }),
+        responseMarker: options.redactionSources?.provider,
+        onResponseMarkerConsumed: () =>
+          options.redactionSourceObserved?.("provider"),
       }),
-      workflows: { incidentIngestionWorkflow: workflow },
+      runbookRoot,
+    );
+    runtime = await createTracedDemoMastra({
+      databaseUrl,
+      traceDatabaseUrl,
+      demoRunId,
+      workflow,
     });
     const app = new Hono<AppEnv>();
+    app.use(
+      "*",
+      requestContextMiddleware(() => demoId("request", demoRunId)),
+    );
     registerWebhookRoutes(app, {
       config: phase2Config(),
       store,
       nowMs: () => Date.parse(fixedNow),
-      logger: { write: () => {} },
+      clock: fixedClock(fixedNow),
+      logger,
     });
-    const fixture = fixtureForScenario(options.scenario, demoRunId);
     const bytes = new TextEncoder().encode(JSON.stringify(fixture));
     const timestamp = String(Date.parse(fixedNow));
     const signature = createHmac("sha256", webhookSecret)
@@ -260,24 +290,33 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
       }),
     );
     if (response.status !== 202) throw new Error("DEMO_WEBHOOK_REJECTED");
+    if (options.redactionSources?.alert)
+      options.redactionSourceObserved?.("alert");
     const webhook = (await response.json()) as { incidentId?: string };
     if (!webhook.incidentId) throw new Error("DEMO_INCIDENT_MISSING");
-    await persistScenarioEvidenceBaseline(store, fixture, webhook.incidentId);
+    await persistScenarioEvidenceBaseline(
+      store,
+      fixture,
+      webhook.incidentId,
+      options.redactionSources?.evidence,
+    );
+    if (options.redactionSources?.evidence)
+      options.redactionSourceObserved?.("evidence");
     closeStore();
     const pubsub = new EventEmitterPubSub();
     const workerStore = createLibSqlOperationalStore({ url: databaseUrl });
     const unsubscribe = await startWorkflowWorker({
       pubsub,
-      workflow: runtime.getWorkflow("incidentIngestionWorkflow"),
+      workflow: runtime.mastra.getWorkflow("incidentIngestionWorkflow"),
       store: workerStore,
-      logger: { write: () => {} },
+      logger,
       maxAttempts: 3,
     });
     const dispatcher = new OutboxDispatcher(
       workerStore,
       pubsub,
       phase2Config().outbox,
-      { write: () => {} },
+      logger,
       () => new Date(fixedNow),
     );
     try {
@@ -358,6 +397,9 @@ export async function runMockDemo(options: RunOptions): Promise<DemoRunResult> {
       options.timeoutMs,
       records,
       options.signal,
+      logger,
+      options.redactionSources,
+      options.redactionSourceObserved,
     );
   } catch (error) {
     const code = error instanceof Error ? error.message : "DEMO_FAILED";

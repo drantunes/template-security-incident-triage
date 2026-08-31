@@ -43,16 +43,20 @@ export async function stageRunbookGeneration(
   if (!kind) throw new DomainError("VALIDATION_FAILED");
   return store.transaction(async (tx) => {
     const version = await tx.execute({
-      sql: `SELECT source_hash, parsed_hash, allowed_actions_json FROM runbook_versions
+      sql: `SELECT source_hash, parsed_hash, allowed_actions_json, mandatory_rules_json FROM runbook_versions
         WHERE runbook_id = ? AND version = ?`,
       args: [input.runbook.metadata.id, input.runbook.metadata.version],
     });
     const allowedActionsJson = JSON.stringify(input.runbook.allowedActions);
+    const mandatoryRulesJson = JSON.stringify(
+      input.runbook.metadata.mandatoryRules,
+    );
     if (version.rows[0]) {
       if (
         version.rows[0].source_hash !== input.runbook.sourceHash ||
         version.rows[0].parsed_hash !== input.runbook.parsedHash ||
-        version.rows[0].allowed_actions_json !== allowedActionsJson
+        version.rows[0].allowed_actions_json !== allowedActionsJson ||
+        version.rows[0].mandatory_rules_json !== mandatoryRulesJson
       )
         throw new DomainError("CONFLICT");
     } else {
@@ -61,8 +65,8 @@ export async function stageRunbookGeneration(
           runbook_id, version, owner, declared_status, source_path, source_hash,
           parsed_hash, schema_version, chunking_algorithm_version,
           embedding_provider, embedding_model, embedding_dimension,
-          allowed_actions_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          allowed_actions_json, mandatory_rules_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           input.runbook.metadata.id,
           input.runbook.metadata.version,
@@ -77,6 +81,7 @@ export async function stageRunbookGeneration(
           EMBEDDING_MODEL,
           EMBEDDING_DIMENSION,
           allowedActionsJson,
+          mandatoryRulesJson,
           input.createdAt,
         ],
       });
@@ -209,7 +214,7 @@ export async function resolveEligibleGeneration(
   const result = await store.execute({
     sql: `SELECT a.incident_kind, a.runbook_id, a.version, a.generation_id,
       a.revision, g.index_name, g.chunk_count, g.aggregate_hash,
-      g.state, v.declared_status, v.allowed_actions_json, v.source_hash
+      g.state, v.declared_status, v.allowed_actions_json, v.mandatory_rules_json, v.source_hash
       FROM runbook_activations a
       JOIN runbook_generations g ON g.generation_id = a.generation_id
         AND g.runbook_id = a.runbook_id AND g.version = a.version
@@ -233,6 +238,7 @@ export async function resolveEligibleGeneration(
     chunkCount: Number(row.chunk_count),
     aggregateHash: String(row.aggregate_hash),
     allowedActionsJson: String(row.allowed_actions_json),
+    mandatoryRulesJson: String(row.mandatory_rules_json),
     sourceHash: String(row.source_hash),
   };
 }

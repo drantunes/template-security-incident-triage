@@ -1,4 +1,4 @@
-import { semanticDatabaseHash, writeJournal } from "./journal.js";
+import { resourceHash, semanticDatabaseHash, writeJournal } from "./journal.js";
 import type { DemoJournal, DemoRecord } from "./contracts.js";
 
 export function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -44,6 +44,7 @@ export async function transition(
     state,
     createdAt: journal.createdAt,
     databasePath: journal.databasePath,
+    traceDatabasePath: journal.traceDatabasePath,
     resources: synchronizedResources,
     ...(journal.incidentId ? { incidentId: journal.incidentId } : {}),
     ...(journal.workflowRunId ? { workflowRunId: journal.workflowRunId } : {}),
@@ -64,7 +65,12 @@ export async function refreshDatabaseHash(
             ...resource,
             expectedHash: await semanticDatabaseHash(journal.databasePath),
           }
-        : resource,
+        : resource.kind === "local_trace_database"
+          ? {
+              ...resource,
+              expectedHash: await resourceHash(journal.traceDatabasePath),
+            }
+          : resource,
     ),
   );
   return transition(root, journal, journal.state, resources);

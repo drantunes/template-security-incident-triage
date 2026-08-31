@@ -1,6 +1,12 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
+import { DuckDbAnalyticsStore } from "../../src/analytics/duckdb-analytics-store.js";
 import { migrateOperationalStore } from "../../src/db/migrate.js";
+import { exportAnalyticsSince } from "../../src/analytics/exporter.js";
 import {
   createTempDatabase,
   type TempDatabase,
@@ -34,10 +40,10 @@ describe("SOC migrations", () => {
             'approval_decision_audit','mock_incident_provider_effects',
             'mock_containment_effects','geoip_cache_entries','geoip_cache_leases','provider_effect_ledger',
             'consumer_effect_ledger','workos_observed_memberships','workos_observed_sessions',
-            'workos_observed_positions'
+            'workos_observed_positions','eval_results','analytics_export_events'
           )) ORDER BY name`,
       });
-      expect(tables.rows).toHaveLength(35);
+      expect(tables.rows).toHaveLength(37);
       expect(tables.rows.map((row) => row.name)).toContain(
         "soc_schema_migrations",
       );
@@ -54,7 +60,7 @@ describe("SOC migrations", () => {
       const indexes = await store.execute({
         sql: "SELECT count(*) AS count FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
       });
-      expect(Number(indexes.rows[0]?.count)).toBe(45);
+      expect(Number(indexes.rows[0]?.count)).toBe(47);
       const tokenForeignKeys = await store.execute({
         sql: "PRAGMA foreign_key_list(approval_resume_tokens)",
       });
@@ -124,12 +130,168 @@ describe("SOC migrations", () => {
         { version: 6 },
         { version: 7 },
         { version: 8 },
+        { version: 9 },
+        { version: 10 },
+        { version: 11 },
+        { version: 12 },
+        { version: 13 },
+        { version: 14 },
+        { version: 15 },
       ]);
       await expect(
         store.execute({
           sql: `SELECT decision_provenance FROM approvals WHERE 1 = 0`,
         }),
       ).resolves.toBeDefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("upgrades Phase 8 authority without inventing provider time and reconstructs terminal approvals", async () => {
+    const database = await createTempDatabase();
+    databases.push(database);
+    const store = database.createStore();
+    try {
+      await migrateOperationalStore(store, { targetVersion: 8 });
+      await store.execute({
+        sql: `INSERT INTO incidents(id,tenant_id,kind,subject_id,status,created_at,updated_at)
+          VALUES ('incident-upgrade','tenant-upgrade','unknown_device_login','subject','received',?,?)`,
+        args: ["2026-08-30T00:00:00.000Z", "2026-08-30T00:00:00.000Z"],
+      });
+      await store.execute({
+        sql: `INSERT INTO workflow_runs(id,incident_id,tenant_id,run_id,workflow_id,status,started_at)
+          VALUES ('workflow-upgrade','incident-upgrade','tenant-upgrade','run-upgrade','workflow','waiting',?)`,
+        args: ["2026-08-30T00:00:00.000Z"],
+      });
+      await store.execute({
+        sql: `INSERT INTO containment_plans(id,incident_id,tenant_id,schema_version,plan_version,plan_hash_version,plan_hash,plan_json,expires_at,created_at)
+          VALUES ('plan-terminal','incident-upgrade','tenant-upgrade',1,2,1,?, '{}',?,?)`,
+        args: [
+          "b".repeat(64),
+          "2026-08-30T01:00:00.000Z",
+          "2026-08-30T00:00:00.000Z",
+        ],
+      });
+      await store.execute({
+        sql: `INSERT INTO approvals(id,plan_id,incident_id,tenant_id,plan_hash_version,plan_hash,requested_at,expires_at,decision,decided_by,decided_by_role,decided_at,workflow_run_id)
+          VALUES ('approval-terminal','plan-terminal','incident-upgrade','tenant-upgrade',1,?,?,?,'approved','reviewer','soc_manager',?,'run-upgrade')`,
+        args: [
+          "b".repeat(64),
+          "2026-08-30T00:00:00.000Z",
+          "2026-08-30T01:00:00.000Z",
+          "2026-08-30T00:00:03.000Z",
+        ],
+      });
+      await store.execute({
+        sql: `INSERT INTO provider_deliveries(id,provider,incident_id,tenant_id,operation,idempotency_key,status,attempt_count,next_attempt_at)
+          VALUES ('provider-retry','mock-incident','incident-upgrade','tenant-upgrade','final-contained','key-retry','retry',1,?)`,
+        args: ["2026-08-30T00:05:00.000Z"],
+      });
+      await store.execute({
+        sql: `INSERT INTO containment_plans(id,incident_id,tenant_id,schema_version,plan_version,plan_hash_version,plan_hash,plan_json,expires_at,created_at)
+          VALUES ('plan-upgrade','incident-upgrade','tenant-upgrade',1,1,1,?, '{}',?,?)`,
+        args: [
+          "a".repeat(64),
+          "2026-08-30T01:00:00.000Z",
+          "2026-08-30T00:00:00.000Z",
+        ],
+      });
+      await store.execute({
+        sql: `INSERT INTO approvals(id,plan_id,incident_id,tenant_id,plan_hash_version,plan_hash,requested_at,expires_at,workflow_run_id)
+          VALUES ('approval-upgrade','plan-upgrade','incident-upgrade','tenant-upgrade',1,?,?,?,'run-upgrade')`,
+        args: [
+          "a".repeat(64),
+          "2026-08-30T00:00:01.000Z",
+          "2026-08-30T01:00:00.000Z",
+        ],
+      });
+      await store.execute({
+        sql: `INSERT INTO provider_deliveries(id,provider,incident_id,tenant_id,operation,idempotency_key,status,attempt_count,next_attempt_at)
+          VALUES ('provider-upgrade','mock-incident','incident-upgrade','tenant-upgrade','open-awaiting-approval','key-upgrade','succeeded',1,NULL)`,
+      });
+
+      await migrateOperationalStore(store);
+      await expect(
+        store.execute({
+          sql: "SELECT observed_at FROM provider_deliveries WHERE id='provider-upgrade'",
+        }),
+      ).resolves.toMatchObject({ rows: [{ observed_at: null }] });
+      const exported = await exportAnalyticsSince(store, 0);
+      expect(exported).toContainEqual(
+        expect.objectContaining({
+          source: "approvals",
+          sourceId: "approval-upgrade",
+          status: "pending",
+          occurredAt: "2026-08-30T00:00:01.000Z",
+        }),
+      );
+      expect(exported).toContainEqual(
+        expect.objectContaining({
+          sourceId: "provider-upgrade",
+          withheld: { reason: "PROVIDER_OBSERVED_AT_UNKNOWN" },
+        }),
+      );
+      expect(exported).toContainEqual(
+        expect.objectContaining({
+          sourceId: "provider-retry",
+          occurredAt: "2026-08-30T00:05:00.000Z",
+          withheld: { reason: "PROVIDER_OBSERVED_AT_UNKNOWN" },
+        }),
+      );
+      expect(exported).toContainEqual(
+        expect.objectContaining({
+          sourceId: "approval-terminal",
+          status: "pending",
+          occurredAt: "2026-08-30T00:00:00.000Z",
+        }),
+      );
+      expect(exported).toContainEqual(
+        expect.objectContaining({
+          sourceId: "approval-terminal",
+          status: "approved",
+          occurredAt: "2026-08-30T00:00:03.000Z",
+        }),
+      );
+      const analyticsRoot = await mkdtemp(join(tmpdir(), "phase10-upgrade-"));
+      const analytics = new DuckDbAnalyticsStore(
+        join(analyticsRoot, "analytics.duckdb"),
+      );
+      try {
+        await analytics.ingestBatch(exported);
+        await analytics.rebuild(exported);
+        await expect(
+          analytics.queryMetric({
+            metric: "approval_latency",
+            tenantId: "tenant-upgrade",
+            from: "2026-08-30T00:00:00.000Z",
+            to: "2026-08-31T00:00:00.000Z",
+          }),
+        ).resolves.toMatchObject({ sampleCount: 1, value: 3000 });
+        expect(await analytics.readWithheldRows()).toHaveLength(2);
+        expect(
+          (await analytics.readFactRows()).some(
+            (row) => row.source === "provider_deliveries",
+          ),
+        ).toBe(false);
+      } finally {
+        await analytics.close();
+        await rm(analyticsRoot, { recursive: true, force: true });
+      }
+
+      await store.execute({
+        sql: `INSERT INTO provider_deliveries(id,provider,incident_id,tenant_id,operation,idempotency_key,status,attempt_count,next_attempt_at,observed_at)
+          VALUES ('provider-live','mock-incident','incident-upgrade','tenant-upgrade','final-failed','key-live','succeeded',1,NULL,?)`,
+        args: ["2026-08-30T00:00:03.000Z"],
+      });
+      const live = await exportAnalyticsSince(store, 0);
+      expect(live).toContainEqual(
+        expect.objectContaining({
+          sourceId: "provider-live",
+          occurredAt: "2026-08-30T00:00:03.000Z",
+          status: "succeeded",
+        }),
+      );
     } finally {
       store.close();
     }

@@ -48,6 +48,10 @@ export const ApprovalDecisionRequestSchema = z
   .object({
     decision: z.enum(["approved", "rejected"]),
     reason: longText.optional(),
+    // Authenticated source-only fields are deliberately not persisted or
+    // included in decision events/traces.
+    comment: longText.optional(),
+    actorHint: longText.optional(),
     planId: opaqueId,
     planHashVersion: z.literal(1),
     planHash: sha256,
